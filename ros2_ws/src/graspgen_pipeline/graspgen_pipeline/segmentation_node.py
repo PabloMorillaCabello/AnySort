@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 """
-Segmentation Node - Uses SAM3 (Segment Anything Model 3) to segment objects
-from RGB images based on a text prompt. Publishes binary masks.
+Segmentation Node — ROS2 thin client for the SAM3 inference server.
 
-SAM3 API reference (from facebook/sam3 repo):
-  - build_sam3_image_model(bpe_path=...) or from_pretrained via transformers
-  - Sam3Processor: set_image(), set_text_prompt()
-  - Also available via: transformers.Sam3Model / transformers.Sam3Processor
+Architecture:
+  SAM3 requires Python 3.12 but ROS2 Humble runs on Python 3.10.
+  This node does NOT import SAM3 directly. Instead, it communicates with
+  a persistent sam3_server.py process (running under /opt/sam3env/bin/python)
+  via a Unix domain socket.
+
+Protocol (per request):
+  1. Send JSON header: {"width": W, "height": H, "prompt": "text", "size": N}
+  2. Send N bytes of raw RGB uint8 (H*W*3)
+  3. Receive JSON header: {"ok": true, "width": W, "height": H, "size": N}
+  4. Receive N bytes of mask uint8 (H*W, values 0 or 255)
 """
+import json
+import socket
+import subprocess
+import time
+
 import numpy as np
-import torch
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from cv_bridge import CvBridge
-from PIL import Image as PILImage
 
 
 class SegmentationNode(Node):
-    """SAM3 text-prompted segmentation ROS2 node."""
+    """SAM3 text-prompted segmentation ROS2 node (socket client)."""
 
     def __init__(self):
         super().__init__("segmentation_node")
@@ -30,20 +39,18 @@ class SegmentationNode(Node):
         self.declare_parameter("confidence_threshold", 0.5)
         self.declare_parameter("mask_threshold", 0.5)
         self.declare_parameter("device", "cuda:0")
-        self.declare_parameter("use_half_precision", False)  # FP16 to save VRAM
+        self.declare_parameter("use_half_precision", False)
         self.declare_parameter("use_transformers_api", True)
+        self.declare_parameter("sam3_socket", "/tmp/sam3_server.sock")
+        self.declare_parameter("sam3_server_script", "/ros2_ws/scripts/sam3_server.py")
+        self.declare_parameter("sam3_python", "/opt/sam3env/bin/python")
+        self.declare_parameter("auto_start_server", True)
 
-        self.model_path = self.get_parameter("model_path").value
         self.text_prompt = self.get_parameter("text_prompt").value
-        self.confidence = self.get_parameter("confidence_threshold").value
-        self.mask_threshold = self.get_parameter("mask_threshold").value
-        self.device = self.get_parameter("device").value
-        self.use_half = self.get_parameter("use_half_precision").value
-        self.use_transformers = self.get_parameter("use_transformers_api").value
-
+        self.sock_path = self.get_parameter("sam3_socket").value
         self.bridge = CvBridge()
-        self.model = None
-        self.processor = None
+        self._conn = None
+        self._server_proc = None
 
         # Subscribers
         self.rgb_sub = self.create_subscription(
@@ -57,139 +64,211 @@ class SegmentationNode(Node):
         self.mask_pub = self.create_publisher(Image, "/segmentation/mask", 10)
         self.viz_pub = self.create_publisher(Image, "/segmentation/visualization", 10)
 
-        # Load model
-        self._load_model()
+        # Auto-start the SAM3 server if requested
+        if self.get_parameter("auto_start_server").value:
+            self._start_server()
+
+        # Connect to SAM3 server
+        self._connect()
 
         self.get_logger().info(
-            f"Segmentation node ready | prompt: '{self.text_prompt}' | device: {self.device}"
+            f"Segmentation node ready | prompt: '{self.text_prompt}' | "
+            f"server: {self.sock_path}"
         )
 
-    def _load_model(self):
-        """Load the SAM3 model."""
-        self.get_logger().info("Loading SAM3 model...")
+    # ------------------------------------------------------------------
+    # Server management
+    # ------------------------------------------------------------------
+    def _start_server(self):
+        """Launch the SAM3 server as a subprocess (Python 3.12 venv)."""
+        python_bin = self.get_parameter("sam3_python").value
+        script = self.get_parameter("sam3_server_script").value
+        device = self.get_parameter("device").value
+        use_tf = self.get_parameter("use_transformers_api").value
+        use_half = self.get_parameter("use_half_precision").value
+        confidence = self.get_parameter("confidence_threshold").value
+        mask_thresh = self.get_parameter("mask_threshold").value
 
-        if self.use_transformers:
-            # ---------- Transformers API (recommended) ----------
-            from transformers import Sam3Processor as TFSam3Processor
-            from transformers import Sam3Model
-
-            self.processor = TFSam3Processor.from_pretrained("facebook/sam3")
-            if self.use_half:
-                self.model = Sam3Model.from_pretrained(
-                    "facebook/sam3", torch_dtype=torch.float16
-                ).to(self.device)
-                self.get_logger().info("SAM3 loaded in FP16 (half precision).")
-            else:
-                self.model = Sam3Model.from_pretrained("facebook/sam3").to(self.device)
-            self.model.eval()
-            self.get_logger().info("SAM3 loaded via Transformers API.")
+        cmd = [
+            python_bin, script,
+            "--socket", self.sock_path,
+            "--device", device,
+            "--confidence", str(confidence),
+            "--mask-threshold", str(mask_thresh),
+        ]
+        if use_tf:
+            cmd.append("--use-transformers")
         else:
-            # ---------- Native SAM3 API ----------
-            from sam3 import build_sam3_image_model
-            from sam3.model.sam3_image_processor import Sam3Processor as NativeSam3Processor
+            cmd.append("--no-transformers")
+        if use_half:
+            cmd.append("--fp16")
+        else:
+            cmd.append("--no-fp16")
 
-            self.model = build_sam3_image_model(load_from_HF=True)
-            self.model.to(self.device)
-            self.model.eval()
-            self.processor = NativeSam3Processor(
-                self.model, confidence_threshold=self.confidence
-            )
-            self.get_logger().info("SAM3 loaded via native API.")
+        self.get_logger().info(f"Starting SAM3 server: {' '.join(cmd)}")
+        self._server_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
 
+    def _connect(self, retries: int = 30, delay: float = 2.0):
+        """Connect to the SAM3 server socket with retries."""
+        for attempt in range(retries):
+            try:
+                self._conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._conn.connect(self.sock_path)
+                self.get_logger().info("Connected to SAM3 server.")
+                return
+            except (FileNotFoundError, ConnectionRefusedError):
+                if attempt < retries - 1:
+                    self.get_logger().info(
+                        f"Waiting for SAM3 server... ({attempt + 1}/{retries})"
+                    )
+                    time.sleep(delay)
+                    self._conn = None
+                else:
+                    self.get_logger().error(
+                        "Could not connect to SAM3 server after "
+                        f"{retries * delay:.0f}s. Is sam3_server.py running?"
+                    )
+
+    def _reconnect(self):
+        """Attempt to reconnect after a broken pipe."""
+        self.get_logger().warn("Lost connection to SAM3 server, reconnecting...")
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._connect(retries=5, delay=2.0)
+
+    # ------------------------------------------------------------------
+    # Socket protocol helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _recv_exactly(conn: socket.socket, n: int) -> bytes:
+        chunks = []
+        received = 0
+        while received < n:
+            chunk = conn.recv(min(n - received, 65536))
+            if not chunk:
+                raise ConnectionError("SAM3 server disconnected")
+            chunks.append(chunk)
+            received += len(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _recv_json_line(conn: socket.socket) -> dict:
+        buf = b""
+        while True:
+            byte = conn.recv(1)
+            if not byte:
+                raise ConnectionError("SAM3 server disconnected")
+            if byte == b"\n":
+                break
+            buf += byte
+        return json.loads(buf.decode("utf-8"))
+
+    @staticmethod
+    def _send_json_line(conn: socket.socket, obj: dict):
+        data = (json.dumps(obj) + "\n").encode("utf-8")
+        conn.sendall(data)
+
+    # ------------------------------------------------------------------
+    # ROS callbacks
+    # ------------------------------------------------------------------
     def prompt_callback(self, msg):
         """Update text prompt dynamically via ROS topic."""
         self.text_prompt = msg.data
         self.get_logger().info(f"Text prompt updated to: '{self.text_prompt}'")
 
     def rgb_callback(self, msg):
-        """Process incoming RGB image with SAM3 text-prompted segmentation."""
-        if self.model is None:
+        """Process incoming RGB image through SAM3 server."""
+        if self._conn is None:
             return
 
         try:
-            # Convert ROS Image → PIL Image
             cv_image = self.bridge.imgmsg_to_cv2(msg, "rgb8")
-            pil_image = PILImage.fromarray(cv_image)
+            h, w = cv_image.shape[:2]
+            rgb_bytes = cv_image.tobytes()
 
-            if self.use_transformers:
-                mask = self._infer_transformers(pil_image)
-            else:
-                mask = self._infer_native(pil_image)
+            # Send request to SAM3 server
+            self._send_json_line(self._conn, {
+                "width": w,
+                "height": h,
+                "prompt": self.text_prompt,
+                "size": len(rgb_bytes),
+            })
+            self._conn.sendall(rgb_bytes)
 
-            if mask is not None:
-                # Publish binary mask (0 or 255)
-                mask_uint8 = (mask * 255).astype(np.uint8)
-                mask_msg = self.bridge.cv2_to_imgmsg(mask_uint8, "mono8")
-                mask_msg.header = msg.header
-                self.mask_pub.publish(mask_msg)
+            # Receive response
+            resp = self._recv_json_line(self._conn)
+            if not resp.get("ok", False):
+                self.get_logger().warn(
+                    f"SAM3 error: {resp.get('error', 'unknown')}",
+                    throttle_duration_sec=5.0,
+                )
+                return
 
-                # Publish visualization overlay
-                viz = cv_image.copy()
-                viz[mask > 0] = (viz[mask > 0] * 0.5 + np.array([0, 255, 0]) * 0.5).astype(np.uint8)
-                viz_msg = self.bridge.cv2_to_imgmsg(viz, "rgb8")
-                viz_msg.header = msg.header
-                self.viz_pub.publish(viz_msg)
+            mask_bytes = self._recv_exactly(self._conn, resp["size"])
+            mask = np.frombuffer(mask_bytes, dtype=np.uint8).reshape((h, w))
 
+            # Check if mask is all zeros (no detection)
+            if mask.max() == 0:
+                self.get_logger().warn(
+                    f"No objects found for prompt: '{self.text_prompt}'",
+                    throttle_duration_sec=5.0,
+                )
+                return
+
+            # Publish binary mask
+            mask_msg = self.bridge.cv2_to_imgmsg(mask, "mono8")
+            mask_msg.header = msg.header
+            self.mask_pub.publish(mask_msg)
+
+            # Publish visualization overlay
+            viz = cv_image.copy()
+            mask_bool = mask > 0
+            viz[mask_bool] = (
+                viz[mask_bool] * 0.5 + np.array([0, 255, 0]) * 0.5
+            ).astype(np.uint8)
+            viz_msg = self.bridge.cv2_to_imgmsg(viz, "rgb8")
+            viz_msg.header = msg.header
+            self.viz_pub.publish(viz_msg)
+
+        except ConnectionError:
+            self._reconnect()
         except Exception as e:
-            self.get_logger().error(f"Segmentation failed: {e}", throttle_duration_sec=5.0)
-
-    def _infer_transformers(self, pil_image):
-        """Run SAM3 inference via HuggingFace Transformers API."""
-        inputs = self.processor(
-            images=pil_image, text=self.text_prompt, return_tensors="pt"
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
-        results = self.processor.post_process_instance_segmentation(
-            outputs,
-            threshold=self.confidence,
-            mask_threshold=self.mask_threshold,
-            target_sizes=inputs.get("original_sizes").tolist(),
-        )[0]
-
-        # Combine all instance masks into a single binary mask
-        if len(results["segments_info"]) == 0:
-            self.get_logger().warn(
-                f"No objects found for prompt: '{self.text_prompt}'",
-                throttle_duration_sec=5.0,
+            self.get_logger().error(
+                f"Segmentation failed: {e}", throttle_duration_sec=5.0
             )
-            return None
 
-        combined_mask = np.zeros(
-            (pil_image.height, pil_image.width), dtype=np.uint8
-        )
-        segmentation = results["segmentation"].cpu().numpy()
-        for seg_info in results["segments_info"]:
-            combined_mask[segmentation == seg_info["id"]] = 1
-
-        return combined_mask
-
-    def _infer_native(self, pil_image):
-        """Run SAM3 inference via native sam3 API."""
-        state = self.processor.set_image(pil_image)
-        self.processor.set_text_prompt(state=state, prompt=self.text_prompt)
-
-        # Extract masks from state
-        # The native API stores results in the inference state
-        masks = state.get("masks", None)
-        if masks is None or len(masks) == 0:
-            return None
-
-        # Combine all masks
-        combined = np.zeros_like(masks[0], dtype=np.uint8)
-        for m in masks:
-            combined = np.maximum(combined, m.astype(np.uint8))
-        return combined
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+    def destroy_node(self):
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        if self._server_proc:
+            self._server_proc.terminate()
+            self._server_proc.wait(timeout=5)
+        super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = SegmentationNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

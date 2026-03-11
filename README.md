@@ -14,15 +14,16 @@ Orbbec Gemini 2 ──> SAM3 Segmentation ──> GraspGen ──> MoveIt2 Plann
 
 ## Environment Stack
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| CUDA | 12.6 | Unified for SAM3 + GraspGen |
-| Python | 3.12 | Required by SAM3 |
-| PyTorch | 2.7.0 | Required by SAM3, compatible with GraspGen |
-| ROS2 | Humble | On Ubuntu 22.04 |
-| SAM3 | latest | `facebook/sam3` from HuggingFace |
-| GraspGen | latest | `adithyamurali/GraspGenModels` from HuggingFace |
-| Orbbec SDK | v2-main | OrbbecSDK_ROS2 for Gemini 2 |
+| Component | Version | Python | Notes |
+|-----------|---------|--------|-------|
+| CUDA | 12.6 | — | Unified for SAM3 + GraspGen |
+| Python | 3.10 (system) | — | ROS2 Humble + GraspGen (Ubuntu 22.04) |
+| Python | 3.12 (venv) | — | SAM3 only (`/opt/sam3env`) |
+| PyTorch | 2.7.0 | both | Installed in both environments |
+| ROS2 | Humble | 3.10 | Binary packages for Ubuntu 22.04 |
+| SAM3 | latest | 3.12 | `facebook/sam3` — runs as socket server |
+| GraspGen | latest | 3.10 | `adithyamurali/GraspGenModels` |
+| Orbbec SDK | v2-main | 3.10 | OrbbecSDK_ROS2 for Gemini 2 |
 
 ## Repository Structure
 
@@ -51,6 +52,7 @@ GraspGen_Thesis_Repo/
 │   │       └── pipeline_params.yaml      # All tuneable parameters
 │   └── robotiq_3f_driver/            # Robotiq 3F gripper Modbus driver
 ├── scripts/                          # Utility & test scripts
+│   ├── sam3_server.py                 # SAM3 inference server (Python 3.12 venv, socket IPC)
 │   ├── download_models.sh            # Download SAM3 + GraspGen weights
 │   ├── setup_orbbec.sh               # Host udev rules for camera
 │   ├── build_workspace.sh            # colcon build helper
@@ -121,10 +123,10 @@ docker compose exec graspgen bash
 
 ```bash
 # Inside the container:
-./scripts/test_environment.sh       # Check all dependencies
-python3 scripts/test_sam3.py        # Test SAM3 model
-python3 scripts/test_graspgen.py    # Test GraspGen model
-./scripts/test_camera.sh            # Test Orbbec camera (needs camera plugged in)
+./scripts/test_environment.sh                    # Check all dependencies (both Python envs)
+/opt/sam3env/bin/python scripts/test_sam3.py      # Test SAM3 model (Python 3.12 venv)
+python3 scripts/test_graspgen.py                  # Test GraspGen model (Python 3.10)
+./scripts/test_camera.sh                          # Test Orbbec camera (needs camera plugged in)
 ```
 
 ### Step 5: Build and run the pipeline

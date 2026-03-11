@@ -26,7 +26,7 @@ services:
       - ROS_DOMAIN_ID=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - HF_TOKEN=${HF_TOKEN:-}
-      - PYTHONPATH=/opt/sam3:/opt/GraspGen
+      - PYTHONPATH=/opt/GraspGen
       - CUDA_HOME=/usr/local/cuda
     volumes:
       # Mount ROS2 workspace packages (your pipeline code)

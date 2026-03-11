@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """
 Test: SAM3 model loading and inference on a sample image.
-Run inside the Docker container.
+Run inside the Docker container using the SAM3 Python 3.12 venv.
 
 Usage:
-  python3 scripts/test_sam3.py
-  python3 scripts/test_sam3.py --image path/to/test.jpg --prompt "cup"
+  /opt/sam3env/bin/python scripts/test_sam3.py
+  /opt/sam3env/bin/python scripts/test_sam3.py --image path/to/test.jpg --prompt "cup"
+
+NOTE: This script must be run with /opt/sam3env/bin/python (Python 3.12),
+      NOT with the system python3 (Python 3.10).
 """
 import argparse
-import time
 import sys
+import time
 import numpy as np
+
+
+def check_python_version():
+    """Ensure we are running in the correct Python environment."""
+    v = sys.version_info
+    if v.major == 3 and v.minor >= 12:
+        print(f"  [PASS] Python {v.major}.{v.minor}.{v.micro} (>= 3.12 required for SAM3)")
+    else:
+        print(f"  [FAIL] Python {v.major}.{v.minor}.{v.micro} — SAM3 requires Python 3.12+")
+        print(f"         Run this script with: /opt/sam3env/bin/python {sys.argv[0]}")
+        sys.exit(1)
 
 
 def test_imports():
@@ -120,9 +134,10 @@ def main():
     args = parser.parse_args()
 
     print("=" * 50)
-    print("  SAM3 Model Test")
+    print("  SAM3 Model Test (Python 3.12 venv)")
     print("=" * 50)
 
+    check_python_version()
     test_imports()
     processor, model, device = test_model_loading()
 
