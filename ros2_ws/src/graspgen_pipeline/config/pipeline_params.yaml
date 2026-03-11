@@ -1,0 +1,64 @@
+# =============================================================================
+# GraspGen Pipeline Parameters
+# =============================================================================
+
+# --- Camera Node (relay / synchronizer) ---
+# The actual Orbbec driver is launched via gemini2.launch.py from orbbec_camera.
+# This node syncs RGB + Depth frames and republishes them.
+camera_node:
+  ros__parameters:
+    rgb_topic_in: "/camera/color/image_raw"
+    depth_topic_in: "/camera/depth/image_raw"
+    camera_info_topic_in: "/camera/color/camera_info"
+    sync_slop: 0.1  # seconds tolerance for ApproximateTimeSynchronizer
+
+# --- Segmentation Node (SAM3) ---
+segmentation_node:
+  ros__parameters:
+    model_path: "/opt/models/sam3"
+    text_prompt: "object"                # Default prompt (override via launch arg or topic)
+    confidence_threshold: 0.5
+    mask_threshold: 0.5
+    device: "cuda:0"
+    use_transformers_api: true           # true=HuggingFace Transformers, false=native sam3
+
+# --- GraspGen Node ---
+grasp_generator_node:
+  ros__parameters:
+    # Path to gripper config YAML from GraspGen model checkpoints
+    # Available configs in /opt/models/graspgen/:
+    #   - robotiq_2f140.yml   (Robotiq 2F-140 — closest to 3F)
+    #   - franka_panda.yml    (Franka Panda)
+    #   - suction.yml         (Single-contact suction)
+    gripper_config: "/opt/models/graspgen/robotiq_2f140.yml"
+    device: "cuda:0"
+    num_grasps: 50
+    topk_num_grasps: 10
+    grasp_threshold: 0.7
+    remove_outliers: false
+
+# --- Motion Planner Node ---
+motion_planner_node:
+  ros__parameters:
+    robot_ip: "192.168.1.100"
+    robot_type: "ur5e"                   # ur3e, ur5e, ur10e, ur16e
+    use_sim: false
+    planning_group: "manipulator"
+    max_velocity_scaling: 0.3
+    max_acceleration_scaling: 0.3
+    planning_time: 5.0
+    num_planning_attempts: 10
+    # Gripper
+    gripper_type: "robotiq_3f"
+    gripper_port: "/dev/ttyUSB0"
+    gripper_baudrate: 115200
+    # Approach/retreat offsets (meters)
+    approach_distance: 0.10
+    retreat_distance: 0.10
+
+# --- Pipeline Orchestrator ---
+pipeline_orchestrator:
+  ros__parameters:
+    auto_execute: false                  # If true, execute best grasp automatically
+    save_results: true
+    results_dir: "/ros2_ws/results"

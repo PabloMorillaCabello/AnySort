@@ -1,0 +1,62 @@
+# =============================================================================
+# GraspGen Thesis - Docker Compose
+# Usage:
+#   1. Copy .env.example to .env and set your HF_TOKEN
+#   2. docker compose build --build-arg HF_TOKEN=$(cat .env | grep HF_TOKEN | cut -d= -f2)
+#   3. docker compose up -d
+#   4. docker compose exec graspgen bash
+# =============================================================================
+
+services:
+  graspgen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HF_TOKEN: ${HF_TOKEN:-}
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.6;8.9}
+    image: graspgen-thesis:latest
+    container_name: graspgen_dev
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - HF_TOKEN=${HF_TOKEN:-}
+      - PYTHONPATH=/opt/sam3:/opt/GraspGen
+      - CUDA_HOME=/usr/local/cuda
+    volumes:
+      # Mount ROS2 workspace packages (your pipeline code)
+      - ../ros2_ws/src/graspgen_pipeline:/ros2_ws/src/graspgen_pipeline
+      - ../ros2_ws/src/robotiq_3f_driver:/ros2_ws/src/robotiq_3f_driver
+      # Persist model weights between rebuilds
+      - model_cache:/opt/models
+      # Data directory for captured images and results
+      - ../data:/ros2_ws/data
+      - ../results:/ros2_ws/results
+      # Config files
+      - ../config:/ros2_ws/config
+      # Scripts
+      - ../scripts:/ros2_ws/scripts
+      # X11 for GUI (RViz, Meshcat, etc.)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Camera device access (Orbbec USB)
+      - /dev:/dev
+    privileged: true
+    network_mode: host
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  model_cache:
+    driver: local

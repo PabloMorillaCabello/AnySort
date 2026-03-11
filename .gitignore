@@ -1,0 +1,81 @@
+# =============================================================================
+# GraspGen Thesis - .gitignore
+# =============================================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+
+# --- AI Model weights (large files, download via script) ---
+models/sam3/
+!models/sam3/.gitkeep
+models/graspgen/
+!models/graspgen/.gitkeep
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.weights
+
+# --- Data (captured during experiments) ---
+data/rgb/*.png
+data/rgb/*.jpg
+data/depth/*.png
+data/depth/*.npy
+data/masks/*.png
+data/grasp_poses/*.json
+data/grasp_poses/*.npy
+
+# --- Results ---
+results/*
+!results/.gitkeep
+
+# --- ROS2 build artifacts ---
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+ros2_ws/.colcon/
+
+# --- Orbbec SDK (cloned at Docker build, not tracked) ---
+ros2_ws/src/OrbbecSDK_ROS2/
+
+# --- Docker ---
+docker/.env
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.cproject
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs ---
+*.log
+log/
+
+# --- Secrets ---
+.env
+*.key
+*.pem
