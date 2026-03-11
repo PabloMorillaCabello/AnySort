@@ -20,6 +20,7 @@ segmentation_node:
     confidence_threshold: 0.5
     mask_threshold: 0.5
     device: "cuda:0"
+    use_half_precision: true             # FP16 — saves ~1.7GB VRAM (recommended for <=8GB GPUs)
     use_transformers_api: true           # true=HuggingFace Transformers, false=native sam3
 
 # --- GraspGen Node ---

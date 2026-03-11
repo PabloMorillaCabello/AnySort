@@ -65,22 +65,6 @@ GraspGen_Thesis_Repo/
 └── docs/                             # Thesis notes & documentation
 ```
 
-## Creating the GitHub Repository
-
-```bash
-# 1. Create the repo on GitHub (via CLI or web UI)
-gh repo create GraspGen_Thesis_Repo --private --description "Master Thesis: Text-Prompted Grasp Generation Pipeline"
-
-# 2. Or if you already created it on github.com:
-cd GraspGen_Thesis_Repo
-git remote add origin git@github.com:YOUR_USERNAME/GraspGen_Thesis_Repo.git
-
-# 3. Initial commit and push
-git add -A
-git commit -m "Initial repo structure: SAM3 + GraspGen + Orbbec + ROS2 pipeline"
-git push -u origin main
-```
-
 ## Quick Start
 
 ### Prerequisites

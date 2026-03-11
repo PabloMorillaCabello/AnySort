@@ -30,6 +30,7 @@ class SegmentationNode(Node):
         self.declare_parameter("confidence_threshold", 0.5)
         self.declare_parameter("mask_threshold", 0.5)
         self.declare_parameter("device", "cuda:0")
+        self.declare_parameter("use_half_precision", False)  # FP16 to save VRAM
         self.declare_parameter("use_transformers_api", True)
 
         self.model_path = self.get_parameter("model_path").value
@@ -37,6 +38,7 @@ class SegmentationNode(Node):
         self.confidence = self.get_parameter("confidence_threshold").value
         self.mask_threshold = self.get_parameter("mask_threshold").value
         self.device = self.get_parameter("device").value
+        self.use_half = self.get_parameter("use_half_precision").value
         self.use_transformers = self.get_parameter("use_transformers_api").value
 
         self.bridge = CvBridge()
@@ -72,7 +74,13 @@ class SegmentationNode(Node):
             from transformers import Sam3Model
 
             self.processor = TFSam3Processor.from_pretrained("facebook/sam3")
-            self.model = Sam3Model.from_pretrained("facebook/sam3").to(self.device)
+            if self.use_half:
+                self.model = Sam3Model.from_pretrained(
+                    "facebook/sam3", torch_dtype=torch.float16
+                ).to(self.device)
+                self.get_logger().info("SAM3 loaded in FP16 (half precision).")
+            else:
+                self.model = Sam3Model.from_pretrained("facebook/sam3").to(self.device)
             self.model.eval()
             self.get_logger().info("SAM3 loaded via Transformers API.")
         else:
