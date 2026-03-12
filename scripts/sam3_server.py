@@ -86,18 +86,24 @@ def infer(rgb_array: np.ndarray, prompt: str) -> np.ndarray | None:
         inputs = processor(images=pil_image, text=prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model(**inputs)
+        h, w = rgb_array.shape[:2]
         results = processor.post_process_instance_segmentation(
             outputs,
             threshold=confidence_threshold,
-            mask_threshold=mask_threshold,
-            target_sizes=inputs.get("original_sizes").tolist(),
+            target_sizes=[(h, w)],
         )[0]
-        if len(results["segments_info"]) == 0:
+        # API returns: {"scores": [...], "boxes": [...], "masks": Tensor(N, H, W)}
+        masks = results.get("masks", None)
+        scores = results.get("scores", None)
+        if masks is None or len(masks) == 0:
             return None
-        seg = results["segmentation"].cpu().numpy()
-        combined = np.zeros(seg.shape, dtype=np.uint8)
-        for info in results["segments_info"]:
-            combined[seg == info["id"]] = 255
+        # Filter by confidence and combine all masks into one
+        combined = np.zeros((h, w), dtype=np.uint8)
+        for i, mask in enumerate(masks):
+            score = float(scores[i]) if scores is not None and i < len(scores) else 1.0
+            if score >= confidence_threshold:
+                m = mask.cpu().numpy().astype(bool)
+                combined[m] = 255
         return combined
     else:
         state = processor.set_image(pil_image)

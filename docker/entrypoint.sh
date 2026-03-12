@@ -41,6 +41,7 @@ echo "  PyTorch:   $(python3 -c 'import torch; print(torch.__version__)' 2>/dev/
 echo "  SAM3:      $(/opt/sam3env/bin/python -c 'import sam3; print("OK")' 2>/dev/null || echo 'NOT FOUND')"
 echo "  GraspGen:  $(python3 -c 'import grasp_gen; print("OK")' 2>/dev/null || echo 'NOT FOUND')"
 echo "  GPU:       $(python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NO GPU")' 2>/dev/null)"
+echo "  DISPLAY:   ${DISPLAY:-NOT SET}"
 echo "--------------------------------------------"
 echo "  SAM3 server: /opt/sam3env/bin/python scripts/sam3_server.py"
 echo "  Activate SAM3 venv: source /opt/sam3env/bin/activate"

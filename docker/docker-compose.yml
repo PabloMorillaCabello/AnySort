@@ -21,9 +21,10 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
-      - DISPLAY=${DISPLAY:-:0}
+      - DISPLAY=${DISPLAY:-host.docker.internal:0.0}
       - QT_X11_NO_MITSHM=1
-      - ROS_DOMAIN_ID=0
+      - LIBGL_ALWAYS_INDIRECT=1
+      - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - HF_TOKEN=${HF_TOKEN:-}
       - PYTHONPATH=/opt/GraspGen

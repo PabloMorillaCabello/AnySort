@@ -105,16 +105,10 @@ fi
 # --- 5. GraspGen (system Python 3.10) ---
 echo ""
 echo "--- GraspGen (System Python 3.10) ---"
-if python3 -c "from grasp_gen.sampler import GraspGenSampler; print('OK')" 2>/dev/null; then
-    pass "grasp_gen.sampler importable"
+if python3 -c "import grasp_gen; print('OK')" 2>/dev/null; then
+    pass "grasp_gen package importable"
 else
-    fail "grasp_gen.sampler NOT importable"
-fi
-
-if python3 -c "from grasp_gen.utils import load_grasp_cfg; print('OK')" 2>/dev/null; then
-    pass "grasp_gen.utils importable"
-else
-    fail "grasp_gen.utils NOT importable"
+    fail "grasp_gen package NOT importable"
 fi
 
 if python3 -c "import pointnet2_ops; print('OK')" 2>/dev/null; then

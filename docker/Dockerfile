@@ -68,6 +68,7 @@ RUN add-apt-repository ppa:deadsnakes/ppa -y && apt-get update && apt-get instal
     libgflags-dev nlohmann-json3-dev libgoogle-glog-dev \
     libssl-dev libdw-dev mesa-utils libgl1 libgl1-mesa-glx \
     libegl1-mesa libglib2.0-0 libsm6 libxrender1 libxext6 \
+    python3-tk python3.12-tk feh \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade system pip (for Python 3.10 - ROS2/GraspGen environment)
@@ -77,8 +78,13 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 # 3. PyTorch 2.7 + CUDA 12.6 (for Python 3.10 - shared by ROS2 and GraspGen)
 # =============================================================================
 # Remove distutils-installed packages that conflict with PyTorch dependencies
+# Remove distutils-installed system packages that conflict with pip upgrades
+# (sympy conflicts with PyTorch, blinker with Flask/roboticstoolbox,
+#  scipy compiled against NumPy 1.x breaks with NumPy 2.x)
 RUN rm -rf /usr/lib/python3/dist-packages/sympy* \
-           /usr/lib/python3/dist-packages/mpmath*
+           /usr/lib/python3/dist-packages/mpmath* \
+           /usr/lib/python3/dist-packages/scipy* \
+           /usr/lib/python3/dist-packages/blinker*
 
 RUN pip3 install --no-cache-dir \
     torch==2.7.0 \
@@ -147,6 +153,10 @@ RUN /opt/sam3env/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
        torchvision==0.22.0 \
        torchaudio==2.7.0 \
        --index-url https://download.pytorch.org/whl/cu126
+
+# Ensure setuptools is available (provides pkg_resources, required by sam3.model_builder)
+# Also install transformers for the HuggingFace SAM3 API
+RUN /opt/sam3env/bin/pip install --no-cache-dir setuptools transformers
 
 # Clone SAM3 and install in the 3.12 venv
 RUN git clone https://github.com/facebookresearch/sam3.git /opt/sam3 \

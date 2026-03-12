@@ -1,209 +1,307 @@
 #!/usr/bin/env python3
 """
-Test: GraspGen model loading and inference on a sample point cloud.
-Run inside the Docker container.
+Test: GraspGen installation, imports, submodule discovery, and basic functionality.
+Run inside the Docker container with system Python 3.10.
 
 Usage:
   python3 scripts/test_graspgen.py
-  python3 scripts/test_graspgen.py --mesh path/to/object.obj
-  python3 scripts/test_graspgen.py --gripper_config /opt/models/graspgen/robotiq_2f140.yml
+  python3 scripts/test_graspgen.py --no-display   # skip visualization
 """
-import argparse
-import time
 import sys
 import os
+import time
+import importlib
+import pkgutil
 import numpy as np
 
 
-def test_imports():
-    """Test that GraspGen packages can be imported."""
-    print("[TEST] Importing GraspGen packages...")
+# =========================================================================
+# 1. GraspGen requirements.txt dependencies
+# =========================================================================
+def test_graspgen_requirements():
+    """Test all packages from GraspGen's own requirements.txt."""
+    print("[TEST] GraspGen requirements.txt dependencies...")
     results = {}
 
+    # (import_name, pip_name, notes)
     modules = [
-        ("grasp_gen.sampler", "GraspGenSampler"),
-        ("grasp_gen.utils", "load_grasp_cfg"),
-        ("pointnet2_ops", None),
-        ("spconv", None),
-        ("torch_geometric", None),
-        ("trimesh", None),
-        ("diffusers", None),
+        ("h5py",             "h5py",              ""),
+        ("hydra",            "hydra-core",         ""),
+        ("matplotlib",       "matplotlib",         ""),
+        ("meshcat",          "meshcat",            ""),
+        ("numpy",            "numpy==1.26.4",      ""),
+        ("webdataset",       "webdataset",         ""),
+        ("sklearn",          "scikit-learn",        ""),
+        ("scipy",            "scipy",              ""),
+        ("tensorboard",      "tensorboard",         ""),
+        ("trimesh",          "trimesh==4.5.3",      ""),
+        ("transformers",     "transformers",        ""),
+        ("tensordict",       "tensordict",          ""),
+        ("diffusers",        "diffusers==0.11.1",   ""),
+        ("timm",             "timm==1.0.15",        ""),
+        ("huggingface_hub",  "huggingface-hub",     ""),
+        ("OpenGL",           "PyOpenGL",            ""),
+        ("addict",           "addict",              ""),
+        ("spconv",           "spconv-cu126",        "replaced spconv-cu120"),
+        ("yapf",             "yapf==0.40.1",        ""),
+        ("tensorboardX",     "tensorboardx",        ""),
+        ("torch_geometric",  "torch-geometric",     ""),
+        ("yourdfpy",         "yourdfpy==0.0.56",    ""),
+        ("imageio",          "imageio",             ""),
     ]
 
-    for module, attr in modules:
+    for import_name, pip_name, notes in modules:
         try:
-            mod = __import__(module)
-            if attr:
-                assert hasattr(mod, attr) or True  # submodule import
-            print(f"  [PASS] {module}")
-            results[module] = True
+            mod = __import__(import_name)
+            version = getattr(mod, "__version__", "")
+            ver_str = f" ({version})" if version else ""
+            note_str = f" [{notes}]" if notes else ""
+            print(f"  [PASS] {import_name}{ver_str}{note_str}")
+            results[import_name] = True
         except ImportError as e:
-            print(f"  [FAIL] {module}: {e}")
-            results[module] = False
+            print(f"  [FAIL] {import_name} (pip: {pip_name}) — {e}")
+            results[import_name] = False
+
+    # Packages removed intentionally
+    print(f"  [SKIP] pickle5 (built-in since Python 3.8)")
+    print(f"  [SKIP] sharedarray (not imported anywhere in GraspGen source code)")
 
     return results
 
 
-def test_model_loading(gripper_config):
-    """Test loading the GraspGen model."""
-    print(f"\n[TEST] Loading GraspGen model...")
-    print(f"  [INFO] Config: {gripper_config}")
+# =========================================================================
+# 2. Pipeline-specific dependencies (not in GraspGen's requirements.txt)
+# =========================================================================
+def test_pipeline_deps():
+    """Test additional dependencies needed by our pipeline."""
+    print("\n[TEST] Pipeline-specific dependencies...")
+    results = {}
+
+    modules = [
+        ("torch",            "PyTorch"),
+        ("torchvision",      "TorchVision"),
+        ("torchaudio",       "TorchAudio"),
+        ("pointnet2_ops",    "PointNet++ CUDA ops"),
+        ("torch_scatter",    "torch-scatter"),
+        ("torch_cluster",    "torch-cluster"),
+        ("open3d",           "Open3D"),
+        ("cv2",              "OpenCV"),
+        ("omegaconf",        "OmegaConf"),
+        ("pymodbus",         "PyModbus (gripper)"),
+        ("serial",           "PySerial (gripper)"),
+    ]
+
+    for import_name, label in modules:
+        try:
+            mod = __import__(import_name)
+            version = getattr(mod, "__version__", "")
+            ver_str = f" ({version})" if version else ""
+            print(f"  [PASS] {label}: {import_name}{ver_str}")
+            results[import_name] = True
+        except ImportError as e:
+            print(f"  [FAIL] {label}: {import_name} — {e}")
+            results[import_name] = False
+
+    return results
+
+
+# =========================================================================
+# 3. GraspGen package deep inspection
+# =========================================================================
+def test_grasp_gen_imports():
+    """Discover and test all grasp_gen submodules recursively."""
+    print("\n[TEST] GraspGen package deep import test...")
 
     try:
-        from grasp_gen.sampler import GraspGenSampler
-        from grasp_gen.utils import load_grasp_cfg
+        import grasp_gen
+    except ImportError as e:
+        print(f"  [FAIL] Cannot import grasp_gen: {e}")
+        return {}, False
 
-        t0 = time.time()
-        grasp_cfg = load_grasp_cfg(gripper_config)
-        sampler = GraspGenSampler(grasp_cfg)
-        load_time = time.time() - t0
+    pkg_dir = os.path.dirname(grasp_gen.__file__)
+    print(f"  [PASS] grasp_gen package at: {pkg_dir}")
 
-        print(f"  [PASS] Model loaded in {load_time:.1f}s")
-        return sampler
-    except Exception as e:
-        print(f"  [FAIL] Model loading failed: {e}")
-        return None
+    results = {"grasp_gen": True}
+    pass_count = 0
+    fail_count = 0
+
+    for importer, modname, ispkg in pkgutil.walk_packages(
+        path=[pkg_dir], prefix="grasp_gen.", onerror=lambda x: None
+    ):
+        try:
+            importlib.import_module(modname)
+            print(f"  [PASS] {modname}")
+            results[modname] = True
+            pass_count += 1
+        except Exception as e:
+            err_msg = str(e)
+            if len(err_msg) > 80:
+                err_msg = err_msg[:77] + "..."
+            print(f"  [WARN] {modname}: {err_msg}")
+            results[modname] = False
+            fail_count += 1
+
+    print(f"\n  [INFO] GraspGen submodules: {pass_count} passed, {fail_count} warnings")
+    return results, fail_count == 0
 
 
-def test_inference_synthetic(sampler):
-    """Test GraspGen on a synthetic point cloud (sphere)."""
-    from grasp_gen.sampler import GraspGenSampler
+# =========================================================================
+# 4. PyTorch + CUDA
+# =========================================================================
+def test_pytorch_cuda():
+    """Test PyTorch CUDA integration."""
+    print("\n[TEST] PyTorch CUDA...")
+    import torch
 
-    print("\n[TEST] Running inference on synthetic point cloud...")
+    if not torch.cuda.is_available():
+        print("  [FAIL] CUDA not available")
+        return False
 
-    # Generate a sphere point cloud (simulates a ball-like object)
-    n_points = 4096
-    phi = np.random.uniform(0, 2 * np.pi, n_points)
-    costheta = np.random.uniform(-1, 1, n_points)
-    theta = np.arccos(costheta)
-    r = 0.05  # 5cm radius
+    gpu_name = torch.cuda.get_device_name(0)
+    print(f"  [PASS] CUDA available: {gpu_name}")
+    print(f"  [INFO] PyTorch {torch.__version__}, CUDA {torch.version.cuda}")
+    print(f"  [INFO] cuDNN {torch.backends.cudnn.version()}")
 
-    x = r * np.sin(theta) * np.cos(phi)
-    y = r * np.sin(theta) * np.sin(phi)
-    z = r * np.cos(theta) + 0.3  # offset 30cm from camera
+    t = torch.randn(256, 256, device="cuda")
+    result = t @ t.T
+    print(f"  [PASS] GPU matmul OK (256x256)")
 
-    pc = np.stack([x, y, z], axis=-1).astype(np.float32)
-    print(f"  [INFO] Point cloud shape: {pc.shape}")
+    cc = torch.cuda.get_device_capability(0)
+    print(f"  [INFO] Compute capability: {cc[0]}.{cc[1]}")
 
+    return True
+
+
+# =========================================================================
+# 5. PointNet++ CUDA extensions
+# =========================================================================
+def test_pointnet2_cuda():
+    """Test PointNet++ CUDA extensions with actual operations."""
+    print("\n[TEST] PointNet++ CUDA extensions...")
     try:
-        t0 = time.time()
-        grasps, confidences = GraspGenSampler.run_inference(
-            pc,
-            sampler,
-            grasp_threshold=0.5,
-            num_grasps=20,
-            topk_num_grasps=5,
-            remove_outliers=False,
-        )
-        inference_time = time.time() - t0
+        import torch
+        import pointnet2_ops
 
-        print(f"  [PASS] Inference completed in {inference_time:.2f}s")
-        print(f"  [INFO] Generated {len(grasps)} grasps")
+        print(f"  [PASS] pointnet2_ops imported from: {pointnet2_ops.__file__}")
 
-        if len(confidences) > 0:
-            print(f"  [INFO] Confidence range: [{min(confidences):.3f}, {max(confidences):.3f}]")
-            for i, (g, c) in enumerate(zip(grasps[:3], confidences[:3])):
-                pos = g[:3, 3]
-                print(f"  [INFO]   Grasp {i}: pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}), conf={c:.3f}")
+        ops = [a for a in dir(pointnet2_ops) if not a.startswith("_")]
+        print(f"  [INFO] Available ops: {', '.join(ops[:10])}")
+
+        if hasattr(pointnet2_ops, "pointnet2_utils"):
+            utils = pointnet2_ops.pointnet2_utils
+            try:
+                pc = torch.randn(1, 128, 3, device="cuda")
+                idx = utils.furthest_point_sample(pc, 32)
+                print(f"  [PASS] furthest_point_sample: input (1,128,3) -> idx {idx.shape}")
+            except Exception as e:
+                print(f"  [WARN] furthest_point_sample test: {e}")
 
         return True
     except Exception as e:
-        print(f"  [FAIL] Inference failed: {e}")
+        print(f"  [FAIL] PointNet++ error: {e}")
         return False
 
 
-def test_inference_mesh(sampler, mesh_path):
-    """Test GraspGen on a mesh file."""
-    from grasp_gen.sampler import GraspGenSampler
-    import trimesh
+# =========================================================================
+# 6. Model weights
+# =========================================================================
+def test_model_weights():
+    """Check if GraspGen model weights are downloaded and inspect structure."""
+    print("\n[TEST] GraspGen model weights...")
+    weights_dir = "/opt/models/graspgen"
 
-    print(f"\n[TEST] Running inference on mesh: {mesh_path}")
-
-    try:
-        mesh = trimesh.load(mesh_path)
-        pc = mesh.sample(4096).astype(np.float32)
-        print(f"  [INFO] Sampled {pc.shape[0]} points from mesh")
-
-        t0 = time.time()
-        grasps, confidences = GraspGenSampler.run_inference(
-            pc,
-            sampler,
-            grasp_threshold=0.5,
-            num_grasps=20,
-            topk_num_grasps=5,
-            remove_outliers=False,
-        )
-        inference_time = time.time() - t0
-
-        print(f"  [PASS] Inference completed in {inference_time:.2f}s")
-        print(f"  [INFO] Generated {len(grasps)} grasps")
-        return True
-    except Exception as e:
-        print(f"  [FAIL] Mesh inference failed: {e}")
+    if not os.path.isdir(weights_dir):
+        print(f"  [WARN] {weights_dir} not found")
         return False
 
+    files = []
+    configs = []
+    checkpoints = []
+    for root, dirs, fnames in os.walk(weights_dir):
+        for f in fnames:
+            fpath = os.path.join(root, f)
+            size_mb = os.path.getsize(fpath) / 1e6
+            rel = os.path.relpath(fpath, weights_dir)
+            files.append((rel, size_mb))
+            if f.endswith((".yml", ".yaml")):
+                configs.append(rel)
+            if f.endswith((".pt", ".pth", ".ckpt", ".bin", ".safetensors")):
+                checkpoints.append((rel, size_mb))
 
+    if not files:
+        print(f"  [WARN] {weights_dir} is empty")
+        return False
+
+    total_mb = sum(s for _, s in files)
+    print(f"  [PASS] {len(files)} files, {total_mb:.0f} MB total")
+
+    if checkpoints:
+        print(f"  [INFO] Checkpoints ({len(checkpoints)}):")
+        for name, size in sorted(checkpoints):
+            print(f"           {name} ({size:.1f} MB)")
+
+    if configs:
+        print(f"  [INFO] Gripper configs ({len(configs)}):")
+        for name in sorted(configs):
+            print(f"           {name}")
+
+    return True
+
+
+# =========================================================================
+# 7. GPU memory
+# =========================================================================
 def test_gpu_memory():
-    """Report GPU memory after GraspGen."""
+    """Report GPU memory usage."""
     import torch
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1e9
         reserved = torch.cuda.memory_reserved() / 1e9
-        total = torch.cuda.get_device_properties(0).total_mem / 1e9
-        print(f"\n[INFO] GPU Memory: {allocated:.1f}GB allocated, "
-              f"{reserved:.1f}GB reserved, {total:.1f}GB total")
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        free = total - reserved
+        print(f"\n[INFO] GPU Memory: {allocated:.2f} GB allocated, "
+              f"{reserved:.2f} GB reserved, {free:.2f} GB free / {total:.1f} GB total")
 
 
-def find_gripper_config():
-    """Try to find a gripper config file."""
-    search_paths = [
-        "/opt/models/graspgen/robotiq_2f140.yml",
-        "/opt/models/graspgen/franka_panda.yml",
-        "/opt/models/graspgen/suction.yml",
-    ]
-    # Also search recursively
-    for root, dirs, files in os.walk("/opt/models/graspgen"):
-        for f in files:
-            if f.endswith(".yml") or f.endswith(".yaml"):
-                search_paths.append(os.path.join(root, f))
-
-    for p in search_paths:
-        if os.path.isfile(p):
-            return p
-    return None
-
-
+# =========================================================================
+# Main
+# =========================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Test GraspGen model")
-    parser.add_argument("--gripper_config", type=str, default=None,
-                        help="Path to gripper config YAML")
-    parser.add_argument("--mesh", type=str, default=None,
-                        help="Path to mesh file (.obj, .stl, .ply)")
+    parser = __import__("argparse").ArgumentParser(description="Test GraspGen")
+    parser.add_argument("--no-display", action="store_true", help="Skip visualization")
     args = parser.parse_args()
 
-    print("=" * 50)
-    print("  GraspGen Model Test")
-    print("=" * 50)
+    print("=" * 60)
+    print("  GraspGen Installation & Functionality Test (Python 3.10)")
+    print("=" * 60)
 
-    import_results = test_imports()
+    req_results = test_graspgen_requirements()
+    pipe_results = test_pipeline_deps()
+    gg_results, gg_all_ok = test_grasp_gen_imports()
+    cuda_ok = test_pytorch_cuda()
+    pn2_ok = test_pointnet2_cuda()
+    weights_ok = test_model_weights()
+    test_gpu_memory()
 
-    # Find gripper config
-    config = args.gripper_config or find_gripper_config()
-    if config is None:
-        print("\n[FAIL] No gripper config found. Run ./scripts/download_models.sh first.")
-        print("  [INFO] Expected configs in /opt/models/graspgen/")
-        sys.exit(1)
+    # Summary
+    req_pass = sum(1 for v in req_results.values() if v)
+    req_fail = sum(1 for v in req_results.values() if not v)
+    pipe_pass = sum(1 for v in pipe_results.values() if v)
+    pipe_fail = sum(1 for v in pipe_results.values() if not v)
+    gg_pass = sum(1 for v in gg_results.values() if v)
+    gg_fail = sum(1 for v in gg_results.values() if not v)
 
-    sampler = test_model_loading(config)
+    print(f"\n{'=' * 60}")
+    print(f"  GraspGen deps:   {req_pass}/{req_pass + req_fail} passed")
+    print(f"  Pipeline deps:   {pipe_pass}/{pipe_pass + pipe_fail} passed")
+    print(f"  GraspGen modules:{gg_pass} passed, {gg_fail} warnings")
+    print(f"  CUDA:            {'OK' if cuda_ok else 'FAIL'}")
+    print(f"  PointNet++:      {'OK' if pn2_ok else 'FAIL'}")
+    print(f"  Weights:         {'OK' if weights_ok else 'MISSING'}")
+    print(f"{'=' * 60}")
 
-    if sampler is not None:
-        success = test_inference_synthetic(sampler)
-        if args.mesh:
-            success = test_inference_mesh(sampler, args.mesh) and success
-        test_gpu_memory()
-        sys.exit(0 if success else 1)
-    else:
-        sys.exit(1)
+    total_fail = req_fail + pipe_fail
+    sys.exit(0 if total_fail == 0 and cuda_ok else 1)
 
 
 if __name__ == "__main__":

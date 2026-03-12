@@ -7,8 +7,13 @@
 # --- Computer Vision & 3D Processing ---
 opencv-python>=4.8.0
 open3d>=0.17.0
+trimesh>=3.20.0
 pyrender>=0.1.45
 Pillow>=9.5.0
+
+# --- Scientific Computing (pip versions, system scipy removed) ---
+scipy>=1.10.0
+scikit-learn>=1.3.0
 
 # --- Robot Control ---
 roboticstoolbox-python>=1.0.0
