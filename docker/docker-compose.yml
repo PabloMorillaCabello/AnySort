@@ -48,6 +48,8 @@ services:
       - /dev:/dev
     privileged: true
     network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     stdin_open: true
     tty: true
     deploy:
