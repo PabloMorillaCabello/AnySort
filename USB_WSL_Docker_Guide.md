@@ -73,7 +73,7 @@ usbipd bind --busid 2-10
 - Only needs to be done once per device (persists across reboots usually)
 
 **If it fails with "Device busy":**
-- Close any Windows app using the device (Camera app, Teams, browser tabs, OBS, vendor software)
+- Close any Windows app using the device (Camera app, Teams, browser tabs, OBS, vendor software, DISCORD !!)
 - Retry the bind command
 
 **If you need to force it:**
