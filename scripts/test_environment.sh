@@ -4,8 +4,9 @@
 # Run inside the Docker container.
 #
 # Architecture:
-#   - System Python 3.10: ROS2 Humble + GraspGen + common packages
+#   - GraspGen venv Python 3.10: /opt/GraspGen/.venv/bin/python (uv-managed)
 #   - SAM3 venv Python 3.12: /opt/sam3env/bin/python (SAM3 only)
+#   - Dobot API: /opt/Dobot_hv (on PYTHONPATH)
 #
 # Usage: ./scripts/test_environment.sh
 # =============================================================================
@@ -23,15 +24,15 @@ echo "============================================"
 echo "  Environment Verification Tests"
 echo "============================================"
 
-# --- 1. Python versions (dual architecture) ---
+# --- 1. Python versions ---
 echo ""
-echo "--- Python (Dual Architecture) ---"
+echo "--- Python ---"
 PY_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
 PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
 if [ "$PY_MINOR" -eq 10 ]; then
-    pass "System Python $PY_VERSION (3.10 required for ROS2 Humble)"
+    pass "GraspGen venv Python $PY_VERSION (3.10 required)"
 else
-    fail "System Python $PY_VERSION (expected 3.10 for ROS2 Humble)"
+    fail "GraspGen venv Python $PY_VERSION (expected 3.10)"
 fi
 
 if [ -x "/opt/sam3env/bin/python" ]; then
@@ -68,9 +69,9 @@ echo ""
 echo "--- PyTorch ---"
 PT_VER=$(python3 -c "import torch; print(torch.__version__)" 2>/dev/null)
 if [ -n "$PT_VER" ]; then
-    pass "PyTorch $PT_VER (system Python 3.10)"
+    pass "PyTorch $PT_VER (GraspGen venv Python 3.10)"
 else
-    fail "PyTorch not importable (system Python 3.10)"
+    fail "PyTorch not importable (GraspGen venv Python 3.10)"
 fi
 
 SAM3_PT=$(/opt/sam3env/bin/python -c "import torch; print(torch.__version__)" 2>/dev/null)
@@ -102,9 +103,9 @@ else
     warn "Sam3Model not in transformers (may need newer version)"
 fi
 
-# --- 5. GraspGen (system Python 3.10) ---
+# --- 5. GraspGen (uv-managed venv Python 3.10) ---
 echo ""
-echo "--- GraspGen (System Python 3.10) ---"
+echo "--- GraspGen (uv-managed venv Python 3.10) ---"
 if python3 -c "import grasp_gen; print('OK')" 2>/dev/null; then
     pass "grasp_gen package importable"
 else
@@ -129,7 +130,22 @@ else
     fail "torch_geometric NOT importable"
 fi
 
-# --- 6. ROS2 ---
+# --- 6. Dobot TCP/IP API ---
+echo ""
+echo "--- Dobot Robot API ---"
+if [ -d "/opt/Dobot_hv" ]; then
+    pass "Dobot_hv repository present at /opt/Dobot_hv"
+else
+    fail "Dobot_hv NOT found at /opt/Dobot_hv"
+fi
+
+if python3 -c "import dobot_api; print('OK')" 2>/dev/null; then
+    pass "dobot_api importable"
+else
+    warn "dobot_api NOT importable (check PYTHONPATH includes /opt/Dobot_hv)"
+fi
+
+# --- 7. ROS2 ---
 echo ""
 echo "--- ROS2 ---"
 if command -v ros2 &>/dev/null; then
@@ -144,7 +160,7 @@ else
     fail "ROS2 Humble not found"
 fi
 
-# --- 7. ROS2 Packages ---
+# --- 8. ROS2 Packages ---
 echo ""
 echo "--- ROS2 Packages ---"
 for pkg in orbbec_camera ur_robot_driver moveit; do
@@ -155,7 +171,7 @@ for pkg in orbbec_camera ur_robot_driver moveit; do
     fi
 done
 
-# --- 8. Model Weights ---
+# --- 9. Model Weights ---
 echo ""
 echo "--- Model Weights ---"
 if [ -d "/opt/models/sam3" ] && [ "$(ls -A /opt/models/sam3 2>/dev/null)" ]; then
@@ -164,13 +180,13 @@ else
     warn "SAM3 weights NOT found (run: ./scripts/download_models.sh)"
 fi
 
-if [ -d "/opt/models/graspgen" ] && [ "$(ls -A /opt/models/graspgen 2>/dev/null)" ]; then
-    pass "GraspGen weights present in /opt/models/graspgen"
+if [ -d "/opt/GraspGen/GraspGenModels" ] && [ "$(ls -A /opt/GraspGen/GraspGenModels 2>/dev/null)" ]; then
+    pass "GraspGen weights present in /opt/GraspGen/GraspGenModels"
 else
-    warn "GraspGen weights NOT found (run: ./scripts/download_models.sh)"
+    warn "GraspGen weights NOT found (run: cd /opt/GraspGen && git clone https://huggingface.co/adithyamurali/GraspGenModels)"
 fi
 
-# --- 9. SAM3 Server Bridge ---
+# --- 10. SAM3 Server Bridge ---
 echo ""
 echo "--- SAM3 Server Bridge ---"
 if [ -f "/ros2_ws/scripts/sam3_server.py" ]; then
@@ -179,9 +195,9 @@ else
     warn "sam3_server.py not found (should be volume-mounted)"
 fi
 
-# --- 10. Key Python packages (system) ---
+# --- 11. Key Python packages (GraspGen venv) ---
 echo ""
-echo "--- Additional Python Packages (System) ---"
+echo "--- Additional Python Packages ---"
 for pkg in cv2 open3d trimesh pymodbus serial hydra; do
     if python3 -c "import $pkg" 2>/dev/null; then
         pass "Python: $pkg"
@@ -197,8 +213,9 @@ echo "  Results: $PASS passed, $FAIL failed, $WARN warnings"
 echo "============================================"
 echo ""
 echo "  Architecture:"
-echo "    System (Python 3.10): ROS2 + GraspGen + common packages"
+echo "    GraspGen venv (Python 3.10): /opt/GraspGen/.venv/bin/python (uv-managed)"
 echo "    SAM3 venv (Python 3.12): /opt/sam3env/bin/python"
+echo "    Dobot API: /opt/Dobot_hv (on PYTHONPATH)"
 echo ""
 
 if [ $FAIL -gt 0 ]; then

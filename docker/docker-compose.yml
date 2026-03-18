@@ -17,6 +17,13 @@ services:
         TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.6;8.9}
     image: graspgen-thesis:latest
     container_name: graspgen_dev
+    ports:
+      - "8080:8080"    # Viser / web UI
+      - "7860:7860"    # Viser alternate port
+      - "7000:7000"
+      - "6000:6000"
+      - "29999:29999"  # Dobot dashboard (TCP/IP control)
+      - "30004:30004"  # Dobot real-time feedback
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -26,7 +33,7 @@ services:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - HF_TOKEN=${HF_TOKEN:-}
-      - PYTHONPATH=/opt/GraspGen
+      - PYTHONPATH=/opt/GraspGen:/opt/Dobot_hv
       - CUDA_HOME=/usr/local/cuda
     volumes:
       # Mount ROS2 workspace packages (your pipeline code)
@@ -44,7 +51,7 @@ services:
       # Camera device access (Orbbec USB)
       - /dev:/dev
     privileged: true
-    network_mode: host
+    #network_mode: host
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stdin_open: true

@@ -208,7 +208,7 @@ def test_pointnet2_cuda():
 def test_model_weights():
     """Check if GraspGen model weights are downloaded and inspect structure."""
     print("\n[TEST] GraspGen model weights...")
-    weights_dir = "/opt/models/graspgen"
+    weights_dir = "/opt/GraspGen/GraspGenModels"
 
     if not os.path.isdir(weights_dir):
         print(f"  [WARN] {weights_dir} not found")

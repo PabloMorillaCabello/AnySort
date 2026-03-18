@@ -49,11 +49,14 @@ echo "  -> SAM3 weights saved to: ${SAM3_DIR}"
 # --- GraspGen ---
 echo ""
 echo "[2/2] Downloading GraspGen models (adithyamurali/GraspGenModels)..."
-GRASPGEN_DIR="${MODELS_DIR}/graspgen"
-mkdir -p "$GRASPGEN_DIR"
-huggingface-cli download adithyamurali/GraspGenModels \
-    --local-dir "$GRASPGEN_DIR" \
-    --token "$HF_TOKEN"
+GRASPGEN_DIR="/opt/GraspGen/GraspGenModels"
+if [ ! -d "$GRASPGEN_DIR" ]; then
+    cd /opt/GraspGen
+    git clone https://huggingface.co/adithyamurali/GraspGenModels
+else
+    echo "  -> GraspGenModels already exists, pulling latest..."
+    cd "$GRASPGEN_DIR" && git pull
+fi
 echo "  -> GraspGen weights saved to: ${GRASPGEN_DIR}"
 
 echo ""
@@ -61,7 +64,7 @@ echo "============================================"
 echo "  All models downloaded successfully!"
 echo ""
 echo "  SAM3:     ${SAM3_DIR}"
-echo "  GraspGen: ${GRASPGEN_DIR}"
+echo "  GraspGen: /opt/GraspGen/GraspGenModels"
 echo ""
 echo "  Available GraspGen gripper configs:"
 ls -1 "${GRASPGEN_DIR}"/*.yml 2>/dev/null || echo "    (check subdirectories)"

@@ -1,15 +1,16 @@
 # =============================================================================
 # GraspGen Thesis - Development Environment
-# CUDA 12.6 + ROS2 Humble (Python 3.10) + SAM3 (Python 3.12 venv) + GraspGen
+# CUDA 12.6 + ROS2 Humble + GraspGen (uv venv) + SAM3 (Python 3.12 venv)
 #
 # Architecture:
 #   - ROS2 Humble: Python 3.10 (system default, Ubuntu 22.04 debs)
-#   - GraspGen: Python 3.10 (same as ROS2, shares PyTorch 2.7)
+#   - GraspGen: Python 3.10 (uv-managed venv at /opt/GraspGen/.venv)
 #   - SAM3: Python 3.12 (isolated venv at /opt/sam3env)
+#   - Dobot API: TCP/IP robot control (/opt/Dobot_hv, on PYTHONPATH)
 #
 # Compatibility:
 #   - SAM3 requires: Python 3.12+, PyTorch 2.7+, CUDA 12.6+
-#   - GraspGen works with: Python 3.10+, PyTorch 2.1+ (tested with 2.7)
+#   - GraspGen works with: Python 3.10+, PyTorch (managed by uv)
 #   - ROS2 Humble: Python 3.10 only (binary packages)
 # =============================================================================
 FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
@@ -57,9 +58,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
-# 2. System Dependencies (build tools, Python 3.12, Orbbec SDK deps, OpenGL)
+# 2. System Dependencies (build tools, Python 3.12 for SAM3, OpenGL, etc.)
 # =============================================================================
-# Add deadsnakes PPA for Python 3.12 (needed for SAM3 venv only)
 RUN add-apt-repository ppa:deadsnakes/ppa -y && apt-get update && apt-get install -y \
     git wget unzip build-essential cmake ninja-build \
     python3.12 python3.12-venv python3.12-dev \
@@ -68,80 +68,68 @@ RUN add-apt-repository ppa:deadsnakes/ppa -y && apt-get update && apt-get instal
     libgflags-dev nlohmann-json3-dev libgoogle-glog-dev \
     libssl-dev libdw-dev mesa-utils libgl1 libgl1-mesa-glx \
     libegl1-mesa libglib2.0-0 libsm6 libxrender1 libxext6 \
-    python3-tk python3.12-tk feh \
-    && rm -rf /var/lib/apt/lists/*
-
-# Upgrade system pip (for Python 3.10 - ROS2/GraspGen environment)
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+    python3-tk python3.12-tk feh git-lfs \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install
 
 # =============================================================================
-# 3. PyTorch 2.7 + CUDA 12.6 (for Python 3.10 - shared by ROS2 and GraspGen)
+# 3. GraspGen - Install via uv with Python 3.10 venv
 # =============================================================================
-# Remove distutils-installed packages that conflict with PyTorch dependencies
-# Remove distutils-installed system packages that conflict with pip upgrades
-# (sympy conflicts with PyTorch, blinker with Flask/roboticstoolbox,
-#  scipy compiled against NumPy 1.x breaks with NumPy 2.x)
-RUN rm -rf /usr/lib/python3/dist-packages/sympy* \
-           /usr/lib/python3/dist-packages/mpmath* \
-           /usr/lib/python3/dist-packages/scipy* \
-           /usr/lib/python3/dist-packages/blinker*
-
-RUN pip3 install --no-cache-dir \
-    torch==2.7.0 \
-    torchvision==0.22.0 \
-    torchaudio==2.7.0 \
-    --index-url https://download.pytorch.org/whl/cu126
-
-
-# =============================================================================
-# 4. GraspGen - Clone and install from source (Python 3.10)
-# =============================================================================
-# GraspGen pins torch==2.1.0 in pyproject.toml, but works fine with 2.7.
-# Use --no-deps to skip its pinned torch, then install its other deps separately.
-RUN git clone https://github.com/NVlabs/GraspGen.git /opt/GraspGen \
-    && cd /opt/GraspGen \
-    && pip3 install --no-cache-dir --no-deps -e . \
-    && pip3 install --no-cache-dir \
-       numpy==1.26.4 \
-       hydra-core h5py webdataset scikit-learn scipy \
-       tensorboard tensorboardx trimesh==4.5.3 diffusers==0.11.1 \
-       addict yapf==0.40.1 \
-       yourdfpy==0.0.56 imageio meshcat msgpack msgpack-numpy \
-       timm==1.0.15 transformers tensordict huggingface-hub==0.25.2
-# Note: pickle5 removed (built-in since Python 3.8)
-# Note: sharedarray removed (often fails to compile, optional for GraspGen)
-# Note: PyOpenGL will be installed by pyrender at its required version
+# Install uv package manager (handles dependency resolution much better than pip)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
 
 # Limit parallel compilation jobs to prevent freezes on low-RAM systems
 ENV MAX_JOBS=2
 
-# Install PointNet++ CUDA extensions (recompile for CUDA 12.6)
 # Set compute capability for your GPU (8.6=RTX 3060, 8.9=RTX 4090, 9.0=H100)
 ARG TORCH_CUDA_ARCH_LIST="8.6"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
-# PointNet++ needs g++ as the CUDA host compiler
-ENV CC=g++
-ENV CXX=g++
+
+# Clone GraspGen, create venv, install all deps + PointNet++ CUDA extensions
+SHELL ["/bin/bash", "-c"]
+RUN git clone https://github.com/NVlabs/GraspGen.git /opt/GraspGen \
+    && cd /opt/GraspGen \
+    && uv python install 3.10 \
+    && uv venv --python 3.10 .venv \
+    && source .venv/bin/activate \
+    && uv pip install -e . \
+    && chmod +x install_uv_pointnet.sh \
+    && ./install_uv_pointnet.sh \
+    && python tests/test_inference_installation.py
+
+# Download GraspGen model checkpoints via git-lfs
 RUN cd /opt/GraspGen \
-    && pip3 install --no-cache-dir --no-build-isolation pointnet2_ops/
-
-# Reset CC/CXX back to gcc after PointNet++ build
-# (roboticstoolbox-python has C code using 'delete' as a function name,
-#  which is a reserved keyword in C++ — so g++ would reject it)
-ENV CC=gcc
-ENV CXX=g++
-
-# spconv for CUDA 12.6 (replaces spconv-cu120 from GraspGen requirements)
-RUN pip3 install --no-cache-dir spconv-cu126
-
-# PyTorch Geometric + extensions (for GraspGen graph networks)
-# --no-build-isolation lets torch-scatter/torch-cluster see the installed PyTorch
-# during compilation (otherwise pip creates a clean env without torch)
-RUN pip3 install --no-cache-dir torch-geometric \
-    && pip3 install --no-cache-dir --no-build-isolation torch-scatter torch-cluster
+    && git clone https://huggingface.co/adithyamurali/GraspGenModels
 
 # =============================================================================
-# 5. SAM3 - Create Python 3.12 venv and install SAM3 there
+# 4. Additional pipeline dependencies (installed into GraspGen venv)
+# =============================================================================
+COPY requirements.txt /tmp/requirements.txt
+RUN source /opt/GraspGen/.venv/bin/activate \
+    && uv pip install "numpy<2" \
+    && uv pip install -r /tmp/requirements.txt \
+    && uv pip install pymodbus pyserial
+
+# Make tkinter accessible in the venv (needed for Dobot UI).
+# tkinter is a system C extension that can't be pip-installed; if the uv-managed
+# Python doesn't bundle it, symlink the system copy into the venv's site-packages.
+RUN /opt/GraspGen/.venv/bin/python -c "import tkinter" 2>/dev/null \
+    || { SITE=$(/opt/GraspGen/.venv/bin/python -c "import site; print(site.getsitepackages()[0])") \
+         && cp -a /usr/lib/python3.10/tkinter "$SITE/" 2>/dev/null \
+         && cp -a /usr/lib/python3.10/lib-dynload/_tkinter*.so "$SITE/" 2>/dev/null \
+         && echo "Symlinked system tkinter into GraspGen venv"; } \
+    || echo "WARNING: tkinter not available (Dobot UI may not work)"
+
+# =============================================================================
+# 5. Dobot TCP/IP Robot API
+# =============================================================================
+# Python API for controlling Dobot robots via TCP/IP (ports 29999, 30004)
+# Only needs numpy (already in GraspGen venv)
+RUN git clone https://github.com/dauken85/Dobot_hv.git /opt/Dobot_hv
+
+# =============================================================================
+# 6. SAM3 - Python 3.12 venv (separate from GraspGen due to Python version)
 # =============================================================================
 # Create isolated Python 3.12 environment for SAM3
 RUN python3.12 -m venv /opt/sam3env
@@ -154,8 +142,7 @@ RUN /opt/sam3env/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
        torchaudio==2.7.0 \
        --index-url https://download.pytorch.org/whl/cu126
 
-# Ensure setuptools is available (provides pkg_resources, required by sam3.model_builder)
-# Also install transformers for the HuggingFace SAM3 API
+# Install transformers (for HuggingFace SAM3 API)
 RUN /opt/sam3env/bin/pip install --no-cache-dir setuptools transformers
 
 # Clone SAM3 and install in the 3.12 venv
@@ -163,44 +150,22 @@ RUN git clone https://github.com/facebookresearch/sam3.git /opt/sam3 \
     && cd /opt/sam3 \
     && /opt/sam3env/bin/pip install --no-cache-dir -e ".[notebooks]"
 
-# =============================================================================
-# 6. Common Python Dependencies (Python 3.10 environment)
-# =============================================================================
-COPY requirements.txt /tmp/requirements.txt
-# Remove distutils-installed system packages that pip cannot uninstall cleanly
-RUN rm -rf /usr/lib/python3/dist-packages/blinker* \
-    && pip3 install --no-cache-dir -r /tmp/requirements.txt
-
-# =============================================================================
-# 7. Robotiq 3F Gripper (Python 3.10)
-# =============================================================================
-RUN pip3 install --no-cache-dir pymodbus pyserial
-
-# =============================================================================
-# 8. Download Model Weights (at build time, requires HF_TOKEN)
-# =============================================================================
+# Download SAM3 weights (requires HF_TOKEN)
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
-
-# Download SAM3 weights using SAM3's Python 3.12 environment
 RUN if [ -n "$HF_TOKEN" ]; then \
       echo "==> Downloading SAM3 weights from HuggingFace..." && \
-      /opt/sam3env/bin/python -c "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id='facebook/sam3', local_dir='/opt/models/sam3', token=os.environ.get('HF_TOKEN')); print('SAM3 weights downloaded')" && \
-      echo "==> Downloading GraspGen model checkpoints..." && \
-      python3 -c "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id='adithyamurali/GraspGenModels', local_dir='/opt/models/graspgen', token=os.environ.get('HF_TOKEN')); print('GraspGen weights downloaded')" ; \
+      /opt/sam3env/bin/python -c "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id='facebook/sam3', local_dir='/opt/models/sam3', token=os.environ.get('HF_TOKEN')); print('SAM3 weights downloaded')" ; \
     else \
-      echo "WARNING: HF_TOKEN not set. Model weights NOT downloaded." ; \
+      echo "WARNING: HF_TOKEN not set. SAM3 weights NOT downloaded." ; \
       echo "Run scripts/download_models.sh inside the container after setting HF_TOKEN." ; \
     fi
 
 # =============================================================================
-# 9. ROS2 Workspace - Clone Orbbec SDK ROS2
+# 7. ROS2 Workspace - Clone Orbbec SDK ROS2
 # =============================================================================
 ENV ROS_WS=/ros2_ws
 WORKDIR ${ROS_WS}
-
-# Use bash for sourcing ROS setup
-SHELL ["/bin/bash", "-c"]
 
 RUN mkdir -p src && cd src \
     && git clone --branch v2-main https://github.com/orbbec/OrbbecSDK_ROS2.git
@@ -216,20 +181,23 @@ RUN rosdep init || true && rosdep update \
     && rosdep install --from-paths src --ignore-src -r -y || true
 
 # =============================================================================
-# 10. Environment Setup
+# 8. Environment Setup
 # =============================================================================
 RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
     echo "source /ros2_ws/install/setup.bash 2>/dev/null || true" >> /root/.bashrc && \
     echo "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" >> /root/.bashrc && \
-    echo "export PYTHONPATH=/opt/GraspGen:\${PYTHONPATH}" >> /root/.bashrc && \
     echo "export CUDA_HOME=/usr/local/cuda" >> /root/.bashrc && \
     echo "" >> /root/.bashrc && \
-    echo "# SAM3 Python 3.12 environment activation helper" >> /root/.bashrc && \
-    echo "alias sam3_activate='source /opt/sam3env/bin/activate'" >> /root/.bashrc && \
-    echo "# Note: Run 'sam3_activate' to use SAM3 in Python 3.12 venv" >> /root/.bashrc
+    echo "# Activate GraspGen Python 3.10 venv (uv-managed)" >> /root/.bashrc && \
+    echo "source /opt/GraspGen/.venv/bin/activate" >> /root/.bashrc && \
+    echo "export PYTHONPATH=/opt/GraspGen:/opt/Dobot_hv:\${PYTHONPATH}" >> /root/.bashrc && \
+    echo "" >> /root/.bashrc && \
+    echo "# Environment switching helpers" >> /root/.bashrc && \
+    echo "alias sam3_activate='deactivate 2>/dev/null; source /opt/sam3env/bin/activate'" >> /root/.bashrc && \
+    echo "alias graspgen_activate='deactivate 2>/dev/null; source /opt/GraspGen/.venv/bin/activate'" >> /root/.bashrc
 
 # =============================================================================
-# 11. Entrypoint
+# 9. Entrypoint
 # =============================================================================
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
