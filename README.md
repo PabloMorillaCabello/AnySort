@@ -25,6 +25,27 @@ Orbbec Gemini 2 ──> SAM3 Segmentation ──> GraspGen ──> MoveIt2 Plann
 | GraspGen Models | — | — | `/opt/GraspGen/GraspGenModels` (git-lfs) |
 | SAM3 Models | — | — | `/opt/models/sam3` (HuggingFace) |
 
+## Container Directory Layout
+
+Inside the container there are two key areas. Understanding this avoids path confusion:
+
+- **`/opt/`** — Third-party software baked into the Docker image during build. You don't edit these; they come from upstream repos.
+  - `/opt/GraspGen/` — NVlabs GraspGen repo + `.venv/` (uv Python 3.10) + `GraspGenModels/` (checkpoints)
+  - `/opt/sam3/` — Facebook SAM3 repo
+  - `/opt/sam3env/` — Python 3.12 venv for SAM3
+  - `/opt/models/sam3/` — SAM3 model weights
+  - `/opt/Dobot_hv/` — Dobot TCP/IP API
+
+- **`/ros2_ws/`** — The ROS2 workspace and **your working directory** (where you land when entering the container). Your repo folders are volume-mounted here:
+  - `/ros2_ws/scripts/` ← `scripts/` from your repo (test scripts, utilities)
+  - `/ros2_ws/src/graspgen_pipeline/` ← `ros2_ws/src/graspgen_pipeline/` (your pipeline code)
+  - `/ros2_ws/src/robotiq_3f_driver/` ← `ros2_ws/src/robotiq_3f_driver/`
+  - `/ros2_ws/data/`, `results/`, `config/` ← volume-mounted from your repo
+  - `/ros2_ws/src/OrbbecSDK_ROS2/` — cloned during build (not from your repo)
+  - `/ros2_ws/install/` — built by colcon on first run
+
+All commands in this README assume you are at `/ros2_ws/` (the default). Commands that need GraspGen's own files (its bundled demos/tests) explicitly `cd /opt/GraspGen` first.
+
 ## Repository Structure
 
 ```
@@ -57,6 +78,7 @@ GraspGen_Thesis_Repo/
 │   ├── test_sam3.py                  # Test SAM3 loading + inference
 │   ├── test_graspgen.py              # Test GraspGen loading + inference
 │   ├── test_camera.sh                # Test Orbbec Gemini 2 via ROS2
+│   ├── test_webcam.py                # Quick live video feed test (any camera)
 │   └── test_full_pipeline.py         # End-to-end integration test
 ├── config/                           # Global config overrides
 ├── data/                             # Captured data (git-ignored)
@@ -213,10 +235,11 @@ To skip visualization (headless / no X11):
 python3 scripts/test_graspgen.py --no-display
 ```
 
-You can also run GraspGen's own inference test directly:
+You can also run GraspGen's own bundled tests (these live inside `/opt/GraspGen/`, not in your repo):
 
 ```bash
-python tests/test_inference_installation.py        # from /opt/GraspGen
+cd /opt/GraspGen
+python tests/test_inference_installation.py
 ```
 
 And the bundled demo on real scene data:
@@ -225,9 +248,11 @@ And the bundled demo on real scene data:
 cd /opt/GraspGen
 python scripts/demo_scene_pc.py \
   --filter_collisions \
-  --sample_data_dir /opt/GraspGen/GraspGenModels/sample_data/real_scene_pc \
-  --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_franka_panda.yml
+  --sample_data_dir GraspGenModels/sample_data/real_scene_pc \
+  --gripper_config GraspGenModels/checkpoints/graspgen_franka_panda.yml
 ```
+
+To return to your working directory afterwards: `cd /ros2_ws`
 
 ### 3. SAM3 (text-prompted segmentation)
 
