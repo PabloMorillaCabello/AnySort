@@ -209,14 +209,14 @@ graspgen_activate
 
 ## Testing Each Component
 
-All tests run inside the container (`docker compose exec graspgen bash`). Use these to verify each part of the stack independently.
+All tests run inside the container (`docker compose exec graspgen bash`). Make sure you are at `/ros2_ws/` first (type `cd /ros2_ws` if unsure). All commands below use absolute paths so they work from anywhere, but relative paths like `./scripts/...` only work from `/ros2_ws/`.
 
 ### 1. Full Environment Check
 
 Runs a quick pass/fail sweep across every dependency: Python versions, CUDA, PyTorch, GraspGen imports, SAM3 imports, Dobot API, ROS2 packages, model weights, and key Python libraries.
 
 ```bash
-./scripts/test_environment.sh
+/ros2_ws/scripts/test_environment.sh
 ```
 
 Expected output: a summary line like `Results: 25 passed, 0 failed, 2 warnings`. Any `[FAIL]` lines indicate something that needs fixing before the pipeline will work.
@@ -226,13 +226,13 @@ Expected output: a summary line like `Results: 25 passed, 0 failed, 2 warnings`.
 Tests all GraspGen dependencies (23+ packages), deep-imports every `grasp_gen` submodule, verifies PointNet++ CUDA extensions compile and run, checks model weights are present, and runs a GPU matmul sanity check.
 
 ```bash
-python3 scripts/test_graspgen.py
+python3 /ros2_ws/scripts/test_graspgen.py
 ```
 
 To skip visualization (headless / no X11):
 
 ```bash
-python3 scripts/test_graspgen.py --no-display
+python3 /ros2_ws/scripts/test_graspgen.py --no-display
 ```
 
 You can also run GraspGen's own bundled tests (these live inside `/opt/GraspGen/`, not in your repo):
@@ -259,19 +259,19 @@ To return to your working directory afterwards: `cd /ros2_ws`
 Tests SAM3 in its Python 3.12 venv: verifies the package imports (native API and HuggingFace Transformers API), loads the model, runs inference on a synthetic image with a text prompt, and saves a 3-panel visualization.
 
 ```bash
-/opt/sam3env/bin/python scripts/test_sam3.py
+/opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py
 ```
 
 With a custom image and prompt:
 
 ```bash
-/opt/sam3env/bin/python scripts/test_sam3.py --image /path/to/image.jpg --prompt "cup"
+/opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py --image /path/to/image.jpg --prompt "cup"
 ```
 
 Headless (no X11 display needed):
 
 ```bash
-/opt/sam3env/bin/python scripts/test_sam3.py --no-display
+/opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py --no-display
 ```
 
 Output is saved to `/ros2_ws/results/sam3_test_result.png`.
@@ -281,13 +281,13 @@ Output is saved to `/ros2_ws/results/sam3_test_result.png`.
 Tests the camera hardware chain: USB device detection, udev rules, ROS2 `orbbec_camera` package, topic publishing, and data flow frequency. Requires the camera to be physically plugged in.
 
 ```bash
-./scripts/test_camera.sh
+/ros2_ws/scripts/test_camera.sh
 ```
 
 For a quick live video feed check (any camera, not just Orbbec):
 
 ```bash
-python3 scripts/test_webcam.py    # press 'q' to quit
+python3 /ros2_ws/scripts/test_webcam.py    # press 'q' to quit
 ```
 
 ### 5. Dobot Robot API
@@ -321,7 +321,7 @@ ros2 pkg list | grep -E "orbbec_camera|ur_robot_driver|moveit"
 If packages are missing, build the workspace:
 
 ```bash
-./scripts/build_workspace.sh
+/ros2_ws/scripts/build_workspace.sh
 ```
 
 ### 7. End-to-End Pipeline (no hardware)
@@ -338,7 +338,7 @@ ros2 launch graspgen_pipeline full_pipeline.launch.py \
 Terminal 2 — run the integration test:
 
 ```bash
-python3 scripts/test_full_pipeline.py
+python3 /ros2_ws/scripts/test_full_pipeline.py
 ```
 
 Reports whether segmentation masks and grasp poses were received, along with the best grasp position.
