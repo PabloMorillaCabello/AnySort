@@ -1,0 +1,47 @@
+--- a/ui.py
++++ b/ui.py
+@@ -419,16 +419,27 @@
+
+     def feed_back(self):
++        PACKET_SIZE = 1440
+         while True:
+-            print("self.global_state(connect)", self.global_state["connect"])
+             if not self.global_state["connect"]:
+                 break
+-
+-            self.client_feed.socket_dobot.setblocking(True)  # 设置为阻塞模式
+-            data = bytes()
+-            temp = self.client_feed.socket_dobot.recv(144000)
+-            if len(temp) > 1440:
+-                temp = self.client_feed.socket_dobot.recv(144000)
+-            data = temp[0:1440]
+-
+-
+-            a = np.frombuffer(data, dtype=MyType)
+-            print("robot_mode:", a["RobotMode"][0])
+-            print("TestValue:", hex((a['TestValue'][0])))
+-            if hex((a['TestValue'][0])) == '0x123456789abcdef':
++            try:
++                self.client_feed.socket_dobot.setblocking(True)
++                data = bytes()
++                while len(data) < PACKET_SIZE:
++                    remaining = PACKET_SIZE - len(data)
++                    chunk = self.client_feed.socket_dobot.recv(remaining)
++                    if not chunk:
++                        break
++                    data += chunk
++                if len(data) < PACKET_SIZE:
++                    print(f"[feedback] incomplete packet ({len(data)}/{PACKET_SIZE} bytes), reconnecting...")
++                    time.sleep(0.5)
++                    continue
++                a = np.frombuffer(data, dtype=MyType)
++                if hex((a['TestValue'][0])) != '0x123456789abcdef':
++                    continue
++            except Exception as e:
++                print(f"[feedback] error: {e}")
++                time.sleep(0.5)
++                continue
++            try:
+                 # print('tool_vector_actual',
+                 #       np.around(a['tool_vector_actual'], decimals=4))
+                 # print('QActual', np.around(a['q_aQActualctual'], decimals=4))

@@ -105,11 +105,11 @@ RUN cd /opt/GraspGen \
 # =============================================================================
 # 4. Additional pipeline dependencies (installed into GraspGen venv)
 # =============================================================================
-COPY requirements.txt /tmp/requirements.txt
+COPY docker/requirements.txt /tmp/requirements.txt
 RUN source /opt/GraspGen/.venv/bin/activate \
     && uv pip install "numpy<2" \
     && uv pip install -r /tmp/requirements.txt \
-    && uv pip install pymodbus pyserial
+    && uv pip install pymodbus pyserial pyorbbecsdk
 
 # Make tkinter accessible in the venv (needed for Dobot UI).
 # tkinter is a system C extension that can't be pip-installed; if the uv-managed
@@ -127,6 +127,11 @@ RUN /opt/GraspGen/.venv/bin/python -c "import tkinter" 2>/dev/null \
 # Python API for controlling Dobot robots via TCP/IP (ports 29999, 30004)
 # Only needs numpy (already in GraspGen venv)
 RUN git clone https://github.com/dauken85/Dobot_hv.git /opt/Dobot_hv
+
+# Fix feed_back() TCP partial-read crash (ValueError: buffer size must be a
+# multiple of element size). See docker/patches/fix_dobot_feedback.py
+COPY docker/patches/fix_dobot_feedback.py /tmp/patches/fix_dobot_feedback.py
+RUN python3 /tmp/patches/fix_dobot_feedback.py /opt/Dobot_hv/ui.py
 
 # =============================================================================
 # 6. SAM3 - Python 3.12 venv (separate from GraspGen due to Python version)
@@ -162,7 +167,16 @@ RUN if [ -n "$HF_TOKEN" ]; then \
     fi
 
 # =============================================================================
-# 7. ROS2 Workspace - Clone Orbbec SDK ROS2
+# 7. Orbbec Camera - SDK + ROS2 Wrapper
+# =============================================================================
+# Install Orbbec SDK v2.7.6 (provides liborbbec, headers, and udev rules).
+# The .deb is in data/ (tracked in repo). If not present, download from GitHub.
+COPY data/OrbbecSDK_v2.7.6_amd64.deb /tmp/OrbbecSDK_v2.7.6_amd64.deb
+RUN dpkg -i /tmp/OrbbecSDK_v2.7.6_amd64.deb; apt-get install -f -y \
+    && rm /tmp/OrbbecSDK_v2.7.6_amd64.deb
+
+# =============================================================================
+# 8. ROS2 Workspace - Build OrbbecSDK_ROS2 + project packages
 # =============================================================================
 ENV ROS_WS=/ros2_ws
 WORKDIR ${ROS_WS}
@@ -170,7 +184,7 @@ WORKDIR ${ROS_WS}
 RUN mkdir -p src && cd src \
     && git clone --branch v2-main https://github.com/orbbec/OrbbecSDK_ROS2.git
 
-# Install udev rules for Orbbec cameras (note: effective on host, not in container)
+# Install udev rules for Orbbec cameras (effective on host, baked into image)
 RUN cd src/OrbbecSDK_ROS2/orbbec_camera/scripts \
     && chmod +x install_udev_rules.sh \
     && bash install_udev_rules.sh || true
@@ -180,8 +194,14 @@ RUN rosdep init || true && rosdep update \
     && source /opt/ros/humble/setup.bash \
     && rosdep install --from-paths src --ignore-src -r -y || true
 
+# Build the ROS2 workspace (OrbbecSDK_ROS2 + any packages in src/)
+RUN source /opt/ros/humble/setup.bash \
+    && colcon build --symlink-install \
+       --cmake-args -DCMAKE_BUILD_TYPE=Release \
+       --parallel-workers 2
+
 # =============================================================================
-# 8. Environment Setup
+# 9. Environment Setup
 # =============================================================================
 RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
     echo "source /ros2_ws/install/setup.bash 2>/dev/null || true" >> /root/.bashrc && \
@@ -197,9 +217,9 @@ RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc && \
     echo "alias graspgen_activate='deactivate 2>/dev/null; source /opt/GraspGen/.venv/bin/activate'" >> /root/.bashrc
 
 # =============================================================================
-# 9. Entrypoint
+# 10. Entrypoint
 # =============================================================================
-COPY entrypoint.sh /entrypoint.sh
+COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash"]

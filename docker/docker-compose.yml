@@ -10,8 +10,8 @@
 services:
   graspgen:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
       args:
         HF_TOKEN: ${HF_TOKEN:-}
         TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.6;8.9}
@@ -50,8 +50,13 @@ services:
       - ../scripts:/ros2_ws/scripts
       # Camera device access (Orbbec USB)
       - /dev:/dev
-    privileged: true
-    #network_mode: host
+      - /dev/bus/usb:/dev/bus/usb
+    # USB + video device access (more secure than privileged: true)
+    device_cgroup_rules:
+      - 'c 189:* rwm'   # USB devices (/dev/bus/usb)
+      - 'c 180:* rwm'   # USB serial
+      - 'c 81:* rwm'    # Video devices (/dev/video*)
+    #network_mode: host  # Uncomment for ROS2 multi-machine DDS discovery
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stdin_open: true

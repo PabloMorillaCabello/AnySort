@@ -20,9 +20,14 @@ def main():
     print("  Webcam Viewer")
     print("=" * 60)
 
-    camera_index = 0
-    req_width = 640
-    req_height = 480
+    # ORBECC RGB
+    camera_index = 4
+    req_width = 1920
+    req_height = 1080
+    # NORMAL WEBCAM
+    #camera_index = 0
+    #req_width = 640
+    #req_height = 480
     req_fps = 30
 
     print("[TEST] Opening webcam...")

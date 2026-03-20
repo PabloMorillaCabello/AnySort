@@ -21,7 +21,7 @@ Orbbec Gemini 2 ──> SAM3 Segmentation ──> GraspGen ──> MoveIt2 Plann
 | GraspGen | latest | 3.10 (uv venv) | `/opt/GraspGen/.venv` — installed via `uv pip install -e .` |
 | SAM3 | latest | 3.12 (venv) | `/opt/sam3env` — runs as socket server |
 | Dobot API | V4 | 3.10 (venv) | `/opt/Dobot_hv` — TCP/IP robot control (ports 29999, 30004) |
-| Orbbec SDK | v2-main | 3.10 | OrbbecSDK_ROS2 for Gemini 2 |
+| Orbbec SDK | v2.7.6 | 3.10 | SDK .deb + OrbbecSDK_ROS2 (v2-main) for Gemini 2 |
 | GraspGen Models | — | — | `/opt/GraspGen/GraspGenModels` (git-lfs) |
 | SAM3 Models | — | — | `/opt/models/sam3` (HuggingFace) |
 
@@ -55,6 +55,8 @@ GraspGen_Thesis_Repo/
 │   ├── docker-compose.yml            # One-command startup with GPU
 │   ├── entrypoint.sh                 # Auto-build + venv activation + env banner
 │   ├── requirements.txt              # Additional Python deps (installed into GraspGen venv)
+│   ├── patches/                      # Upstream bug fixes applied at build time
+│   │   └── fix_dobot_feedback.py     # Fix Dobot UI TCP partial-read crash
 │   └── .env.example                  # Template for HF_TOKEN + CUDA arch + DISPLAY
 ├── ros2_ws/src/
 │   ├── graspgen_pipeline/            # Main pipeline ROS2 package
@@ -65,7 +67,8 @@ GraspGen_Thesis_Repo/
 │   │   │   ├── motion_planner_node.py    # MoveIt2 planning + execution
 │   │   │   └── pipeline_orchestrator.py  # Coordinates full pick cycle
 │   │   ├── launch/
-│   │   │   └── full_pipeline.launch.py   # Launches everything
+│   │   │   ├── full_pipeline.launch.py   # Launches everything
+│   │   │   └── orbbec_camera.launch.py   # Orbbec Gemini 2 camera node
 │   │   └── config/
 │   │       └── pipeline_params.yaml      # All tuneable parameters
 │   └── robotiq_3f_driver/            # Robotiq 3F gripper Modbus driver
@@ -73,6 +76,7 @@ GraspGen_Thesis_Repo/
 │   ├── sam3_server.py                 # SAM3 inference server (Python 3.12 venv, socket IPC)
 │   ├── download_models.sh            # Download SAM3 + GraspGen weights
 │   ├── setup_orbbec.sh               # Host udev rules for camera
+│   ├── reattach.ps1                  # Windows: attach Orbbec USB to WSL2 via usbipd
 │   ├── build_workspace.sh            # colcon build helper
 │   ├── test_environment.sh           # Verify full environment setup
 │   ├── test_sam3.py                  # Test SAM3 loading + inference
@@ -134,9 +138,21 @@ docker compose exec graspgen bash
 ### Step 3: Setup camera on host (once)
 
 ```bash
-# On the HOST machine (not inside Docker):
+# On the HOST machine (WSL2, not inside Docker):
 ./scripts/setup_orbbec.sh
 ```
+
+If you're on **Windows with WSL2**, you also need to attach the USB camera to WSL2. Run in PowerShell (as Administrator):
+
+```powershell
+# One-time: install usbipd-win
+winget install usbipd
+
+# Attach camera to WSL2 (run each time you plug in the camera):
+.\scripts\reattach.ps1
+```
+
+Verify the camera is visible in WSL2: `lsusb | grep Orbbec`
 
 ### Step 4: Verify the environment
 
@@ -278,10 +294,21 @@ Output is saved to `/ros2_ws/results/sam3_test_result.png`.
 
 ### 4. Orbbec Gemini 2 Camera
 
-Tests the camera hardware chain: USB device detection, udev rules, ROS2 `orbbec_camera` package, topic publishing, and data flow frequency. Requires the camera to be physically plugged in.
+Tests the camera hardware chain: USB device detection, udev rules, ROS2 `orbbec_camera` package, topic publishing, and data flow frequency. Requires the camera to be physically plugged in and attached to WSL2.
 
 ```bash
+# Quick test script
 /ros2_ws/scripts/test_camera.sh
+
+# Launch the camera node (publishes RGB + depth topics)
+ros2 launch orbbec_camera gemini2.launch.py
+
+# Or use the project wrapper with custom defaults:
+ros2 launch graspgen_pipeline orbbec_camera.launch.py
+
+# Verify topics are publishing:
+ros2 topic list | grep camera
+ros2 topic hz /camera/color/image_raw
 ```
 
 For a quick live video feed check (any camera, not just Orbbec):
