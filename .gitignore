@@ -80,3 +80,5 @@ log/
 .env
 *.key
 *.pem
+
+.CLAUDE.md

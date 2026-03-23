@@ -64,7 +64,7 @@ RUN add-apt-repository ppa:deadsnakes/ppa -y && apt-get update && apt-get instal
     git wget unzip build-essential cmake ninja-build \
     python3.12 python3.12-venv python3.12-dev \
     python3-pip python3-dev \
-    libopencv-dev libusb-1.0-0-dev libudev-dev v4l-utils \
+    libopencv-dev libusb-1.0-0-dev libudev-dev v4l-utils usbutils \
     libgflags-dev nlohmann-json3-dev libgoogle-glog-dev \
     libssl-dev libdw-dev mesa-utils libgl1 libgl1-mesa-glx \
     libegl1-mesa libglib2.0-0 libsm6 libxrender1 libxext6 \
@@ -107,9 +107,9 @@ RUN cd /opt/GraspGen \
 # =============================================================================
 COPY docker/requirements.txt /tmp/requirements.txt
 RUN source /opt/GraspGen/.venv/bin/activate \
-    && uv pip install "numpy<2" \
     && uv pip install -r /tmp/requirements.txt \
-    && uv pip install pymodbus pyserial pyorbbecsdk
+    && uv pip install pymodbus pyserial \
+    && uv pip install "numpy<2"
 
 # Make tkinter accessible in the venv (needed for Dobot UI).
 # tkinter is a system C extension that can't be pip-installed; if the uv-managed
@@ -174,6 +174,35 @@ RUN if [ -n "$HF_TOKEN" ]; then \
 COPY data/OrbbecSDK_v2.7.6_amd64.deb /tmp/OrbbecSDK_v2.7.6_amd64.deb
 RUN dpkg -i /tmp/OrbbecSDK_v2.7.6_amd64.deb; apt-get install -f -y \
     && rm /tmp/OrbbecSDK_v2.7.6_amd64.deb
+
+# Build pyorbbecsdk from source.
+#
+# The PyPI wheel (1.3.2) is broken on Linux — it ships a Darwin .so
+# (cpython-311-darwin.so) that is never importable on Linux.
+#
+# pyorbbecsdk bundles its own SDK under sdk/lib/ and sdk/include/ so we do
+# NOT pass -DOrbbecSDK_DIR; the CMake build is self-contained.  setup.py is
+# a thin wrapper that copies the CMake output from install/lib/ into the
+# wheel — so we must run CMake first, then pip install.
+#
+# pybind11-dev is required at CMake configure time.
+RUN apt-get update && apt-get install -y --no-install-recommends pybind11-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/orbbec/pyorbbecsdk.git /opt/pyorbbecsdk \
+    && mkdir -p /opt/pyorbbecsdk/build \
+    && cd /opt/pyorbbecsdk/build \
+    && cmake .. \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_INSTALL_PREFIX=/opt/pyorbbecsdk/install \
+       -DPython3_EXECUTABLE=/opt/GraspGen/.venv/bin/python \
+    && make -j$(nproc) \
+    && make install
+
+# pip install . copies install/lib/*.so into the venv's site-packages
+RUN source /opt/GraspGen/.venv/bin/activate \
+    && cd /opt/pyorbbecsdk \
+    && uv pip install .
 
 # =============================================================================
 # 8. ROS2 Workspace - Build OrbbecSDK_ROS2 + project packages

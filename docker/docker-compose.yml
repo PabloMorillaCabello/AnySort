@@ -61,6 +61,10 @@ services:
       - "host.docker.internal:host-gateway"
     stdin_open: true
     tty: true
+    # Keep the container alive in detached mode (docker compose up -d).
+    # The entrypoint prints the status banner, then this command keeps it running.
+    # Use `docker compose exec graspgen bash` to get a shell.
+    command: ["sleep", "infinity"]
     deploy:
       resources:
         reservations:

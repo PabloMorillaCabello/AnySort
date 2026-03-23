@@ -1,15 +1,24 @@
 # GraspGen - Automated Grasp Generation Pipeline
 
-> **Master Thesis** — Text-Prompted Object Grasping with RGB-D Perception for UR Robots
+> **Master Thesis** — Text-Prompted Object Grasping with RGB-D Perception for Robotic Arms
 
 An end-to-end robotic grasping pipeline that combines RGB-D perception (Orbbec Gemini 2), text-prompted segmentation ([SAM3](https://github.com/facebookresearch/sam3)), learned grasp pose generation ([GraspGen](https://github.com/NVlabs/GraspGen)), and motion planning (MoveIt2) to autonomously pick objects with a UR robot and Robotiq 3F gripper — all orchestrated through ROS2 Humble. Dobot robots are also supported via the [Dobot TCP/IP API](https://github.com/dauken85/Dobot_hv).
 
 ## Pipeline Overview
 
+Two execution modes are available:
+
+**Primary (Standalone Python):**
 ```
-Orbbec Gemini 2 ──> SAM3 Segmentation ──> GraspGen ──> MoveIt2 Planner ──> UR Robot / Dobot
-    (RGB-D)         (text prompt)       (point cloud     (trajectory)     + Robotiq 3F
+Orbbec Gemini 2 ──> SAM3 Segmentation ──> GraspGen ──> Python Executor ──> Dobot / UR Robot
+    (RGB-D)         (text prompt)       (point cloud     (6-DOF poses)      + Robotiq 3F
                                          → 6DOF grasps)
+```
+
+**Alternative (ROS2 + MoveIt2):**
+```
+Orbbec ROS2 topics ──> SAM3 node ──> GraspGen node ──> MoveIt2 Planner ──> UR Robot Driver
+                      (segmentation)   (grasp generation)  (trajectory)      (motion execution)
 ```
 
 ## Environment Stack
@@ -19,7 +28,7 @@ Orbbec Gemini 2 ──> SAM3 Segmentation ──> GraspGen ──> MoveIt2 Plann
 | CUDA | 12.6 | — | Unified across all environments |
 | ROS2 | Humble | 3.10 (system) | Binary packages for Ubuntu 22.04 |
 | GraspGen | latest | 3.10 (uv venv) | `/opt/GraspGen/.venv` — installed via `uv pip install -e .` |
-| SAM3 | latest | 3.12 (venv) | `/opt/sam3env` — runs as socket server |
+| SAM3 | latest | 3.12 (venv) | `/opt/sam3env` — subprocess bridge (sam3_segment_once.py) or socket server |
 | Dobot API | V4 | 3.10 (venv) | `/opt/Dobot_hv` — TCP/IP robot control (ports 29999, 30004) |
 | Orbbec SDK | v2.7.6 | 3.10 | SDK .deb + OrbbecSDK_ROS2 (v2-main) for Gemini 2 |
 | GraspGen Models | — | — | `/opt/GraspGen/GraspGenModels` (git-lfs) |
@@ -32,7 +41,7 @@ Inside the container there are two key areas. Understanding this avoids path con
 - **`/opt/`** — Third-party software baked into the Docker image during build. You don't edit these; they come from upstream repos.
   - `/opt/GraspGen/` — NVlabs GraspGen repo + `.venv/` (uv Python 3.10) + `GraspGenModels/` (checkpoints)
   - `/opt/sam3/` — Facebook SAM3 repo
-  - `/opt/sam3env/` — Python 3.12 venv for SAM3
+  - `/opt/sam3env/` — Python venv for SAM3 (separate from GraspGen)
   - `/opt/models/sam3/` — SAM3 model weights
   - `/opt/Dobot_hv/` — Dobot TCP/IP API
 
@@ -73,21 +82,21 @@ GraspGen_Thesis_Repo/
 │   │       └── pipeline_params.yaml      # All tuneable parameters
 │   └── robotiq_3f_driver/            # Robotiq 3F gripper Modbus driver
 ├── scripts/                          # Utility & test scripts
-│   ├── sam3_server.py                 # SAM3 inference server (Python 3.12 venv, socket IPC)
-│   ├── download_models.sh            # Download SAM3 + GraspGen weights
-│   ├── setup_orbbec.sh               # Host udev rules for camera
-│   ├── reattach.ps1                  # Windows: attach Orbbec USB to WSL2 via usbipd
+│   ├── demo_orbbec_gemini2.py        # **PRIMARY DEMO**: capture → SAM3 → GraspGen → execute (standalone Python)
+│   ├── view_camera.py                # Real-time RGB+Depth+IR viewer (pyorbbecsdk, no ROS2)
+│   ├── sam3_segment_once.py          # One-shot SAM3 helper called by demo (subprocess bridge)
+│   ├── sam3_server.py                # SAM3 inference server (socket IPC alternative)
+│   ├── download_models.sh            # Download SAM3 + GraspGen weights from HuggingFace
 │   ├── build_workspace.sh            # colcon build helper
 │   ├── test_environment.sh           # Verify full environment setup
 │   ├── test_sam3.py                  # Test SAM3 loading + inference
 │   ├── test_graspgen.py              # Test GraspGen loading + inference
 │   ├── test_camera.sh                # Test Orbbec Gemini 2 via ROS2
-│   ├── test_webcam.py                # Quick live video feed test (any camera)
-│   └── test_full_pipeline.py         # End-to-end integration test
-├── config/                           # Global config overrides
+│   └── test_full_pipeline.py         # End-to-end integration test (synthetic data)
+├── config/                           # Global config overrides (currently empty)
 ├── data/                             # Captured data (git-ignored)
 ├── results/                          # Experiment results (git-ignored)
-└── docs/                             # Thesis notes & documentation
+└── docs/                             # Thesis notes & documentation (currently empty)
 ```
 
 ## Quick Start
@@ -128,28 +137,36 @@ cd docker
 #   - Clones OrbbecSDK_ROS2
 docker compose build
 
-# Start the container
+# Start the container in detached mode
 docker compose up -d
 
-# Enter the dev environment
+# Enter the dev environment (container runs with sleep infinity to stay alive)
 docker compose exec graspgen bash
 ```
 
 ### Step 3: Setup camera on host (once)
 
+Install the Orbbec udev rules on the **host machine** (WSL2, not inside Docker):
+
 ```bash
-# On the HOST machine (WSL2, not inside Docker):
-./scripts/setup_orbbec.sh
+# Copy udev rule so the camera is accessible without root
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", MODE="0666", GROUP="plugdev"' \
+    | sudo tee /etc/udev/rules.d/99-orbbec.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-If you're on **Windows with WSL2**, you also need to attach the USB camera to WSL2. Run in PowerShell (as Administrator):
+If you're on **Windows with WSL2**, attach the USB camera to WSL2 via `usbipd-win`. Run in PowerShell (as Administrator):
 
 ```powershell
 # One-time: install usbipd-win
 winget install usbipd
 
-# Attach camera to WSL2 (run each time you plug in the camera):
-.\scripts\reattach.ps1
+# List devices and find the Orbbec camera bus ID (e.g. 2-3)
+usbipd list
+
+# Bind once, then attach each session:
+usbipd bind --busid 2-3
+usbipd attach --wsl --busid 2-3
 ```
 
 Verify the camera is visible in WSL2: `lsusb | grep Orbbec`
@@ -163,7 +180,34 @@ Verify the camera is visible in WSL2: `lsusb | grep Orbbec`
 
 Then test individual components as needed (see [Testing Each Component](#testing-each-component) below).
 
-### Step 5: Build and run the pipeline
+### Step 5a: Run the standalone Python pipeline (recommended)
+
+This is the primary workflow — runs the full capture → segmentation → grasp generation → execution cycle without ROS2 overhead. Useful for quick experiments and debugging.
+
+```bash
+# Basic demo: depth-based auto-mask (no SAM3)
+python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
+    --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml
+
+# With SAM3 text-prompted segmentation:
+python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
+    --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml \
+    --sam3_use \
+    --sam3_prompt "red mug"
+
+# Interactive mode (press Enter to capture, q to quit):
+python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
+    --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml \
+    --sam3_use --sam3_prompt "bottle" \
+    --collision_filter \
+    --keypress
+```
+
+SAM3 segmentation is handled by `sam3_segment_once.py` running in the Python 3.12 venv (subprocess call), bridging the version gap between GraspGen (3.10) and SAM3 (3.12).
+
+### Step 5b: Run the ROS2-based pipeline (optional, for UR robot integration)
+
+If you are integrating with a UR robot and MoveIt2 motion planning, use the full ROS2 pipeline instead:
 
 ```bash
 # Build ROS2 workspace (first time only, or use entrypoint auto-build)
@@ -182,10 +226,9 @@ ros2 launch graspgen_pipeline full_pipeline.launch.py \
     text_prompt:="object"
 ```
 
-### Step 6: Trigger a pick cycle
+To trigger a pick cycle (in another terminal):
 
 ```bash
-# In another terminal:
 docker compose exec graspgen bash
 ros2 service call /pipeline_orchestrator/trigger_pick std_srvs/srv/Trigger
 
@@ -311,10 +354,14 @@ ros2 topic list | grep camera
 ros2 topic hz /camera/color/image_raw
 ```
 
-For a quick live video feed check (any camera, not just Orbbec):
+For a live video feed directly from the Orbbec (no ROS2 required):
 
 ```bash
-python3 /ros2_ws/scripts/test_webcam.py    # press 'q' to quit
+# RGB + aligned depth viewer — press 's' to save, 'q' to quit
+python3 /ros2_ws/scripts/view_camera.py
+
+# With IR stream and depth-to-color alignment + pointcloud output:
+python3 /ros2_ws/scripts/view_camera.py --ir --align
 ```
 
 ### 5. Dobot Robot API
@@ -377,8 +424,8 @@ Reports whether segmentation masks and grasp poses were received, along with the
 | Environment | `test_environment.sh` | All deps, imports, model weights | None |
 | GraspGen | `test_graspgen.py` | GraspGen deps, PointNet++ CUDA, GPU | GPU only |
 | SAM3 | `test_sam3.py` | SAM3 model load + inference | GPU only |
-| Camera | `test_camera.sh` | Orbbec USB + ROS2 topics | Camera |
-| Webcam | `test_webcam.py` | Any camera live feed | Any camera |
+| Camera (ROS2) | `test_camera.sh` | Orbbec USB + ROS2 topics | Camera |
+| Camera (viewer) | `view_camera.py` | Live RGB+Depth feed, no ROS2 needed | Camera |
 | Dobot | `python3 -c "import dobot_api"` | API importable | None (robot for full test) |
 | ROS2 | `ros2 pkg list` | Workspace packages built | None |
 | Full pipeline | `test_full_pipeline.py` | End-to-end with synthetic data | GPU only |
