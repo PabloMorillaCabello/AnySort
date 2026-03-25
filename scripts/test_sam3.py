@@ -52,16 +52,11 @@ def test_imports():
     """Test that SAM3 packages can be imported."""
     print("[TEST] Importing SAM3 packages...")
     try:
-        from sam3 import build_sam3_image_model
-        print("  [PASS] sam3.build_sam3_image_model")
-    except ImportError as e:
-        print(f"  [FAIL] sam3 native API: {e}")
-
-    try:
         from transformers import Sam3Processor, Sam3Model
         print("  [PASS] transformers Sam3Model + Sam3Processor")
     except ImportError as e:
-        print(f"  [WARN] transformers SAM3: {e}")
+        print(f"  [FAIL] transformers SAM3: {e}")
+        sys.exit(1)
 
 
 def test_model_loading():

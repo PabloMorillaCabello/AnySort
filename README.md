@@ -28,7 +28,7 @@ Orbbec ROS2 topics ──> SAM3 node ──> GraspGen node ──> MoveIt2 Plann
 | CUDA | 12.6 | — | Unified across all environments |
 | ROS2 | Humble | 3.10 (system) | Binary packages for Ubuntu 22.04 |
 | GraspGen | latest | 3.10 (uv venv) | `/opt/GraspGen/.venv` — installed via `uv pip install -e .` |
-| SAM3 | latest | 3.12 (venv) | `/opt/sam3env` — subprocess bridge (sam3_segment_once.py) or socket server |
+| SAM3 | Transformers API | 3.12 (venv) | `/opt/sam3env` — HuggingFace `facebook/sam3`; called via subprocess (`sam3_segment_once.py`) or socket server (`sam3_server.py`) |
 | Dobot API | V4 | 3.10 (venv) | `/opt/Dobot_hv` — TCP/IP robot control (ports 29999, 30004) |
 | Orbbec SDK | v2.7.6 | 3.10 | SDK .deb + OrbbecSDK_ROS2 (v2-main) for Gemini 2 |
 | GraspGen Models | — | — | `/opt/GraspGen/GraspGenModels` (git-lfs) |
@@ -40,9 +40,8 @@ Inside the container there are two key areas. Understanding this avoids path con
 
 - **`/opt/`** — Third-party software baked into the Docker image during build. You don't edit these; they come from upstream repos.
   - `/opt/GraspGen/` — NVlabs GraspGen repo + `.venv/` (uv Python 3.10) + `GraspGenModels/` (checkpoints)
-  - `/opt/sam3/` — Facebook SAM3 repo
-  - `/opt/sam3env/` — Python venv for SAM3 (separate from GraspGen)
-  - `/opt/models/sam3/` — SAM3 model weights
+  - `/opt/sam3env/` — Python 3.12 venv for SAM3 (torch + transformers + numpy + Pillow + matplotlib)
+  - `/opt/models/sam3/` — SAM3 model weights (pre-downloaded from HuggingFace at build time)
   - `/opt/Dobot_hv/` — Dobot TCP/IP API
 
 - **`/ros2_ws/`** — The ROS2 workspace and **your working directory** (where you land when entering the container). Your repo folders are volume-mounted here:
@@ -132,7 +131,7 @@ cd docker
 #   - Installs CUDA 12.6 + ROS2 Humble
 #   - Installs GraspGen via uv (Python 3.10 venv with PointNet++ CUDA extensions)
 #   - Clones GraspGen model checkpoints via git-lfs
-#   - Installs SAM3 in a separate Python 3.12 venv
+#   - Creates SAM3 Python 3.12 venv (torch 2.7 + transformers, no git clone needed)
 #   - Clones Dobot TCP/IP API
 #   - Clones OrbbecSDK_ROS2
 docker compose build
@@ -315,7 +314,7 @@ To return to your working directory afterwards: `cd /ros2_ws`
 
 ### 3. SAM3 (text-prompted segmentation)
 
-Tests SAM3 in its Python 3.12 venv: verifies the package imports (native API and HuggingFace Transformers API), loads the model, runs inference on a synthetic image with a text prompt, and saves a 3-panel visualization.
+Tests SAM3 in its Python 3.12 venv: verifies the HuggingFace Transformers API imports (`Sam3Processor`, `Sam3Model`), loads the model, runs inference on a synthetic image with a text prompt, and saves a 3-panel visualization.
 
 ```bash
 /opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py
@@ -482,7 +481,7 @@ docker compose exec graspgen bash -c "export HF_TOKEN=hf_xxx && ./scripts/downlo
 
 All tuneable parameters are in `ros2_ws/src/graspgen_pipeline/config/pipeline_params.yaml`:
 
-- **SAM3**: confidence threshold, mask threshold, Transformers vs native API
+- **SAM3**: confidence threshold, mask threshold
 - **GraspGen**: gripper config, number of grasp candidates, quality threshold
 - **Motion planner**: velocity/acceleration limits, planning time, approach/retreat distance
 - **Pipeline**: auto-execute mode, result saving

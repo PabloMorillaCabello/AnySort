@@ -148,7 +148,7 @@ RUN /opt/sam3env/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
        --index-url https://download.pytorch.org/whl/cu126
 
 # Install transformers + runtime deps for sam3_server.py / sam3_segment_once.py
-RUN /opt/sam3env/bin/pip install --no-cache-dir setuptools transformers numpy Pillow
+RUN /opt/sam3env/bin/pip install --no-cache-dir setuptools transformers numpy Pillow matplotlib
 
 # Download SAM3 weights (requires HF_TOKEN)
 ARG HF_TOKEN
