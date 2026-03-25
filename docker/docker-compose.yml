@@ -24,7 +24,7 @@ services:
       - "6000:6000"
       - "29999:29999"  # Dobot dashboard (TCP/IP control)
       - "30004:30004"  # Dobot real-time feedback
-    runtime: nvidia
+    # runtime: nvidia  # Removed: use deploy.resources.reservations.devices below (works with Docker Desktop + nvidia-container-toolkit)
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all

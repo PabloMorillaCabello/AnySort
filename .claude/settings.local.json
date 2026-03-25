@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rlU $r C:UserspabloDesktopHV_THESISTryesGraspGenGraspGen_Thesis_Reposcripts/ C:UserspabloDesktopHV_THESISTryesGraspGenGraspGen_Thesis_Repodocker/)",
+      "Bash(grep -E '\\\\.\\(sh|py\\)$')"
+    ]
+  }
+}

@@ -38,7 +38,10 @@ data/depth/*.npy
 data/masks/*.png
 data/grasp_poses/*.json
 data/grasp_poses/*.npy
-
+data/pointcloud/*.ply
+data/pointcloud/*.npy
+data/depth_aligned/*.npy
+data/depth_aligned/*.png
 # --- Results ---
 results/*
 !results/.gitkeep

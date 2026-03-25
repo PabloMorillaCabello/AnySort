@@ -67,7 +67,7 @@ RUN add-apt-repository ppa:deadsnakes/ppa -y && apt-get update && apt-get instal
     libopencv-dev libusb-1.0-0-dev libudev-dev v4l-utils usbutils \
     libgflags-dev nlohmann-json3-dev libgoogle-glog-dev \
     libssl-dev libdw-dev mesa-utils libgl1 libgl1-mesa-glx \
-    libegl1-mesa libglib2.0-0 libsm6 libxrender1 libxext6 \
+    libegl1-mesa libglib2.0-0 libsm6 libxrender1 libxext6 libx11-6 libgomp1 \
     python3-tk python3.12-tk feh git-lfs \
     && rm -rf /var/lib/apt/lists/* \
     && git lfs install
@@ -189,13 +189,22 @@ RUN dpkg -i /tmp/OrbbecSDK_v2.7.6_amd64.deb; apt-get install -f -y \
 RUN apt-get update && apt-get install -y --no-install-recommends pybind11-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/orbbec/pyorbbecsdk.git /opt/pyorbbecsdk \
+# GIT_LFS_SKIP_SMUDGE=1 avoids the LFS budget error on the orbbec/pyorbbecsdk repo.
+# The bundled sdk/lib/ binaries come from LFS and can't be downloaded when the
+# repo is over budget.  Instead we point cmake at the system OrbbecSDK already
+# installed via the .deb above.  The cmake config lands in a path like
+# /usr/local/lib/cmake/OrbbecSDK/; we find it dynamically so this survives
+# future SDK version bumps.
+RUN GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/orbbec/pyorbbecsdk.git /opt/pyorbbecsdk \
+    && SDK_CMAKE_DIR=$(find /usr/local /usr -name "OrbbecSDKConfig.cmake" 2>/dev/null | head -1 | xargs -r dirname) \
+    && echo "OrbbecSDK cmake config: ${SDK_CMAKE_DIR:-NOT FOUND — build may fail}" \
     && mkdir -p /opt/pyorbbecsdk/build \
     && cd /opt/pyorbbecsdk/build \
     && cmake .. \
        -DCMAKE_BUILD_TYPE=Release \
        -DCMAKE_INSTALL_PREFIX=/opt/pyorbbecsdk/install \
        -DPython3_EXECUTABLE=/opt/GraspGen/.venv/bin/python \
+       ${SDK_CMAKE_DIR:+-DOrbbecSDK_DIR="$SDK_CMAKE_DIR"} \
     && make -j$(nproc) \
     && make install
 

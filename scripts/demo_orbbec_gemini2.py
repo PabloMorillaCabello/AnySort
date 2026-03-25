@@ -8,8 +8,10 @@ obtener la máscara de objeto, proyectarla a pointcloud y hacer GraspGen
 """
 
 import argparse
+import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 import subprocess
 
@@ -428,6 +430,78 @@ def process_point_cloud(pc, grasps, grasp_conf):
     return pc_centered, grasps_centered, scores, t_center
 
 
+def print_best_grasp(grasps_cam: np.ndarray, scores: np.ndarray, t_center: np.ndarray) -> None:
+    """Print detailed data for the best grasp and save it to a JSON file.
+
+    Args:
+        grasps_cam:  (N, 4, 4) grasp poses in camera frame (before centering).
+        scores:      (N,) confidence scores.
+        t_center:    4x4 centering transform applied during visualisation.
+    """
+    if len(grasps_cam) == 0:
+        return
+
+    best_idx = int(np.argmax(scores))
+    best_score = float(scores[best_idx])
+    pose = grasps_cam[best_idx].copy()          # 4×4, camera frame
+
+    translation = pose[:3, 3]
+    rot_mat = pose[:3, :3]
+
+    # Rotation as euler angles + quaternion via scipy (already in GraspGen venv)
+    try:
+        from scipy.spatial.transform import Rotation
+        r = Rotation.from_matrix(rot_mat)
+        euler_deg = r.as_euler("xyz", degrees=True)
+        quat_xyzw = r.as_quat()                 # [x, y, z, w]
+    except Exception:
+        euler_deg = np.zeros(3)
+        quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
+
+    sep = "=" * 56
+    print(f"\n{sep}")
+    print("  BEST GRASP")
+    print(sep)
+    print(f"  Rank:        #{best_idx + 1} of {len(grasps_cam)} candidates")
+    print(f"  Confidence:  {best_score:.4f}  "
+          f"(range [{scores.min():.4f} – {scores.max():.4f}])")
+    print(f"\n  Position (camera frame, metres):")
+    print(f"    X: {translation[0]:+.4f}  (right +)")
+    print(f"    Y: {translation[1]:+.4f}  (down  +)")
+    print(f"    Z: {translation[2]:+.4f}  (depth +)")
+    print(f"\n  Rotation (euler XYZ, degrees):")
+    print(f"    Roll  (X): {euler_deg[0]:+.2f}°")
+    print(f"    Pitch (Y): {euler_deg[1]:+.2f}°")
+    print(f"    Yaw   (Z): {euler_deg[2]:+.2f}°")
+    print(f"\n  Quaternion (x, y, z, w):")
+    print(f"    [{quat_xyzw[0]:+.4f},  {quat_xyzw[1]:+.4f},  "
+          f"{quat_xyzw[2]:+.4f},  {quat_xyzw[3]:+.4f}]")
+    print(f"\n  Pose matrix 4×4 (camera frame):")
+    for row in pose:
+        print(f"    [{row[0]:+7.4f}  {row[1]:+7.4f}  {row[2]:+7.4f}  {row[3]:+7.4f}]")
+    print(sep)
+
+    # Save JSON
+    os.makedirs("/ros2_ws/results", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = {
+        "timestamp": ts,
+        "rank": best_idx + 1,
+        "total_candidates": len(grasps_cam),
+        "confidence": best_score,
+        "score_min": float(scores.min()),
+        "score_max": float(scores.max()),
+        "position_xyz_m": translation.tolist(),
+        "euler_xyz_deg": euler_deg.tolist(),
+        "quaternion_xyzw": quat_xyzw.tolist(),
+        "pose_matrix_4x4": pose.tolist(),
+    }
+    out_path = f"/ros2_ws/results/best_grasp_{ts}.json"
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"  Saved → {out_path}\n")
+
+
 def run_snapshot(args, vis):
     vis.delete()
 
@@ -551,6 +625,9 @@ def run_snapshot(args, vis):
     pc_centered, grasps_centered, scores, t_center = process_point_cloud(
         pc_filtered, grasps_inferred, grasp_conf_inferred
     )
+
+    # Print + save best grasp details
+    print_best_grasp(grasps_inferred, grasp_conf_inferred, t_center)
 
     if args.collision_filter:
         gripper_info = get_gripper_info(gripper_name)

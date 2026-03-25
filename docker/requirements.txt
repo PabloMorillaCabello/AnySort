@@ -7,7 +7,7 @@
 # --- Computer Vision & 3D Processing ---
 opencv-python>=4.8.0
 open3d>=0.17.0
-trimesh>=3.20.0
+trimesh==4.5.3
 pyrender>=0.1.45
 Pillow>=9.5.0
 
