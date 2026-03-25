@@ -91,16 +91,10 @@ fi
 # --- 4. SAM3 (tested in Python 3.12 venv) ---
 echo ""
 echo "--- SAM3 (Python 3.12 venv) ---"
-if /opt/sam3env/bin/python -c "from sam3 import build_sam3_image_model; print('OK')" 2>/dev/null; then
-    pass "sam3 package importable (native API)"
-else
-    warn "sam3 native API not importable (pipeline uses Transformers API by default — OK)"
-fi
-
 if /opt/sam3env/bin/python -c "from transformers import Sam3Processor, Sam3Model; print('OK')" 2>/dev/null; then
-    pass "Sam3Model importable (Transformers API)"
+    pass "SAM3 via Transformers API (Sam3Processor, Sam3Model)"
 else
-    warn "Sam3Model not in transformers (may need newer version)"
+    fail "SAM3 Transformers API not importable (check transformers version)"
 fi
 
 # --- 5. GraspGen (uv-managed venv Python 3.10) ---

@@ -43,7 +43,7 @@ echo "  Python:    $(python3 --version 2>&1 | awk '{print $2}') (GraspGen venv /
 echo "  Python:    $(/opt/sam3env/bin/python --version 2>&1 | awk '{print $2}' || echo 'N/A') (SAM3 venv)"
 echo "  PyTorch:   $(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'NOT FOUND')"
 echo "  GraspGen:  $(python3 -c 'import grasp_gen; print("OK")' 2>/dev/null || echo 'NOT FOUND')"
-echo "  SAM3:      $(/opt/sam3env/bin/python -c 'import sam3; print("OK")' 2>/dev/null || echo 'NOT FOUND')"
+echo "  SAM3:      $(/opt/sam3env/bin/python -c 'from transformers import Sam3Model; print("OK")' 2>/dev/null || echo 'NOT FOUND')"
 echo "  Dobot API: $(python3 -c 'import dobot_api; print("OK")' 2>/dev/null || echo 'NOT FOUND')"
 echo "  Orbbec:    $(ros2 pkg list 2>/dev/null | grep -q orbbec_camera && echo 'OK' || echo 'NOT FOUND')"
 echo "  GPU:       $(python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NO GPU")' 2>/dev/null || echo 'NOT FOUND')"

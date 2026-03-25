@@ -80,7 +80,7 @@ def test_pipeline_deps():
     modules = [
         ("torch",            "PyTorch"),
         ("torchvision",      "TorchVision"),
-        ("torchaudio",       "TorchAudio"),
+
         ("pointnet2_ops",    "PointNet++ CUDA ops"),
         ("torch_scatter",    "torch-scatter"),
         ("torch_cluster",    "torch-cluster"),

@@ -147,13 +147,8 @@ RUN /opt/sam3env/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
        torchaudio==2.7.0 \
        --index-url https://download.pytorch.org/whl/cu126
 
-# Install transformers (for HuggingFace SAM3 API)
-RUN /opt/sam3env/bin/pip install --no-cache-dir setuptools transformers
-
-# Clone SAM3 and install in the 3.12 venv
-RUN git clone https://github.com/facebookresearch/sam3.git /opt/sam3 \
-    && cd /opt/sam3 \
-    && /opt/sam3env/bin/pip install --no-cache-dir -e ".[notebooks]"
+# Install transformers + runtime deps for sam3_server.py / sam3_segment_once.py
+RUN /opt/sam3env/bin/pip install --no-cache-dir setuptools transformers numpy Pillow
 
 # Download SAM3 weights (requires HF_TOKEN)
 ARG HF_TOKEN
