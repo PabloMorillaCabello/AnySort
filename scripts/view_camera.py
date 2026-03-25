@@ -90,22 +90,51 @@ def frame_to_bgr(frame: VideoFrame) -> Optional[np.ndarray]:
 
 
 def depth_frame_to_array(frame: VideoFrame) -> Optional[np.ndarray]:
-    """Convert an Orbbec depth frame to a uint16 numpy array (raw mm values)."""
+    """Convert an Orbbec depth frame to a uint16 numpy array (raw mm values).
+
+    Handles both raw uint16 and compressed formats (e.g. RLE).
+    For compressed formats the SDK returns the decompressed pixel data
+    via get_data(), but the buffer length may not match width*height*2.
+    We use np.asarray which handles the SDK's internal conversion.
+    """
     if frame is None:
         return None
     width = frame.get_width()
     height = frame.get_height()
-    expected_size = width * height * 2  # uint16
-    data = frame.get_data()
-    actual_size = len(data)
-    if actual_size != expected_size:
-        print(f"WARNING: Depth buffer size mismatch: got {actual_size}, expected {expected_size} (skip)")
+    fmt = frame.get_format()
+    data = np.asarray(frame.get_data())
+    n_pixels = width * height
+
+    # For compressed formats (RLE, LOSSLESS, etc.) the raw buffer size
+    # won't match width*height*2.  The SDK already decompresses for us,
+    # so just validate pixel count after reinterpretation.
+    if data.dtype == np.uint16 and data.size == n_pixels:
+        return data.reshape((height, width))
+
+    # Raw uint16 delivered as uint8 bytes
+    if data.dtype == np.uint8 and data.size == n_pixels * 2:
+        return data.view(np.uint16).reshape((height, width))
+
+    # Compressed / RLE: try reinterpreting whatever the SDK gave us
+    if data.dtype == np.uint8:
+        # Not enough bytes for full frame — truly compressed, can't decode here
+        if data.size < n_pixels * 2:
+            # Try the scale_conversion provided by the SDK
+            try:
+                depth = np.frombuffer(frame.get_data(), dtype=np.uint16)
+                if depth.size == n_pixels:
+                    return depth.reshape((height, width))
+            except Exception:
+                pass
+            return None
+        # More than enough bytes — take the first n_pixels uint16 values
+        return data[:n_pixels * 2].view(np.uint16).reshape((height, width))
+
+    # Fallback: try direct reshape
+    try:
+        return data.reshape((height, width)).astype(np.uint16)
+    except Exception:
         return None
-    data_arr = np.frombuffer(data, dtype=np.uint16)
-    if data_arr.size != width * height:
-        print(f"WARNING: Depth data size mismatch after frombuffer: got {data_arr.size}, expected {width*height} (skip)")
-        return None
-    return data_arr.reshape((height, width))
 
 
 def colorize_depth(depth: np.ndarray, max_distance_mm: int = 5000) -> np.ndarray:
@@ -118,24 +147,40 @@ def colorize_depth(depth: np.ndarray, max_distance_mm: int = 5000) -> np.ndarray
 
 
 def ir_frame_to_bgr(frame: VideoFrame) -> Optional[np.ndarray]:
-    """Convert an Orbbec IR frame to a displayable BGR image. Robust."""
+    """Convert an Orbbec IR frame to a displayable BGR image.
+
+    Handles both Y8 (uint8, 1 byte/pixel) and Y16 (uint16, 2 bytes/pixel) formats.
+    """
     if frame is None:
         return None
     width = frame.get_width()
     height = frame.get_height()
-    expected_size = width * height * 2  # uint16
-    data = frame.get_data()
-    actual_size = len(data)
-    if actual_size != expected_size:
-        print(f"WARNING: IR buffer size mismatch: got {actual_size}, expected {expected_size} (skip)")
-        return None
-    data_arr = np.frombuffer(data, dtype=np.uint16)
-    if data_arr.size != width * height:
-        print(f"WARNING: IR data size mismatch: got {data_arr.size}, expected {width*height} (skip)")
-        return None
-    data_arr = data_arr.reshape((height, width))
-    norm = cv2.normalize(data_arr, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    return cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+    fmt = frame.get_format()
+    data = np.asarray(frame.get_data())
+    n_pixels = width * height
+
+    if fmt == OBFormat.Y8 or (data.dtype == np.uint8 and data.size == n_pixels):
+        # Y8: 1 byte per pixel, already uint8
+        gray = data[:n_pixels].reshape((height, width))
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    elif fmt == OBFormat.Y16 or (data.dtype == np.uint16 and data.size == n_pixels):
+        # Y16: 2 bytes per pixel
+        if data.dtype == np.uint16:
+            ir16 = data[:n_pixels].reshape((height, width))
+        else:
+            # uint8 buffer holding uint16 data
+            if data.size < n_pixels * 2:
+                return None
+            ir16 = data[:n_pixels * 2].view(np.uint16).reshape((height, width))
+        norm = cv2.normalize(ir16, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        return cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+    else:
+        # Fallback: try treating as uint8 grayscale
+        try:
+            gray = data[:n_pixels].reshape((height, width)).astype(np.uint8)
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        except Exception:
+            return None
 
 
 def depth_color_to_pointcloud(depth: np.ndarray, color: np.ndarray, fx: float = 615.0, fy: float = 615.0, cx: float = 320.0, cy: float = 240.0) -> np.ndarray:
