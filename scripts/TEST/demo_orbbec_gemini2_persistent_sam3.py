@@ -1,27 +1,57 @@
 #!/usr/bin/env python3
 """
-TEST VERSION — Persistent SAM3 server variant of demo_orbbec_gemini2.py.
+GraspGen Pipeline — Tkinter UI with persistent SAM3 socket server.
 
-Difference from the original:
-  - SAM3 model is loaded ONCE at startup via a persistent subprocess (sam3_server.py).
-  - Each keypress snapshot sends a request to the already-running server instead of
-    spawning a new process and reloading model.safetensors from scratch.
+Workflow:
+  1. SAM3 runs as a persistent Unix socket server (scripts/sam3_server.py),
+     loading model.safetensors ONCE into GPU memory.
+  2. Orbbec Gemini 2 streams live RGB to the Tkinter preview window.
+  3. User selects a gripper config from the dropdown, types an object prompt,
+     and clicks "Capture & Run".
+  4. Latest frame → SAM3 (via socket) → GraspGen → Meshcat visualisation.
+  5. Segmentation mask is overlaid on the live preview after each inference.
+  6. Clicking "Capture & Run" again re-runs with the same (cached) model —
+     no restart needed.
 
-Original script: scripts/demo_orbbec_gemini2.py
-SAM3 server:     scripts/TEST/sam3_server.py
+Usage — two-terminal workflow:
+  # Terminal 1: start SAM3 server (sam3 Python env, loads model once)
+  /opt/sam3env/bin/python /ros2_ws/scripts/sam3_server.py [--device cuda:0]
+
+  # Terminal 2: run this UI (GraspGen Python env)
+  python /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py
+
+  # Or let this script auto-start the SAM3 server:
+  python /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py --sam3_autostart
+
+Meshcat visualisation: http://127.0.0.1:7000
 """
 
 import argparse
+import gc
 import json
 import os
+import queue
+import socket as _socket
 import subprocess
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+import tkinter as tk
+from tkinter import ttk, scrolledtext
 import trimesh.transformations as tra
+
+try:
+    from PIL import Image as PILImage, ImageTk
+    _PIL_OK = True
+except ImportError:
+    PILImage = None
+    ImageTk = None
+    _PIL_OK = False
 
 from grasp_gen.grasp_server import GraspGenSampler, load_grasp_cfg
 from grasp_gen.robot import get_gripper_info
@@ -40,51 +70,10 @@ from grasp_gen.utils.point_cloud_utils import (
 
 
 # ---------------------------------------------------------------------------
-# Argument parsing
+# Constants
 # ---------------------------------------------------------------------------
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Capture one frame from Orbbec Gemini 2 and run GraspGen inference"
-    )
-    parser.add_argument("--gripper_config", type=str, required=True,
-                        help="Path to checkpoint config yml")
-    parser.add_argument("--segmentation_mask_path", type=str, default="",
-                        help="Optional path to segmentation mask (.npy or image)")
-    parser.add_argument("--target_object_id", type=int, default=1,
-                        help="Object id in segmentation mask used as grasp target")
-    parser.add_argument("--num_grasps", type=int, default=200)
-    parser.add_argument("--grasp_threshold", type=float, default=-1.0)
-    parser.add_argument("--topk_num_grasps", type=int, default=100)
-    parser.add_argument("--return_topk", action="store_true")
-    parser.add_argument("--collision_filter", action="store_true")
-    parser.add_argument("--collision_threshold", type=float, default=0.02)
-    parser.add_argument("--max_scene_points", type=int, default=8192)
-    parser.add_argument("--max_object_points", type=int, default=12000)
-    parser.add_argument("--scene_point_size", type=float, default=0.008)
-    parser.add_argument("--object_point_size", type=float, default=0.012)
-    parser.add_argument("--auto_mask_depth_delta", type=float, default=0.08)
-    parser.add_argument("--auto_mask_min_pixels", type=int, default=800)
-    parser.add_argument("--save_capture_prefix", type=str, default="")
-    parser.add_argument("--keypress", action="store_true",
-                        help="Interactive mode: press Enter to capture, q to quit")
-    # SAM3
-    parser.add_argument("--sam3_use", action="store_true",
-                        help="Use SAM3 (text prompt) to obtain segmentation mask from RGB")
-    parser.add_argument("--sam3_prompt", type=str, default="",
-                        help="Text prompt for SAM3 (e.g. 'red mug')")
-    parser.add_argument("--sam3_device", type=str, default="cuda:0",
-                        help="Device for SAM3 server (default: cuda:0)")
-    parser.add_argument("--sam3_no_fp16", action="store_true",
-                        help="Use FP32 for SAM3 instead of FP16")
-    parser.add_argument("--sam3_no_transformers", action="store_true",
-                        help="Use native SAM3 API instead of HuggingFace Transformers")
-    return parser.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# SAM3 persistent server helpers
-# ---------------------------------------------------------------------------
+CHECKPOINTS_DIR = "/opt/GraspGen/GraspGenModels/checkpoints"
+SAM3_SERVER_SCRIPT = "/ros2_ws/scripts/sam3_server.py"
 
 _SAM3_PYTHON_CANDIDATES = [
     "/opt/sam3env/bin/python3.12",
@@ -92,9 +81,27 @@ _SAM3_PYTHON_CANDIDATES = [
     "/opt/sam3env/bin/python",
     "/usr/bin/python3.12",
 ]
-_SAM3_SERVER_SCRIPT = "/ros2_ws/scripts/TEST/sam3_server.py"
+
+_PREVIEW_W = 640
+_PREVIEW_H = 480
+# Green overlay colour in RGB
+_MASK_GREEN_RGB = np.array([0, 210, 90], dtype=np.uint8)
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint discovery
+# ---------------------------------------------------------------------------
+def scan_checkpoints(directory: str) -> dict:
+    """Return {basename: full_path} for every .yml found in directory."""
+    d = Path(directory)
+    if not d.exists():
+        return {}
+    return {p.name: str(p) for p in sorted(d.glob("*.yml"))}
+
+
+# ---------------------------------------------------------------------------
+# SAM3 server management
+# ---------------------------------------------------------------------------
 def _find_sam3_python() -> str:
     for p in _SAM3_PYTHON_CANDIDATES:
         if os.path.isfile(p) and os.access(p, os.X_OK):
@@ -102,285 +109,272 @@ def _find_sam3_python() -> str:
     raise RuntimeError(
         "Cannot find SAM3 Python interpreter. Tried:\n"
         + "\n".join(f"  {p}" for p in _SAM3_PYTHON_CANDIDATES)
+        + "\nRun `ls -la /opt/sam3env/bin/` inside the container."
     )
 
 
-def start_sam3_server(args) -> subprocess.Popen:
-    """
-    Launch sam3_server.py as a persistent subprocess.
-    Blocks until the server prints {"status": "ready"} on stdout,
-    meaning model.safetensors has been loaded into GPU memory.
-    Returns the Popen handle to pass around for later requests.
-    """
+def _wait_for_sam3_socket(sock_path: str, timeout: float = 120.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect(sock_path)
+            s.close()
+            return
+        except OSError:
+            time.sleep(0.5)
+    raise RuntimeError(
+        f"SAM3 server did not become ready within {timeout:.0f}s at '{sock_path}'"
+    )
+
+
+def start_sam3_server(sock_path: str, device: str = "cuda:0",
+                      fp16: bool = True) -> subprocess.Popen:
     python_bin = _find_sam3_python()
-
-    cmd = [python_bin, _SAM3_SERVER_SCRIPT, "--device", args.sam3_device]
-    if args.sam3_no_fp16:
+    cmd = [python_bin, SAM3_SERVER_SCRIPT, "--socket", sock_path, "--device", device]
+    if not fp16:
         cmd.append("--no-fp16")
-    if args.sam3_no_transformers:
-        cmd.append("--no-transformers")
-
-    # Strip GraspGen venv from env so SAM3 Python 3.12 finds its own stdlib
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONHOME", None)
+    print(f"[SAM3] Starting server: {' '.join(cmd)}", flush=True)
+    print("[SAM3] Loading model — this happens ONCE, please wait...", flush=True)
+    proc = subprocess.Popen(cmd, env=env)
+    _wait_for_sam3_socket(sock_path, timeout=120.0)
+    print("[SAM3] Server ready.", flush=True)
+    return proc
 
-    print(f"[SAM3] Starting persistent server: {' '.join(cmd)}", flush=True)
-    print("[SAM3] Loading model.safetensors — this happens ONCE, please wait...", flush=True)
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=None,   # SAM3 server stderr passes through to our terminal
-        env=env,
-        text=True,
-        bufsize=1,     # line-buffered
-    )
+# ---------------------------------------------------------------------------
+# SAM3 socket client
+# ---------------------------------------------------------------------------
+def _recv_exactly(s: _socket.socket, n: int) -> bytes:
+    chunks, received = [], 0
+    while received < n:
+        chunk = s.recv(min(n - received, 65536))
+        if not chunk:
+            raise ConnectionError("SAM3 server disconnected mid-transfer")
+        chunks.append(chunk)
+        received += len(chunk)
+    return b"".join(chunks)
 
-    # Wait for the server to signal it is ready
-    start = time.time()
+
+def _recv_json_line(s: _socket.socket) -> dict:
+    buf = b""
     while True:
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"SAM3 server exited unexpectedly (code {proc.returncode}) before sending 'ready'."
-            )
-        line = proc.stdout.readline()
-        if not line:
-            time.sleep(0.05)
-            continue
-        try:
-            msg = json.loads(line.strip())
-        except json.JSONDecodeError:
-            print(f"[SAM3 server raw] {line.rstrip()}", flush=True)
-            continue
-
-        if msg.get("status") == "ready":
-            print(f"[SAM3] Server ready in {time.time() - start:.1f}s. Model stays in GPU memory.", flush=True)
-            return proc
-        elif msg.get("status") == "load_error":
-            proc.terminate()
-            raise RuntimeError(f"SAM3 server failed to load model: {msg.get('error')}")
-        else:
-            print(f"[SAM3 server] {msg}", flush=True)
+        byte = s.recv(1)
+        if not byte:
+            raise ConnectionError("SAM3 server disconnected")
+        if byte == b"\n":
+            break
+        buf += byte
+    return json.loads(buf.decode("utf-8"))
 
 
-def segment_with_sam3(rgb: np.ndarray, text_prompt: str, sam3_proc: subprocess.Popen) -> np.ndarray:
+def segment_with_sam3_server(rgb: np.ndarray, prompt: str, sock_path: str) -> np.ndarray:
+    """Send one inference request to the SAM3 Unix socket server.
+    Returns binary mask (H, W) uint8 with values {0, 1}.
     """
-    Send one inference request to the already-running SAM3 server.
-    Returns binary mask (H, W) uint8 {0, 1}.
-    No model reload — just the GPU forward pass.
-    """
-    if not text_prompt:
-        raise ValueError("sam3_prompt is empty")
+    if not prompt:
+        raise ValueError("SAM3 prompt is empty")
 
-    tmp_dir = Path("/ros2_ws/tmp")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    img_path = tmp_dir / "sam3_input.png"
-    mask_path = tmp_dir / "sam3_mask.npy"
-
-    rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(str(img_path), rgb_bgr)
-
-    request = json.dumps({
-        "image": str(img_path),
-        "prompt": text_prompt,
-        "mask_out": str(mask_path),
-    })
+    h, w = rgb.shape[:2]
+    rgb_bytes = np.ascontiguousarray(rgb, dtype=np.uint8).tobytes()
+    header = json.dumps({
+        "width": w, "height": h,
+        "prompt": prompt,
+        "size": len(rgb_bytes),
+    }) + "\n"
 
     t0 = time.time()
-    sam3_proc.stdin.write(request + "\n")
-    sam3_proc.stdin.flush()
-
-    # Read response line (blocking)
-    while True:
-        if sam3_proc.poll() is not None:
-            raise RuntimeError(f"SAM3 server died unexpectedly (code {sam3_proc.returncode})")
-        line = sam3_proc.stdout.readline()
-        if not line:
-            time.sleep(0.02)
-            continue
-        break
-
-    elapsed = time.time() - t0
     try:
-        resp = json.loads(line.strip())
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"SAM3 server bad response: {line!r}") from e
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(90.0)
+        s.connect(sock_path)
+        s.sendall(header.encode("utf-8"))
+        s.sendall(rgb_bytes)
+        resp = _recv_json_line(s)
+        if not resp.get("ok"):
+            raise RuntimeError(f"SAM3 server error: {resp.get('error', resp)}")
+        mask_bytes = _recv_exactly(s, resp["size"])
+        s.close()
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot connect to SAM3 server at '{sock_path}': {e}\n"
+            "Start it with:  /opt/sam3env/bin/python /ros2_ws/scripts/sam3_server.py"
+        ) from e
 
-    if resp.get("status") != "ok":
-        raise RuntimeError(f"SAM3 server error: {resp.get('error', resp)}")
-
-    print(f"[SAM3] Inference done in {elapsed:.2f}s, {resp.get('pixels', '?')} pixels masked", flush=True)
-
-    mask = np.load(mask_path)
-    if mask.shape[:2] != rgb.shape[:2]:
-        raise ValueError(f"SAM3 mask shape {mask.shape} does not match RGB shape {rgb.shape}")
+    mask = np.frombuffer(mask_bytes, dtype=np.uint8).reshape(h, w)
+    n_px = int((mask > 0).sum())
+    print(f"[SAM3] {time.time()-t0:.2f}s — {n_px} px masked", flush=True)
     return (mask > 0).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
-# Camera helpers (unchanged from original)
+# Orbbec camera helpers
 # ---------------------------------------------------------------------------
-
-def _extract_intrinsics(profile, frame):
-    fx = fy = cx = cy = None
-    for obj in [frame, profile]:
-        if obj is None:
-            continue
-        for method_name in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
-            if not hasattr(obj, method_name):
-                continue
-            intr = getattr(obj, method_name)()
-            for attr_name in ["fx", "focal_x"]:
-                if hasattr(intr, attr_name):
-                    fx = float(getattr(intr, attr_name))
-                    break
-            for attr_name in ["fy", "focal_y"]:
-                if hasattr(intr, attr_name):
-                    fy = float(getattr(intr, attr_name))
-                    break
-            for attr_name in ["cx", "ppx", "principal_x"]:
-                if hasattr(intr, attr_name):
-                    cx = float(getattr(intr, attr_name))
-                    break
-            for attr_name in ["cy", "ppy", "principal_y"]:
-                if hasattr(intr, attr_name):
-                    cy = float(getattr(intr, attr_name))
-                    break
-            if None not in [fx, fy, cx, cy]:
-                return fx, fy, cx, cy
-    raise RuntimeError("Could not read camera intrinsics from Orbbec SDK objects.")
-
-
-def _to_rgb_array(color_frame, ob_format):
+def _to_rgb_array(color_frame, ob_format) -> np.ndarray:
     from io import BytesIO
-    from PIL import Image
-
     h, w = color_frame.get_height(), color_frame.get_width()
     raw = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
     fmt = color_frame.get_format()
     fmt_name = str(fmt).upper()
 
     if hasattr(ob_format, "RGB") and fmt == ob_format.RGB:
-        return raw.reshape(h, w, 3)
+        return raw.reshape(h, w, 3).copy()
     if hasattr(ob_format, "BGR") and fmt == ob_format.BGR:
         return raw.reshape(h, w, 3)[:, :, ::-1].copy()
     if (hasattr(ob_format, "MJPG") and fmt == ob_format.MJPG) or "MJPG" in fmt_name:
-        with Image.open(BytesIO(raw.tobytes())) as img:
-            return np.array(img.convert("RGB"))
+        img = PILImage.open(BytesIO(raw.tobytes()))
+        return np.array(img.convert("RGB"))
     if (hasattr(ob_format, "YUYV") and fmt == ob_format.YUYV) or "YUYV" in fmt_name:
-        import cv2 as cv2_local
-        return cv2_local.cvtColor(raw.reshape(h, w, 2), cv2_local.COLOR_YUV2RGB_YUY2)
+        return cv2.cvtColor(raw.reshape(h, w, 2), cv2.COLOR_YUV2RGB_YUY2)
     if (hasattr(ob_format, "UYVY") and fmt == ob_format.UYVY) or "UYVY" in fmt_name:
-        import cv2 as cv2_local
-        return cv2_local.cvtColor(raw.reshape(h, w, 2), cv2_local.COLOR_YUV2RGB_UYVY)
-
-    expected_rgb_size = h * w * 3
-    if raw.size == expected_rgb_size:
-        return raw.reshape(h, w, 3)
+        return cv2.cvtColor(raw.reshape(h, w, 2), cv2.COLOR_YUV2RGB_UYVY)
+    if raw.size == h * w * 3:
+        return raw.reshape(h, w, 3).copy()
     if raw.size == h * w * 2:
-        import cv2 as cv2_local
-        return cv2_local.cvtColor(raw.reshape(h, w, 2), cv2_local.COLOR_YUV2RGB_YUY2)
-
-    raise RuntimeError(f"Unsupported color frame format {fmt} with buffer size {raw.size} for {w}x{h}")
+        return cv2.cvtColor(raw.reshape(h, w, 2), cv2.COLOR_YUV2RGB_YUY2)
+    raise RuntimeError(f"Unsupported color format {fmt} size={raw.size} for {w}x{h}")
 
 
-def capture_orbbec_frame():
-    try:
-        from pyorbbecsdk import Config, OBSensorType, OBFormat, Pipeline
-    except Exception as error:
-        raise RuntimeError("pyorbbecsdk is not installed.") from error
+def _extract_intrinsics(depth_profile, depth_frame):
+    fx = fy = cx = cy = None
+    for obj in [depth_frame, depth_profile]:
+        if obj is None:
+            continue
+        for method in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
+            if not hasattr(obj, method):
+                continue
+            intr = getattr(obj, method)()
+            for attr in ["fx", "focal_x"]:
+                if hasattr(intr, attr):
+                    fx = float(getattr(intr, attr)); break
+            for attr in ["fy", "focal_y"]:
+                if hasattr(intr, attr):
+                    fy = float(getattr(intr, attr)); break
+            for attr in ["cx", "ppx", "principal_x"]:
+                if hasattr(intr, attr):
+                    cx = float(getattr(intr, attr)); break
+            for attr in ["cy", "ppy", "principal_y"]:
+                if hasattr(intr, attr):
+                    cy = float(getattr(intr, attr)); break
+            if None not in [fx, fy, cx, cy]:
+                return fx, fy, cx, cy
+    raise RuntimeError("Could not read camera intrinsics from Orbbec SDK.")
 
-    pipeline = Pipeline()
-    config = Config()
 
-    profile_list_depth = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-    depth_profile = profile_list_depth.get_default_video_stream_profile()
-    config.enable_stream(depth_profile)
+# ---------------------------------------------------------------------------
+# Persistent Orbbec camera (background grab thread)
+# ---------------------------------------------------------------------------
+class OrbbecCamera:
+    """Keeps the Orbbec Pipeline alive and continuously exposes the latest frame."""
 
-    profile_list_color = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-    color_profile = profile_list_color.get_default_video_stream_profile()
-    config.enable_stream(color_profile)
+    def __init__(self):
+        try:
+            from pyorbbecsdk import Config, OBSensorType, Pipeline, OBFormat
+        except ImportError as e:
+            raise RuntimeError("pyorbbecsdk is not installed.") from e
 
-    pipeline.start(config)
-    try:
-        frames = None
-        for _ in range(40):
-            frames = pipeline.wait_for_frames(100)
+        self._Pipeline = Pipeline
+        self._Config = Config
+        self._OBSensorType = OBSensorType
+        self._OBFormat = OBFormat
+
+        self._lock = threading.Lock()
+        self._latest_rgb = None
+        self._latest_depth_m = None
+        self._latest_intrinsics = None
+        self._running = False
+        self._thread = None
+        self._depth_profile = None
+
+    def start(self):
+        pipeline = self._Pipeline()
+        config = self._Config()
+
+        depth_list = pipeline.get_stream_profile_list(self._OBSensorType.DEPTH_SENSOR)
+        depth_profile = depth_list.get_default_video_stream_profile()
+        config.enable_stream(depth_profile)
+        self._depth_profile = depth_profile
+
+        color_list = pipeline.get_stream_profile_list(self._OBSensorType.COLOR_SENSOR)
+        color_profile = color_list.get_default_video_stream_profile()
+        config.enable_stream(color_profile)
+
+        pipeline.start(config)
+        self._pipeline = pipeline
+        self._running = True
+        self._thread = threading.Thread(target=self._grab_loop, daemon=True)
+        self._thread.start()
+
+    def _grab_loop(self):
+        OBFormat = self._OBFormat
+        while self._running:
+            try:
+                frames = self._pipeline.wait_for_frames(100)
+            except Exception:
+                continue
             if frames is None:
                 continue
-            if frames.get_depth_frame() is not None and frames.get_color_frame() is not None:
-                break
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+            if color_frame is None or depth_frame is None:
+                continue
+            try:
+                rgb = _to_rgb_array(color_frame, OBFormat)
+            except Exception:
+                continue
+            try:
+                dh = depth_frame.get_height()
+                dw = depth_frame.get_width()
+                depth_raw = np.frombuffer(
+                    depth_frame.get_data(), dtype=np.uint16
+                ).reshape(dh, dw)
+                depth_scale = float(depth_frame.get_depth_scale())
+                depth_m = depth_raw.astype(np.float32) * depth_scale
 
-        if frames is None:
-            raise RuntimeError("Failed to receive frames from Orbbec pipeline")
+                valid = depth_m[(depth_m > 0.05) & np.isfinite(depth_m)]
+                if valid.size > 0 and float(np.median(valid)) > 20.0:
+                    depth_m = depth_m / 1000.0  # mm → m
 
-        depth_frame = frames.get_depth_frame()
-        color_frame = frames.get_color_frame()
-        if depth_frame is None or color_frame is None:
-            raise RuntimeError("Could not get both depth and color frames")
+                if rgb.shape[0] != dh or rgb.shape[1] != dw:
+                    rgb = np.array(
+                        PILImage.fromarray(rgb).resize((dw, dh), PILImage.BILINEAR)
+                    )
+                intr = _extract_intrinsics(self._depth_profile, depth_frame)
+            except Exception:
+                continue
 
-        depth_h, depth_w = depth_frame.get_height(), depth_frame.get_width()
-        depth_raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(depth_h, depth_w)
-        depth_scale = float(depth_frame.get_depth_scale())
-        depth_m = depth_raw.astype(np.float32) * depth_scale
+            with self._lock:
+                self._latest_rgb = rgb
+                self._latest_depth_m = depth_m
+                self._latest_intrinsics = intr
 
-        valid_depth = depth_m[(depth_m > 0.05) & np.isfinite(depth_m)]
-        if valid_depth.size > 0:
-            median_depth = float(np.median(valid_depth))
-            if median_depth > 20.0:
-                depth_m = depth_m / 1000.0
-                print(f"Depth in mm (median={median_depth:.3f}); converting to meters")
+    def get_latest(self):
+        """Return (rgb, depth_m, intrinsics) copies, or (None, None, None)."""
+        with self._lock:
+            if self._latest_rgb is None:
+                return None, None, None
+            return (
+                self._latest_rgb.copy(),
+                self._latest_depth_m.copy(),
+                self._latest_intrinsics,
+            )
 
-        from pyorbbecsdk import OBFormat as OBFormat_local
-        rgb = _to_rgb_array(color_frame, OBFormat_local)
-        if rgb.shape[0] != depth_h or rgb.shape[1] != depth_w:
-            from PIL import Image as PILImage
-            rgb = np.array(PILImage.fromarray(rgb).resize((depth_w, depth_h), resample=PILImage.BILINEAR))
-
-        fx, fy, cx, cy = _extract_intrinsics(depth_profile, depth_frame)
-        return depth_m, rgb, (fx, fy, cx, cy)
-    finally:
-        pipeline.stop()
-
-
-def load_mask(mask_path):
-    if mask_path.endswith(".npy"):
-        return np.load(mask_path)
-    from PIL import Image as PILImage
-    return np.array(PILImage.open(mask_path))
-
-
-def auto_mask_from_depth(depth_m, depth_delta, min_pixels):
-    h, w = depth_m.shape
-    cy, cx = h // 2, w // 2
-    valid = (depth_m > 0.1) & np.isfinite(depth_m)
-    if not valid.any():
-        raise RuntimeError("No valid depth values found for auto mask")
-
-    center_depth = depth_m[cy, cx]
-    if not np.isfinite(center_depth) or center_depth <= 0.1:
-        center_depth = np.percentile(depth_m[valid], 35)
-
-    lower = max(0.1, center_depth - depth_delta)
-    upper = center_depth + depth_delta
-    foreground = valid & (depth_m >= lower) & (depth_m <= upper)
-
-    if foreground.sum() < min_pixels:
-        lo = np.percentile(depth_m[valid], 10)
-        hi = np.percentile(depth_m[valid], 45)
-        foreground = valid & (depth_m >= lo) & (depth_m <= hi)
-
-    if foreground.sum() < min_pixels:
-        raise RuntimeError(f"Auto mask too small ({foreground.sum()} pixels).")
-
-    mask = np.zeros_like(depth_m, dtype=np.uint8)
-    mask[foreground] = 1
-    return mask
+    def stop(self):
+        self._running = False
+        try:
+            self._pipeline.stop()
+        except Exception:
+            pass
 
 
-def process_point_cloud(pc, grasps, grasp_conf):
+# ---------------------------------------------------------------------------
+# GraspGen helpers
+# ---------------------------------------------------------------------------
+def _process_point_cloud(pc, grasps, grasp_conf):
     scores = get_color_from_score(grasp_conf, use_255_scale=True)
     grasps[:, 3, 3] = 1
     t_center = tra.translation_matrix(-pc.mean(axis=0))
@@ -389,195 +383,734 @@ def process_point_cloud(pc, grasps, grasp_conf):
     return pc_centered, grasps_centered, scores, t_center
 
 
+def _save_best_grasp(grasps_cam, scores, t_center) -> dict:
+    if len(grasps_cam) == 0:
+        return {}
+    best_idx = int(np.argmax(scores))
+    best_score = float(scores[best_idx])
+    pose = grasps_cam[best_idx].copy()
+    translation = pose[:3, 3]
+    rot_mat = pose[:3, :3]
+    try:
+        from scipy.spatial.transform import Rotation
+        r = Rotation.from_matrix(rot_mat)
+        euler_deg = r.as_euler("xyz", degrees=True)
+        quat_xyzw = r.as_quat()
+    except Exception:
+        euler_deg = np.zeros(3)
+        quat_xyzw = np.array([0., 0., 0., 1.])
+
+    sep = "=" * 56
+    print(f"\n{sep}\n  BEST GRASP\n{sep}")
+    print(f"  Rank:       #{best_idx + 1} of {len(grasps_cam)}")
+    print(f"  Confidence: {best_score:.4f}  [{scores.min():.4f}–{scores.max():.4f}]")
+    print(f"  Position:   X={translation[0]:+.4f}  Y={translation[1]:+.4f}  Z={translation[2]:+.4f} m")
+    print(f"  Euler XYZ:  Roll={euler_deg[0]:+.2f}°  Pitch={euler_deg[1]:+.2f}°  Yaw={euler_deg[2]:+.2f}°")
+    print(f"  Quaternion: [{quat_xyzw[0]:+.4f}, {quat_xyzw[1]:+.4f}, {quat_xyzw[2]:+.4f}, {quat_xyzw[3]:+.4f}]")
+    print(sep)
+
+    os.makedirs("/ros2_ws/results", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = {
+        "timestamp": ts,
+        "rank": best_idx + 1,
+        "total_candidates": len(grasps_cam),
+        "confidence": best_score,
+        "score_range": [float(scores.min()), float(scores.max())],
+        "position_xyz_m": translation.tolist(),
+        "euler_xyz_deg": euler_deg.tolist(),
+        "quaternion_xyzw": quat_xyzw.tolist(),
+        "pose_matrix_4x4": pose.tolist(),
+    }
+    out_path = f"/ros2_ws/results/best_grasp_{ts}.json"
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"  Saved → {out_path}\n")
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Main snapshot logic (sam3_proc added as parameter)
+# Tkinter Application
 # ---------------------------------------------------------------------------
+class GraspGenApp:
+    def __init__(self, root: tk.Tk, args, camera: OrbbecCamera,
+                 config_map: dict, sam3_proc=None):
+        """
+        config_map: {filename.yml: /full/path/to/filename.yml}
+        """
+        self.root = root
+        self.args = args
+        self.camera = camera
+        self.config_map = config_map        # discovered configs
+        self.sam3_proc = sam3_proc
 
-def run_snapshot(args, vis, sam3_proc):
-    vis.delete()
+        # ── Cached GraspGen state (recreated only when config changes) ──
+        self._loaded_config_name = None     # which .yml is currently loaded
+        self._grasp_cfg = None
+        self._sampler = None
 
-    print("Capturing one frame from Orbbec Gemini 2...")
-    cap_start = time.time()
-    depth_m, rgb, (fx, fy, cx, cy) = capture_orbbec_frame()
-    print(
-        f"Capture complete in {time.time() - cap_start:.2f}s | "
-        f"depth={depth_m.shape} rgb={rgb.shape} intrinsics={(fx, fy, cx, cy)}"
-    )
+        # ── Mask overlay state ─────────────────────────────────────────
+        # Written from inference thread (CPython GIL makes assignment atomic),
+        # read from main thread in _update_preview.
+        self._last_mask = None              # np.ndarray (H,W) uint8 or None
 
-    # --- Segmentation mask: SAM3 > external > auto depth ---
-    if args.sam3_use and args.sam3_prompt:
-        print(f"[SAM3] Sending request with prompt: '{args.sam3_prompt}'")
-        sam3_mask = segment_with_sam3(rgb, args.sam3_prompt, sam3_proc)
-        if sam3_mask.shape != depth_m.shape:
-            raise ValueError(f"SAM3 mask shape {sam3_mask.shape} != depth shape {depth_m.shape}")
-        segmentation_mask = sam3_mask.astype(np.uint8)
-        print("Segmentation mask obtained from SAM3.")
-    elif args.segmentation_mask_path:
-        segmentation_mask = load_mask(args.segmentation_mask_path)
-        print(f"Loaded segmentation mask from {args.segmentation_mask_path}")
-    else:
-        segmentation_mask = auto_mask_from_depth(
-            depth_m, depth_delta=args.auto_mask_depth_delta, min_pixels=args.auto_mask_min_pixels
+        # ── Misc ───────────────────────────────────────────────────────
+        self._inference_running = False
+        # Prevents running while a new config/model is being loaded
+        self._config_loading = False
+        self._log_queue = queue.Queue()
+        self._vis = None                    # meshcat visualizer (created once)
+        self._show_mask_var = tk.BooleanVar(value=True)
+
+        self._build_ui()
+
+        # Pre-select and load initial config in background so the window
+        # appears immediately and shows a "Loading…" state.
+        if config_map:
+            first = next(iter(config_map))
+            if args.gripper_config:
+                preferred = Path(args.gripper_config).name
+                if preferred in config_map:
+                    first = preferred
+            self._config_combo.set(first)
+            self._start_config_load(first)
+
+        self._schedule_preview_update()
+        self._schedule_log_flush()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        self.root.title("GraspGen Pipeline")
+        self.root.configure(bg="#1e1e1e")
+        self.root.resizable(False, False)
+
+        # ── Left: camera preview ──────────────────────────────────────
+        left = tk.Frame(self.root, bg="#1e1e1e")
+        left.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=6)
+
+        self._canvas = tk.Canvas(
+            left, width=_PREVIEW_W, height=_PREVIEW_H,
+            bg="#111111", highlightthickness=1, highlightbackground="#444",
         )
-        print("Generated segmentation mask automatically from depth")
-
-    if segmentation_mask.shape != depth_m.shape:
-        raise ValueError(f"Mask shape {segmentation_mask.shape} != depth shape {depth_m.shape}")
-
-    if args.save_capture_prefix:
-        np.save(f"{args.save_capture_prefix}_depth.npy", depth_m)
-        np.save(f"{args.save_capture_prefix}_rgb.npy", rgb)
-        np.save(f"{args.save_capture_prefix}_mask.npy", segmentation_mask)
-        print(f"Saved capture to prefix: {args.save_capture_prefix}")
-
-    scene_pc, object_pc, scene_colors, object_colors = depth_and_segmentation_to_point_clouds(
-        depth_image=depth_m,
-        segmentation_mask=segmentation_mask,
-        fx=fx, fy=fy, cx=cx, cy=cy,
-        rgb_image=rgb,
-        target_object_id=args.target_object_id,
-        remove_object_from_scene=True,
-    )
-
-    if len(object_pc) > args.max_object_points:
-        keep_idx = np.random.choice(len(object_pc), args.max_object_points, replace=False)
-        object_pc = object_pc[keep_idx]
-        if object_colors is not None:
-            object_colors = object_colors[keep_idx]
-        print(f"Downsampled object point cloud to {len(object_pc)} points")
-
-    object_pc_torch = torch.from_numpy(object_pc)
-    pc_filtered, _ = point_cloud_outlier_removal(object_pc_torch)
-    pc_filtered = pc_filtered.numpy()
-
-    if len(pc_filtered) > 0:
-        t_center = tra.translation_matrix(-pc_filtered.mean(axis=0))
-        pc_centered = tra.transform_points(pc_filtered, t_center)
-    else:
-        t_center = np.eye(4)
-        pc_centered = pc_filtered
-
-    if scene_colors is None:
-        scene_colors = np.tile(np.array([[120, 120, 120]], dtype=np.uint8), (len(scene_pc), 1))
-
-    object_vis_colors = np.tile(np.array([[255, 255, 255]], dtype=np.uint8), (len(pc_centered), 1))
-    scene_centered = tra.transform_points(scene_pc, t_center)
-
-    visualize_pointcloud(vis, "pc_scene", scene_centered, scene_colors, size=args.scene_point_size)
-    visualize_pointcloud(vis, "pc_obj", pc_centered, object_vis_colors, size=args.object_point_size)
-
-    if len(scene_centered) > 0:
-        print(f"Scene bounds (centered): min={scene_centered.min(axis=0)}, max={scene_centered.max(axis=0)}")
-
-    grasp_cfg = load_grasp_cfg(args.gripper_config)
-    gripper_name = grasp_cfg.data.gripper_name
-    sampler = GraspGenSampler(grasp_cfg)
-
-    grasps_inferred, grasp_conf_inferred = GraspGenSampler.run_inference(
-        pc_filtered, sampler,
-        grasp_threshold=args.grasp_threshold,
-        num_grasps=args.num_grasps,
-        topk_num_grasps=args.topk_num_grasps,
-    )
-
-    if len(grasps_inferred) == 0:
-        print("No grasps found.")
-        return
-
-    grasp_conf_inferred = grasp_conf_inferred.cpu().numpy()
-    grasps_inferred = grasps_inferred.cpu().numpy()
-    pc_centered, grasps_centered, scores, t_center = process_point_cloud(
-        pc_filtered, grasps_inferred, grasp_conf_inferred
-    )
-
-    if args.collision_filter:
-        gripper_info = get_gripper_info(gripper_name)
-        collision_mesh = gripper_info.collision_mesh
-        if len(scene_centered) > args.max_scene_points:
-            idx = np.random.choice(len(scene_centered), args.max_scene_points, replace=False)
-            scene_for_collision = scene_centered[idx]
-        else:
-            scene_for_collision = scene_centered
-
-        collision_free_mask = filter_colliding_grasps(
-            scene_pc=scene_for_collision,
-            grasp_poses=grasps_centered,
-            gripper_collision_mesh=collision_mesh,
-            collision_threshold=args.collision_threshold,
+        self._canvas.pack()
+        self._canvas_img_id = self._canvas.create_image(0, 0, anchor="nw")
+        self._no_cam_txt = self._canvas.create_text(
+            _PREVIEW_W // 2, _PREVIEW_H // 2,
+            text="Waiting for camera…",
+            fill="#555555", font=("Helvetica", 14),
         )
 
-        free_grasps = grasps_centered[collision_free_mask]
-        colliding_grasps = grasps_centered[~collision_free_mask]
-        free_scores = scores[collision_free_mask]
+        # Mask overlay toggle — stored as attribute so BooleanVar stays alive
+        self._mask_chk = tk.Checkbutton(
+            left,
+            text="Show mask overlay",
+            variable=self._show_mask_var,
+            bg="#1e1e1e", fg="#aaa",
+            activebackground="#1e1e1e", activeforeground="white",
+            selectcolor="#2d2d2d",
+        )
+        self._mask_chk.pack(anchor="w", padx=4, pady=(4, 0))
 
-        for j, grasp in enumerate(free_grasps):
-            visualize_grasp(vis, f"grasps/free/{j:03d}/grasp", grasp,
-                            color=free_scores[j], gripper_name=gripper_name, linewidth=1.5)
-        for j, grasp in enumerate(colliding_grasps[:40]):
-            visualize_grasp(vis, f"grasps/colliding/{j:03d}/grasp", grasp,
-                            color=[255, 0, 0], gripper_name=gripper_name, linewidth=0.4)
+        # ── Right: controls ───────────────────────────────────────────
+        right = tk.Frame(self.root, bg="#2d2d2d", width=340)
+        right.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=6)
+        right.grid_propagate(False)
 
-        print(f"Collision filter: {collision_free_mask.sum()}/{len(collision_free_mask)} grasps collision-free")
-    else:
-        for j, grasp in enumerate(grasps_centered):
-            visualize_grasp(vis, f"grasps/{j:03d}/grasp", grasp,
-                            color=scores[j], gripper_name=gripper_name, linewidth=1.2)
+        tk.Label(right, text="GraspGen", bg="#2d2d2d", fg="#61afef",
+                 font=("Helvetica", 16, "bold")).pack(pady=(14, 0))
+        tk.Label(right, text="SAM3  ·  Orbbec Gemini 2  ·  GraspGen",
+                 bg="#2d2d2d", fg="#666", font=("Helvetica", 9)).pack(pady=(0, 10))
 
-    print(
-        f"Done. Inferred {len(grasps_inferred)} grasps, confidence "
-        f"[{grasp_conf_inferred.min():.3f}, {grasp_conf_inferred.max():.3f}]"
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
+
+        # ── Gripper / tool selector ───────────────────────────────────
+        tk.Label(right, text="Gripper / Tool:", bg="#2d2d2d", fg="#ccc",
+                 font=("Helvetica", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+
+        names = list(self.config_map.keys())
+        self._config_combo = ttk.Combobox(
+            right,
+            values=names,
+            state="readonly",
+            font=("Helvetica", 9),
+            width=36,
+        )
+        self._config_combo.pack(padx=12, pady=(0, 4), fill="x")
+        if not names:
+            self._config_combo.set("(no configs found)")
+            self._config_combo.configure(state="disabled")
+        self._config_combo.bind("<<ComboboxSelected>>", self._on_config_change)
+
+        # Config path hint
+        self._config_hint = tk.Label(
+            right, text="", bg="#2d2d2d", fg="#555",
+            font=("Courier", 7), wraplength=300, justify="left",
+        )
+        self._config_hint.pack(anchor="w", padx=12, pady=(0, 6))
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
+
+        # ── Object prompt ─────────────────────────────────────────────
+        tk.Label(right, text="Object prompt:", bg="#2d2d2d", fg="#ccc",
+                 font=("Helvetica", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+
+        self._prompt_var = tk.StringVar(value=self.args.sam3_prompt or "")
+        self._prompt_entry = tk.Entry(
+            right, textvariable=self._prompt_var,
+            bg="#3a3a3a", fg="white", insertbackground="white",
+            relief="flat", font=("Helvetica", 11), bd=4,
+        )
+        self._prompt_entry.pack(padx=12, pady=(0, 10), fill="x")
+        self._prompt_entry.bind("<Return>", lambda _e: self._on_run())
+
+        # ── Run button ────────────────────────────────────────────────
+        self._run_btn = tk.Button(
+            right, text="▶  Capture & Run GraspGen",
+            bg="#61afef", fg="#1e1e1e", activebackground="#4d9bd6",
+            font=("Helvetica", 11, "bold"),
+            relief="flat", cursor="hand2", bd=0,
+            command=self._on_run,
+        )
+        self._run_btn.pack(padx=12, pady=4, fill="x", ipady=10)
+
+        # Clear mask button
+        tk.Button(
+            right, text="✕  Clear mask overlay",
+            bg="#3a3a3a", fg="#aaa", activebackground="#444",
+            font=("Helvetica", 9),
+            relief="flat", cursor="hand2", bd=0,
+            command=self._clear_mask,
+        ).pack(padx=12, pady=(2, 8), fill="x", ipady=4)
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
+
+        # ── Status ────────────────────────────────────────────────────
+        tk.Label(right, text="Status:", bg="#2d2d2d", fg="#666",
+                 font=("Helvetica", 9)).pack(anchor="w", padx=12)
+        self._status_var = tk.StringVar(value="Waiting for camera…")
+        tk.Label(
+            right, textvariable=self._status_var,
+            bg="#2d2d2d", fg="#98c379",
+            font=("Helvetica", 9), wraplength=300, justify="left",
+        ).pack(anchor="w", padx=12, pady=(2, 8))
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
+
+        # ── Log ───────────────────────────────────────────────────────
+        tk.Label(right, text="Log:", bg="#2d2d2d", fg="#666",
+                 font=("Helvetica", 9)).pack(anchor="w", padx=12)
+        self._log_text = scrolledtext.ScrolledText(
+            right, width=38, height=14,
+            bg="#1e1e1e", fg="#abb2bf",
+            font=("Courier", 8), state="disabled", relief="flat",
+        )
+        self._log_text.pack(padx=12, pady=(2, 8), fill="both", expand=True)
+
+        tk.Label(
+            right,
+            text=f"SAM3: {self.args.sam3_socket}   Meshcat: http://127.0.0.1:7000",
+            bg="#2d2d2d", fg="#444", font=("Courier", 7),
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        self.root.columnconfigure(0, weight=1)
+        self.root.columnconfigure(1, weight=0)
+        self.root.rowconfigure(0, weight=1)
+
+    # ------------------------------------------------------------------
+    # Config management
+    # ------------------------------------------------------------------
+    def _start_config_load(self, name: str):
+        """Kick off a background config load (safe to call from any thread)."""
+        if self._config_loading or name == self._loaded_config_name:
+            return
+        self._config_loading = True
+        # Disable Run button and show loading state — must be on main thread
+        self.root.after(0, lambda: self._run_btn.configure(
+            state="disabled", text="Loading model…"
+        ))
+        self._set_status(f"Loading {name}…")
+        threading.Thread(
+            target=self._load_grasp_config, args=(name,), daemon=True
+        ).start()
+
+    def _load_grasp_config(self, name: str):
+        """Background thread: load GraspGen config + sampler for the given name.
+        Weights are only reloaded when the name actually changes.
+        ALL Tkinter widget updates are routed through root.after() — never called
+        directly from this thread, which would segfault on Linux.
+        """
+        path = self.config_map.get(name)
+        if not path:
+            self._log(f"[Config] Unknown config: {name}")
+            self._config_loading = False
+            self.root.after(0, self._restore_run_btn)
+            return
+        try:
+            self._log(f"[Config] Loading {name}…")
+            new_cfg = load_grasp_cfg(path)
+            new_sampler = GraspGenSampler(new_cfg)
+
+            # Atomically swap (GIL protects simple attribute writes)
+            self._grasp_cfg = new_cfg
+            self._sampler = new_sampler
+            self._loaded_config_name = name
+
+            # ── All widget updates via root.after — NEVER directly ──
+            self.root.after(0, lambda p=path: self._config_hint.configure(text=p))
+            self._log(f"[Config] Ready: {new_cfg.data.gripper_name}")
+            self._set_status(f"Ready — {name}")
+        except Exception as e:
+            self._log(f"[Config] ERROR loading {name}: {e}")
+            self._set_status(f"Config error: {e}")
+            self._grasp_cfg = None
+            self._sampler = None
+            self._loaded_config_name = None
+        finally:
+            self._config_loading = False
+            self.root.after(0, self._restore_run_btn)
+
+    def _restore_run_btn(self):
+        """Re-enable the Run button if nothing else is blocking it (main thread)."""
+        if not self._inference_running and not self._config_loading:
+            self._run_btn.configure(state="normal", text="▶  Capture & Run GraspGen")
+
+    def _on_config_change(self, _event=None):
+        name = self._config_combo.get()
+        if not name or name == self._loaded_config_name:
+            return
+        if self._config_loading or self._inference_running:
+            # Revert combo to the currently loaded config so the user knows
+            self._config_combo.set(self._loaded_config_name or "")
+            self._set_status("Busy — wait for current operation to finish.")
+            return
+        self._start_config_load(name)
+
+    # ------------------------------------------------------------------
+    # Preview update (~12 fps, main thread)
+    # ------------------------------------------------------------------
+    def _schedule_preview_update(self):
+        self._update_preview()
+        self.root.after(80, self._schedule_preview_update)
+
+    def _update_preview(self):
+        if not _PIL_OK:
+            return
+        rgb, _depth, _intr = self.camera.get_latest()
+        if rgb is None:
+            return
+
+        # Hide placeholder text once we have a frame
+        self._canvas.itemconfig(self._no_cam_txt, state="hidden")
+
+        display = rgb.copy()
+
+        # ── Mask overlay ──────────────────────────────────────────────
+        # Read _last_mask once (CPython assignment is atomic under GIL)
+        mask = self._last_mask
+        if self._show_mask_var.get() and mask is not None:
+            mh, mw = mask.shape[:2]
+            dh, dw = display.shape[:2]
+            # Resize mask to match current frame if dimensions differ
+            if (mh, mw) != (dh, dw):
+                mask = cv2.resize(
+                    mask.astype(np.float32), (dw, dh),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(np.uint8)
+            # Build coloured overlay and blend
+            overlay = display.copy()
+            overlay[mask > 0] = _MASK_GREEN_RGB
+            cv2.addWeighted(display, 0.55, overlay, 0.45, 0, dst=display)
+
+        # ── Scale to canvas size keeping aspect ratio ─────────────────
+        h, w = display.shape[:2]
+        scale = min(_PREVIEW_W / w, _PREVIEW_H / h)
+        nw, nh = int(w * scale), int(h * scale)
+        display = cv2.resize(display, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+        padded = np.zeros((_PREVIEW_H, _PREVIEW_W, 3), dtype=np.uint8)
+        yo = (_PREVIEW_H - nh) // 2
+        xo = (_PREVIEW_W - nw) // 2
+        padded[yo:yo + nh, xo:xo + nw] = display
+
+        pil_img = PILImage.fromarray(padded)
+        tk_img = ImageTk.PhotoImage(pil_img)
+        self._canvas.itemconfig(self._canvas_img_id, image=tk_img)
+        self._canvas._tk_img_ref = tk_img   # prevent GC
+
+        if self._status_var.get().startswith("Waiting for camera"):
+            self._status_var.set("Camera ready.")
+
+    # ------------------------------------------------------------------
+    # Mask helpers
+    # ------------------------------------------------------------------
+    def _clear_mask(self):
+        self._last_mask = None
+
+    # ------------------------------------------------------------------
+    # Log helpers (thread-safe via queue)
+    # ------------------------------------------------------------------
+    def _log(self, msg: str):
+        self._log_queue.put(msg)
+
+    def _schedule_log_flush(self):
+        self._flush_log()
+        self.root.after(200, self._schedule_log_flush)
+
+    def _flush_log(self):
+        msgs = []
+        try:
+            while True:
+                msgs.append(self._log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if msgs:
+            self._log_text.configure(state="normal")
+            for m in msgs:
+                self._log_text.insert("end", m + "\n")
+            self._log_text.see("end")
+            self._log_text.configure(state="disabled")
+
+    def _set_status(self, msg: str):
+        """Safe to call from any thread."""
+        self.root.after(0, lambda: self._status_var.set(msg))
+
+    # ------------------------------------------------------------------
+    # Run button
+    # ------------------------------------------------------------------
+    def _on_run(self):
+        if self._inference_running or self._config_loading:
+            return
+
+        prompt = self._prompt_var.get().strip()
+        if not prompt:
+            self._set_status("Enter an object prompt first.")
+            return
+
+        if self._sampler is None or self._grasp_cfg is None:
+            self._set_status("No gripper config loaded — select one from the dropdown.")
+            return
+
+        rgb, depth_m, intrinsics = self.camera.get_latest()
+        if rgb is None or depth_m is None:
+            self._set_status("No camera frame available yet.")
+            return
+
+        self._inference_running = True
+        self._run_btn.configure(state="disabled", text="Running…")
+        self._set_status("Running pipeline…")
+        # Clear stale mask during inference
+        self._last_mask = None
+
+        threading.Thread(
+            target=self._run_pipeline,
+            args=(rgb.copy(), depth_m.copy(), intrinsics, prompt,
+                  self._sampler, self._grasp_cfg),
+            daemon=True,
+        ).start()
+
+    # ------------------------------------------------------------------
+    # Inference pipeline (background thread)
+    # ------------------------------------------------------------------
+    def _run_pipeline(self, rgb, depth_m, intrinsics, prompt, sampler, grasp_cfg):
+        args = self.args
+        try:
+            # ── 1. SAM3 segmentation ──────────────────────────────────
+            self._log(f"[SAM3] prompt='{prompt}'")
+            t0 = time.time()
+            mask = segment_with_sam3_server(rgb, prompt, args.sam3_socket)
+            n_px = int(mask.sum())
+            self._log(f"[SAM3] {time.time()-t0:.2f}s — {n_px} px masked")
+
+            if mask.shape != depth_m.shape:
+                # Resize mask to depth shape
+                mask = cv2.resize(
+                    mask.astype(np.float32),
+                    (depth_m.shape[1], depth_m.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(np.uint8)
+                n_px = int(mask.sum())
+
+            # Store mask for overlay — direct assignment is safe under CPython GIL
+            self._last_mask = mask
+
+            if n_px < 50:
+                raise RuntimeError(
+                    f"Only {n_px} pixels masked — try a more specific prompt"
+                )
+
+            # ── 2. Point clouds ───────────────────────────────────────
+            fx, fy, cx, cy = intrinsics
+            scene_pc, object_pc, scene_colors, object_colors = \
+                depth_and_segmentation_to_point_clouds(
+                    depth_image=depth_m,
+                    segmentation_mask=mask,
+                    fx=fx, fy=fy, cx=cx, cy=cy,
+                    rgb_image=rgb,
+                    target_object_id=args.target_object_id,
+                    remove_object_from_scene=True,
+                )
+
+            if len(object_pc) > args.max_object_points:
+                idx = np.random.choice(len(object_pc), args.max_object_points, replace=False)
+                object_pc = object_pc[idx]
+                if object_colors is not None:
+                    object_colors = object_colors[idx]
+
+            pc_torch = torch.from_numpy(object_pc)
+            pc_filtered, _ = point_cloud_outlier_removal(pc_torch)
+            pc_filtered = pc_filtered.numpy()
+
+            if len(pc_filtered) == 0:
+                raise RuntimeError("Object point cloud is empty after outlier removal")
+
+            t_center = tra.translation_matrix(-pc_filtered.mean(axis=0))
+            pc_centered = tra.transform_points(pc_filtered, t_center)
+            scene_centered = tra.transform_points(scene_pc, t_center)
+
+            # ── 3. Meshcat visualisation ──────────────────────────────
+            if self._vis is None:
+                try:
+                    self._vis = create_visualizer()
+                except Exception as e:
+                    self._log(f"[Meshcat] Could not connect: {e}")
+
+            if self._vis is not None:
+                self._vis.delete()
+                make_frame(self._vis, "world", h=0.12, radius=0.004)
+
+                _sc = scene_colors if scene_colors is not None else \
+                    np.tile([[120, 120, 120]], (len(scene_pc), 1)).astype(np.uint8)
+                _oc = np.tile([[255, 255, 255]], (len(pc_centered), 1)).astype(np.uint8)
+                visualize_pointcloud(self._vis, "pc_scene", scene_centered, _sc,
+                                     size=args.scene_point_size)
+                visualize_pointcloud(self._vis, "pc_obj", pc_centered, _oc,
+                                     size=args.object_point_size)
+
+            # ── 4. GraspGen inference (reuse cached sampler) ──────────
+            self._log("[GraspGen] Running inference…")
+            t1 = time.time()
+            grasps, grasp_conf = GraspGenSampler.run_inference(
+                pc_filtered, sampler,
+                grasp_threshold=args.grasp_threshold,
+                num_grasps=args.num_grasps,
+                topk_num_grasps=args.topk_num_grasps,
+            )
+            self._log(f"[GraspGen] {time.time()-t1:.2f}s — {len(grasps)} grasps")
+
+            if len(grasps) == 0:
+                raise RuntimeError("GraspGen found no grasps for this point cloud")
+
+            grasp_conf_np = grasp_conf.cpu().numpy()
+            grasps_np = grasps.cpu().numpy()
+            pc_centered, grasps_centered, scores, t_center = _process_point_cloud(
+                pc_filtered, grasps_np, grasp_conf_np
+            )
+
+            best = _save_best_grasp(grasps_np, grasp_conf_np, t_center)
+            gripper_name = grasp_cfg.data.gripper_name
+
+            # ── 5. Collision filtering (optional) ─────────────────────
+            if self._vis is not None:
+                if args.collision_filter:
+                    gripper_info = get_gripper_info(gripper_name)
+                    scene_col = scene_centered
+                    if len(scene_centered) > args.max_scene_points:
+                        idx = np.random.choice(
+                            len(scene_centered), args.max_scene_points, replace=False
+                        )
+                        scene_col = scene_centered[idx]
+
+                    free_mask = filter_colliding_grasps(
+                        scene_pc=scene_col,
+                        grasp_poses=grasps_centered,
+                        gripper_collision_mesh=gripper_info.collision_mesh,
+                        collision_threshold=args.collision_threshold,
+                    )
+                    for j, g in enumerate(grasps_centered[free_mask]):
+                        visualize_grasp(self._vis, f"grasps/free/{j:03d}/grasp", g,
+                                        color=scores[free_mask][j],
+                                        gripper_name=gripper_name, linewidth=1.5)
+                    for j, g in enumerate(grasps_centered[~free_mask][:40]):
+                        visualize_grasp(self._vis, f"grasps/colliding/{j:03d}/grasp", g,
+                                        color=[255, 0, 0],
+                                        gripper_name=gripper_name, linewidth=0.4)
+                    n_free = int(free_mask.sum())
+                    self._log(f"[Collision] {n_free}/{len(free_mask)} grasps free")
+                else:
+                    for j, g in enumerate(grasps_centered):
+                        visualize_grasp(self._vis, f"grasps/{j:03d}/grasp", g,
+                                        color=scores[j],
+                                        gripper_name=gripper_name, linewidth=1.2)
+
+            # ── 6. Summary ────────────────────────────────────────────
+            conf_min = float(grasp_conf_np.min())
+            conf_max = float(grasp_conf_np.max())
+            best_conf = best.get("confidence", 0.0)
+            best_z = best.get("position_xyz_m", [0, 0, 0])[2]
+            summary = (
+                f"{len(grasps_np)} grasps [{conf_min:.3f}–{conf_max:.3f}]\n"
+                f"Best conf: {best_conf:.4f}  depth: {best_z:.3f}m\n"
+                f"Meshcat: http://127.0.0.1:7000"
+            )
+            self._log("─" * 36)
+            self._log(summary)
+            self._set_status(summary)
+
+        except Exception as exc:
+            err = str(exc)
+            self._log(f"[ERROR] {err}")
+            self._set_status(f"Error: {err}")
+
+        finally:
+            # Free CUDA memory held by this inference pass so the next run
+            # starts clean and doesn't hit OOM or deferred CUDA errors.
+            try:
+                torch.cuda.synchronize()   # surface any deferred CUDA errors now
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()   # release cached allocator blocks
+            except Exception:
+                pass
+            gc.collect()
+
+            # Always re-enable the button regardless of success/failure
+            self._inference_running = False
+            self.root.after(0, self._restore_run_btn)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="GraspGen Tkinter UI — persistent SAM3 socket server"
     )
+    p.add_argument(
+        "--gripper_config", type=str, default=None,
+        help="Pre-select this gripper config .yml (optional — can use dropdown instead)",
+    )
+    p.add_argument(
+        "--checkpoints_dir", type=str, default=CHECKPOINTS_DIR,
+        help=f"Directory to scan for gripper config .yml files (default: {CHECKPOINTS_DIR})",
+    )
+    p.add_argument("--num_grasps", type=int, default=200)
+    p.add_argument("--grasp_threshold", type=float, default=-1.0)
+    p.add_argument("--topk_num_grasps", type=int, default=100)
+    p.add_argument("--return_topk", action="store_true")
+    p.add_argument("--collision_filter", action="store_true",
+                   help="Filter colliding grasps against scene point cloud")
+    p.add_argument("--collision_threshold", type=float, default=0.02)
+    p.add_argument("--max_scene_points", type=int, default=8192)
+    p.add_argument("--max_object_points", type=int, default=12000)
+    p.add_argument("--scene_point_size", type=float, default=0.008)
+    p.add_argument("--object_point_size", type=float, default=0.012)
+    p.add_argument("--target_object_id", type=int, default=1)
+    # SAM3
+    p.add_argument("--sam3_prompt", type=str, default="",
+                   help="Default prompt pre-filled in the UI")
+    p.add_argument("--sam3_socket", type=str, default="/tmp/sam3_server.sock",
+                   help="Unix socket path for the SAM3 server")
+    p.add_argument("--sam3_device", type=str, default="cuda:0")
+    p.add_argument("--sam3_no_fp16", action="store_true")
+    p.add_argument("--sam3_autostart", action="store_true",
+                   help="Auto-start sam3_server.py if not already running")
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-
 def main():
     args = parse_args()
-
-    if not os.path.exists(args.gripper_config):
-        raise FileNotFoundError(args.gripper_config)
 
     if args.return_topk and args.topk_num_grasps == -1:
         args.topk_num_grasps = 100
 
-    # Start SAM3 server ONCE before the capture loop
+    # ── Discover gripper configs ──────────────────────────────────────────
+    config_map = scan_checkpoints(args.checkpoints_dir)
+    if config_map:
+        print(f"[Config] Found {len(config_map)} config(s) in {args.checkpoints_dir}:",
+              flush=True)
+        for name in config_map:
+            print(f"  {name}", flush=True)
+    else:
+        print(
+            f"[Config] WARNING: No .yml files found in '{args.checkpoints_dir}'.\n"
+            "         Pass --checkpoints_dir or --gripper_config to specify configs.",
+            flush=True,
+        )
+        # Fall back to --gripper_config if given
+        if args.gripper_config and os.path.isfile(args.gripper_config):
+            name = Path(args.gripper_config).name
+            config_map = {name: args.gripper_config}
+
+    # ── SAM3 server ───────────────────────────────────────────────────────
     sam3_proc = None
-    if args.sam3_use:
-        if not args.sam3_prompt:
-            raise ValueError("--sam3_use requires --sam3_prompt")
-        sam3_proc = start_sam3_server(args)
-
-    vis = create_visualizer()
-    make_frame(vis, "world", h=0.12, radius=0.004)
-    print("Meshcat visualization active. Open http://127.0.0.1:7000 in your browser.")
-
+    print(f"[SAM3] Checking server at '{args.sam3_socket}'…", flush=True)
     try:
-        if args.keypress:
-            print("Keypress mode: Enter=Capture, q=Quit")
-            while True:
-                user_in = input("[Enter=Capture, q=Quit] > ").strip().lower()
-                if user_in in ["q", "quit", "exit"]:
-                    print("Exiting.")
-                    break
-                try:
-                    run_snapshot(args, vis, sam3_proc)
-                except Exception as error:
-                    print(f"Snapshot failed: {error}")
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(args.sam3_socket)
+        s.close()
+        print("[SAM3] Connected to existing server.", flush=True)
+    except OSError:
+        if args.sam3_autostart:
+            sam3_proc = start_sam3_server(
+                args.sam3_socket,
+                device=args.sam3_device,
+                fp16=not args.sam3_no_fp16,
+            )
         else:
-            run_snapshot(args, vis, sam3_proc)
-            print("Visualizer running. Keep this process alive.")
-            while True:
-                time.sleep(1.0)
-    finally:
+            print(
+                f"[SAM3] No server found at '{args.sam3_socket}'.\n"
+                "       Start it with:\n"
+                "         /opt/sam3env/bin/python /ros2_ws/scripts/sam3_server.py\n"
+                "       Or pass --sam3_autostart.\n"
+                "       SAM3 inference will fail until the server is running.",
+                flush=True,
+            )
+
+    # ── Orbbec camera ─────────────────────────────────────────────────────
+    print("[Camera] Starting Orbbec pipeline…", flush=True)
+    camera = OrbbecCamera()
+    camera.start()
+    print("[Camera] Live stream running.", flush=True)
+
+    # ── Tkinter UI ────────────────────────────────────────────────────────
+    if not _PIL_OK:
+        print(
+            "[UI] WARNING: Pillow not found — camera preview will be blank.\n"
+            "     pip install Pillow",
+            flush=True,
+        )
+
+    root = tk.Tk()
+    app = GraspGenApp(root, args, camera, config_map, sam3_proc=sam3_proc)
+
+    def _on_close():
+        print("Shutting down…", flush=True)
+        camera.stop()
         if sam3_proc is not None:
-            print("[SAM3] Shutting down server...", flush=True)
             try:
-                sam3_proc.stdin.close()
+                sam3_proc.terminate()
                 sam3_proc.wait(timeout=5)
             except Exception:
-                sam3_proc.terminate()
+                sam3_proc.kill()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+
+    print(
+        "UI ready.\n"
+        "  • Select a gripper from the dropdown.\n"
+        "  • Type a prompt and click 'Capture & Run'.\n"
+        "  • Meshcat: http://127.0.0.1:7000",
+        flush=True,
+    )
+    root.mainloop()
 
 
 if __name__ == "__main__":

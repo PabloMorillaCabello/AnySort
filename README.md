@@ -28,7 +28,7 @@ Orbbec ROS2 topics ──> SAM3 node ──> GraspGen node ──> MoveIt2 Plann
 | CUDA | 12.6 | — | Unified across all environments |
 | ROS2 | Humble | 3.10 (system) | Binary packages for Ubuntu 22.04 |
 | GraspGen | latest | 3.10 (uv venv) | `/opt/GraspGen/.venv` — installed via `uv pip install -e .` |
-| SAM3 | Transformers API | 3.12 (venv) | `/opt/sam3env` — HuggingFace `facebook/sam3`; called via subprocess (`sam3_segment_once.py`) or socket server (`sam3_server.py`) |
+| SAM3 | Transformers API | 3.12 (venv) | `/opt/sam3env` — persistent socket server (`sam3_server.py`) loads model once, serves requests via `/tmp/sam3_server.sock`; legacy subprocess mode (`sam3_segment_once.py`) also available |
 | Dobot API | V4 | 3.10 (venv) | `/opt/Dobot_hv` — TCP/IP robot control (ports 29999, 30004) |
 | Orbbec SDK | v2.7.6 | 3.10 | SDK .deb + OrbbecSDK_ROS2 (v2-main) for Gemini 2 |
 | GraspGen Models | — | — | `/opt/GraspGen/GraspGenModels` (git-lfs) |
@@ -81,10 +81,12 @@ GraspGen_Thesis_Repo/
 │   │       └── pipeline_params.yaml      # All tuneable parameters
 │   └── robotiq_3f_driver/            # Robotiq 3F gripper Modbus driver
 ├── scripts/                          # Utility & test scripts
-│   ├── demo_orbbec_gemini2.py        # **PRIMARY DEMO**: capture → SAM3 → GraspGen → execute (standalone Python)
+│   ├── TEST/                         # Interactive pipeline UI (primary demo)
+│   │   └── demo_orbbec_gemini2_persistent_sam3.py  # Tkinter UI: live preview, SAM3 server, GraspGen, Meshcat
+│   ├── demo_orbbec_gemini2.py        # Legacy demo: subprocess SAM3 per call (reference script)
 │   ├── view_camera.py                # Real-time RGB+Depth+IR viewer (pyorbbecsdk, no ROS2)
-│   ├── sam3_segment_once.py          # One-shot SAM3 helper called by demo (subprocess bridge)
-│   ├── sam3_server.py                # SAM3 inference server (socket IPC alternative)
+│   ├── sam3_segment_once.py          # One-shot SAM3 helper (legacy subprocess bridge)
+│   ├── sam3_server.py                # SAM3 persistent socket server (primary integration method)
 │   ├── download_models.sh            # Download SAM3 + GraspGen weights from HuggingFace
 │   ├── build_workspace.sh            # colcon build helper
 │   ├── test_environment.sh           # Verify full environment setup
@@ -179,30 +181,61 @@ Verify the camera is visible in WSL2: `lsusb | grep Orbbec`
 
 Then test individual components as needed (see [Testing Each Component](#testing-each-component) below).
 
-### Step 5a: Run the standalone Python pipeline (recommended)
+### Step 5a: Run the interactive Tkinter pipeline (recommended)
 
-This is the primary workflow — runs the full capture → segmentation → grasp generation → execution cycle without ROS2 overhead. Useful for quick experiments and debugging.
+This is the primary workflow — a Tkinter UI that runs the full capture → segmentation → grasp generation cycle without ROS2 overhead. Uses SAM3 persistent socket server for efficient multi-inference execution.
+
+**Two-terminal setup (recommended):**
+
+Terminal 1 — Start SAM3 socket server (loads model once, stays alive):
 
 ```bash
-# Basic demo: depth-based auto-mask (no SAM3)
+/opt/sam3env/bin/python /ros2_ws/scripts/sam3_server.py
+# Optional flags:
+#   --device cuda:0 (GPU device; default auto-detect)
+#   --no-fp16 (disable float16; for memory issues)
+#   --socket /tmp/sam3_server.sock (default socket path)
+```
+
+Terminal 2 — Launch the interactive pipeline UI:
+
+```bash
+python /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py
+# Optional flags:
+#   --sam3_autostart (auto-starts SAM3 server if not running)
+#   --collision_filter (enable collision filtering)
+#   --sam3_prompt "red mug" (pre-fill prompt in UI)
+```
+
+**Single-terminal (auto-start SAM3 server):**
+
+```bash
+python /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py --sam3_autostart
+```
+
+The UI provides:
+- Live Orbbec Gemini 2 RGB preview (640×480, ~12 fps)
+- Dropdown to select gripper/tool config (auto-scanned from `/opt/GraspGen/GraspGenModels/checkpoints/`)
+- Text prompt entry for SAM3 segmentation
+- "Capture & Run GraspGen" button to execute the pipeline
+- Green mask overlay on live preview after each inference
+- GraspGen model caching (model weights loaded once per gripper, reused on subsequent calls)
+- Results saved to `/ros2_ws/results/best_grasp_<timestamp>.json`
+
+Meshcat visualization of generated grasps available at: http://127.0.0.1:7000
+
+**Legacy script** (reference only — subprocess SAM3 per call):
+
+```bash
+# Single inference with depth-based auto-mask (no SAM3)
 python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
     --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml
 
-# With SAM3 text-prompted segmentation:
+# With text-prompted SAM3 (slower — reloads model each call)
 python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
     --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml \
-    --sam3_use \
-    --sam3_prompt "red mug"
-
-# Interactive mode (press Enter to capture, q to quit):
-python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
-    --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml \
-    --sam3_use --sam3_prompt "bottle" \
-    --collision_filter \
-    --keypress
+    --sam3_use --sam3_prompt "red mug" --collision_filter
 ```
-
-SAM3 segmentation is handled by `sam3_segment_once.py` running in the Python 3.12 venv (subprocess call), bridging the version gap between GraspGen (3.10) and SAM3 (3.12).
 
 ### Step 5b: Run the ROS2-based pipeline (optional, for UR robot integration)
 
@@ -427,6 +460,7 @@ Reports whether segmentation masks and grasp poses were received, along with the
 | Camera (viewer) | `view_camera.py` | Live RGB+Depth feed, no ROS2 needed | Camera |
 | Dobot | `python3 -c "import dobot_api"` | API importable | None (robot for full test) |
 | ROS2 | `ros2 pkg list` | Workspace packages built | None |
+| UI Pipeline | `TEST/demo_orbbec_gemini2_persistent_sam3.py` | Tkinter UI: live preview, SAM3 server, GraspGen, Meshcat | Camera + GPU |
 | Full pipeline | `test_full_pipeline.py` | End-to-end with synthetic data | GPU only |
 
 ## Docker Commands Reference
