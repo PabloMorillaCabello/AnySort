@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(grep -rlU $r C:UserspabloDesktopHV_THESISTryesGraspGenGraspGen_Thesis_Reposcripts/ C:UserspabloDesktopHV_THESISTryesGraspGenGraspGen_Thesis_Repodocker/)",
-      "Bash(grep -E '\\\\.\\(sh|py\\)$')"
+      "Bash(grep -E '\\\\.\\(sh|py\\)$')",
+      "Read(//mnt/c/Users/pablo/Desktop/HV_THESIS/Tryes/GraspGen/**)",
+      "Read(//c/Users/pablo/Desktop/HV_THESIS/Tryes/GraspGen/**)",
+      "Bash(xargs grep:*)"
     ]
   }
 }

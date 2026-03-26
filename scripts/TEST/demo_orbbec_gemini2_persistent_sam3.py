@@ -147,6 +147,42 @@ def start_sam3_server(sock_path: str, device: str = "cuda:0",
 
 
 # ---------------------------------------------------------------------------
+# Mask post-processing
+# ---------------------------------------------------------------------------
+def _select_largest_component(mask: np.ndarray) -> tuple:
+    """Keep only the largest connected component in a binary mask (H,W) uint8.
+
+    Returns (result_mask, n_components) so the caller can report how many
+    objects were found.
+
+    SAM3 often returns a single semantic mask covering all instances of the
+    same class.  This splits the mask into blobs and returns only the biggest
+    one, so GraspGen sees a single isolated object.
+
+    To change the selection criterion swap the sort key, e.g.:
+        # Closest to image centre:
+        cy, cx = mask.shape[0] / 2, mask.shape[1] / 2
+        dists = [((r+h/2-cy)**2 + (c+w/2-cx)**2) for (c,r,w,h,_) in components]
+        best = int(np.argmin(dists))
+    """
+    if mask.sum() == 0:
+        return mask, 0
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    n_components = num_labels - 1  # exclude background label 0
+    if n_components <= 1:
+        return mask, n_components
+
+    # stats rows: [x, y, w, h, area] — index 0 is background, skip it
+    areas = stats[1:, cv2.CC_STAT_AREA]   # shape (n_components,)
+    best_label = int(areas.argmax()) + 1  # +1 to re-align with label indices
+    result = (labels == best_label).astype(np.uint8)
+    return result, n_components
+
+
+# ---------------------------------------------------------------------------
 # SAM3 socket client
 # ---------------------------------------------------------------------------
 def _recv_exactly(s: _socket.socket, n: int) -> bytes:
@@ -174,7 +210,11 @@ def _recv_json_line(s: _socket.socket) -> dict:
 
 def segment_with_sam3_server(rgb: np.ndarray, prompt: str, sock_path: str) -> np.ndarray:
     """Send one inference request to the SAM3 Unix socket server.
-    Returns binary mask (H, W) uint8 with values {0, 1}.
+    Returns binary mask (H, W) uint8 with values {0, 1} — best instance by score.
+
+    The server returns all detected instance masks (sorted by score descending).
+    Selection logic is here so you can swap in a different criterion (e.g. largest
+    area, closest to center) without touching the server.
     """
     if not prompt:
         raise ValueError("SAM3 prompt is empty")
@@ -197,7 +237,9 @@ def segment_with_sam3_server(rgb: np.ndarray, prompt: str, sock_path: str) -> np
         resp = _recv_json_line(s)
         if not resp.get("ok"):
             raise RuntimeError(f"SAM3 server error: {resp.get('error', resp)}")
-        mask_bytes = _recv_exactly(s, resp["size"])
+        num_masks = resp.get("num_masks", 1)
+        scores = resp.get("scores", [])
+        mask_bytes = _recv_exactly(s, resp["size"]) if resp["size"] > 0 else b""
         s.close()
     except OSError as e:
         raise RuntimeError(
@@ -205,10 +247,32 @@ def segment_with_sam3_server(rgb: np.ndarray, prompt: str, sock_path: str) -> np
             "Start it with:  /opt/sam3env/bin/python /ros2_ws/scripts/sam3_server.py"
         ) from e
 
-    mask = np.frombuffer(mask_bytes, dtype=np.uint8).reshape(h, w)
-    n_px = int((mask > 0).sum())
-    print(f"[SAM3] {time.time()-t0:.2f}s — {n_px} px masked", flush=True)
-    return (mask > 0).astype(np.uint8)
+    if num_masks == 0 or not mask_bytes:
+        print(f"[SAM3] {time.time()-t0:.2f}s — no detections", flush=True)
+        return np.zeros((h, w), dtype=np.uint8)
+
+    all_masks = np.frombuffer(mask_bytes, dtype=np.uint8).reshape(num_masks, h, w)
+
+    # ── Select best instance ──────────────────────────────────────────────────
+    # Server returns masks sorted by SAM3 score descending → index 0 is best.
+    # To change criterion, replace this line. Examples:
+    #   largest area:   best_idx = int(np.array([m.sum() for m in all_masks]).argmax())
+    #   closest center: compute centroid distance per mask
+    best_idx = 0  # highest SAM3 confidence score
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Split merged blobs → keep only the largest connected component
+    best_mask, n_objects = _select_largest_component(
+        (all_masks[best_idx] > 0).astype(np.uint8)
+    )
+
+    print(
+        f"[SAM3] {time.time()-t0:.2f}s — "
+        f"{n_objects} '{prompt}' found — "
+        f"selected largest, {int(best_mask.sum())} px",
+        flush=True,
+    )
+    return best_mask
 
 
 # ---------------------------------------------------------------------------
@@ -434,9 +498,10 @@ def _save_best_grasp(grasps_cam, scores, t_center) -> dict:
 # ---------------------------------------------------------------------------
 class GraspGenApp:
     def __init__(self, root: tk.Tk, args, camera: OrbbecCamera,
-                 config_map: dict, sam3_proc=None):
+                 config_map: dict, sam3_proc=None, vis=None):
         """
         config_map: {filename.yml: /full/path/to/filename.yml}
+        vis: pre-created meshcat Visualizer (created in main thread before Tkinter loop)
         """
         self.root = root
         self.args = args
@@ -459,7 +524,9 @@ class GraspGenApp:
         # Prevents running while a new config/model is being loaded
         self._config_loading = False
         self._log_queue = queue.Queue()
-        self._vis = None                    # meshcat visualizer (created once)
+        # Thread-safe queue for callables to run on the main thread
+        self._cb_queue: queue.Queue = queue.Queue()
+        self._vis = vis                     # meshcat visualizer (created in main thread at startup)
         self._show_mask_var = tk.BooleanVar(value=True)
 
         self._build_ui()
@@ -638,16 +705,32 @@ class GraspGenApp:
     def _load_grasp_config(self, name: str):
         """Background thread: load GraspGen config + sampler for the given name.
         Weights are only reloaded when the name actually changes.
-        ALL Tkinter widget updates are routed through root.after() — never called
+        ALL Tkinter widget updates are routed through _cb_queue — never called
         directly from this thread, which would segfault on Linux.
         """
         path = self.config_map.get(name)
         if not path:
             self._log(f"[Config] Unknown config: {name}")
             self._config_loading = False
-            self.root.after(0, self._restore_run_btn)
+            self._cb_queue.put(self._restore_run_btn)
             return
         try:
+            # ── Release old model GPU memory before loading new one ────
+            # Skipping this causes OOM / CUDA errors when the gripper changes.
+            if self._sampler is not None:
+                self._log("[Config] Releasing previous model from GPU…")
+                try:
+                    del self._sampler
+                except Exception:
+                    pass
+                self._sampler = None
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                gc.collect()
+
             self._log(f"[Config] Loading {name}…")
             new_cfg = load_grasp_cfg(path)
             new_sampler = GraspGenSampler(new_cfg)
@@ -657,19 +740,29 @@ class GraspGenApp:
             self._sampler = new_sampler
             self._loaded_config_name = name
 
-            # ── All widget updates via root.after — NEVER directly ──
-            self.root.after(0, lambda p=path: self._config_hint.configure(text=p))
+            # ── All widget updates via cb_queue — NEVER root.after from bg thread ──
+            self._cb_queue.put(lambda p=path: self._config_hint.configure(text=p))
             self._log(f"[Config] Ready: {new_cfg.data.gripper_name}")
             self._set_status(f"Ready — {name}")
         except Exception as e:
             self._log(f"[Config] ERROR loading {name}: {e}")
             self._set_status(f"Config error: {e}")
+            # Ensure no stale/partial model sits on GPU
+            try:
+                del new_sampler  # noqa: F821
+            except Exception:
+                pass
             self._grasp_cfg = None
             self._sampler = None
             self._loaded_config_name = None
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
         finally:
             self._config_loading = False
-            self.root.after(0, self._restore_run_btn)
+            self._cb_queue.put(self._restore_run_btn)
 
     def _restore_run_btn(self):
         """Re-enable the Run button if nothing else is blocking it (main thread)."""
@@ -756,7 +849,17 @@ class GraspGenApp:
 
     def _schedule_log_flush(self):
         self._flush_log()
+        self._flush_cb_queue()
         self.root.after(200, self._schedule_log_flush)
+
+    def _flush_cb_queue(self):
+        """Drain the thread-safe callback queue on the main thread."""
+        try:
+            while True:
+                cb = self._cb_queue.get_nowait()
+                cb()
+        except queue.Empty:
+            pass
 
     def _flush_log(self):
         msgs = []
@@ -774,7 +877,7 @@ class GraspGenApp:
 
     def _set_status(self, msg: str):
         """Safe to call from any thread."""
-        self.root.after(0, lambda: self._status_var.set(msg))
+        self._cb_queue.put(lambda m=msg: self._status_var.set(m))
 
     # ------------------------------------------------------------------
     # Run button
@@ -870,12 +973,6 @@ class GraspGenApp:
             scene_centered = tra.transform_points(scene_pc, t_center)
 
             # ── 3. Meshcat visualisation ──────────────────────────────
-            if self._vis is None:
-                try:
-                    self._vis = create_visualizer()
-                except Exception as e:
-                    self._log(f"[Meshcat] Could not connect: {e}")
-
             if self._vis is not None:
                 self._vis.delete()
                 make_frame(self._vis, "world", h=0.12, radius=0.004)
@@ -952,7 +1049,7 @@ class GraspGenApp:
             summary = (
                 f"{len(grasps_np)} grasps [{conf_min:.3f}–{conf_max:.3f}]\n"
                 f"Best conf: {best_conf:.4f}  depth: {best_z:.3f}m\n"
-                f"Meshcat: http://127.0.0.1:7000"
+                f"Meshcat: {getattr(self._vis, 'viewer_url', 'http://127.0.0.1:7000/static/')}"
             )
             self._log("─" * 36)
             self._log(summary)
@@ -978,7 +1075,7 @@ class GraspGenApp:
 
             # Always re-enable the button regardless of success/failure
             self._inference_running = False
-            self.root.after(0, self._restore_run_btn)
+            self._cb_queue.put(self._restore_run_btn)
 
 
 # ---------------------------------------------------------------------------
@@ -1073,6 +1170,16 @@ def main():
                 flush=True,
             )
 
+    # ── Meshcat visualizer (main thread — must be before Tkinter loop) ────
+    vis = None
+    try:
+        vis = create_visualizer()
+        meshcat_url = getattr(vis, "viewer_url", "http://127.0.0.1:7000/static/")
+        print(f"[Meshcat] Visualizer ready → {meshcat_url}", flush=True)
+    except Exception as e:
+        print(f"[Meshcat] WARNING: could not create visualizer: {e}", flush=True)
+        print("[Meshcat] Grasps will not be visualized.", flush=True)
+
     # ── Orbbec camera ─────────────────────────────────────────────────────
     print("[Camera] Starting Orbbec pipeline…", flush=True)
     camera = OrbbecCamera()
@@ -1088,7 +1195,7 @@ def main():
         )
 
     root = tk.Tk()
-    app = GraspGenApp(root, args, camera, config_map, sam3_proc=sam3_proc)
+    app = GraspGenApp(root, args, camera, config_map, sam3_proc=sam3_proc, vis=vis)
 
     def _on_close():
         print("Shutting down…", flush=True)
@@ -1107,7 +1214,7 @@ def main():
         "UI ready.\n"
         "  • Select a gripper from the dropdown.\n"
         "  • Type a prompt and click 'Capture & Run'.\n"
-        "  • Meshcat: http://127.0.0.1:7000",
+        f"  • Meshcat: {getattr(vis, 'viewer_url', 'http://127.0.0.1:7000/static/')}",
         flush=True,
     )
     root.mainloop()
