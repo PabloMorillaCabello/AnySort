@@ -28,7 +28,7 @@ Orbbec ROS2 topics ──> SAM3 node ──> GraspGen node ──> MoveIt2 Plann
 | CUDA | 12.6 | — | Unified across all environments |
 | ROS2 | Humble | 3.10 (system) | Binary packages for Ubuntu 22.04 |
 | GraspGen | latest | 3.10 (uv venv) | `/opt/GraspGen/.venv` — installed via `uv pip install -e .` |
-| SAM3 | latest | 3.12 (venv) | `/opt/sam3env` — subprocess bridge (sam3_segment_once.py) or socket server |
+| SAM3 | latest | 3.9 (venv) | `/opt/sam3env` — persistent socket server (sam3_server.py) for inference |
 | Dobot API | V4 | 3.10 (venv) | `/opt/Dobot_hv` — TCP/IP robot control (ports 29999, 30004) |
 | Orbbec SDK | v2.7.6 | 3.10 | SDK .deb + OrbbecSDK_ROS2 (v2-main) for Gemini 2 |
 | GraspGen Models | — | — | `/opt/GraspGen/GraspGenModels` (git-lfs) |
@@ -82,20 +82,32 @@ GraspGen_Thesis_Repo/
 │   │       └── pipeline_params.yaml      # All tuneable parameters
 │   └── robotiq_3f_driver/            # Robotiq 3F gripper Modbus driver
 ├── scripts/                          # Utility & test scripts
-│   ├── demo_orbbec_gemini2.py        # **PRIMARY DEMO**: capture → SAM3 → GraspGen → execute (standalone Python)
 │   ├── view_camera.py                # Real-time RGB+Depth+IR viewer (pyorbbecsdk, no ROS2)
-│   ├── sam3_segment_once.py          # One-shot SAM3 helper called by demo (subprocess bridge)
-│   ├── sam3_server.py                # SAM3 inference server (socket IPC alternative)
+│   ├── sam3_server.py                # **SAM3 PERSISTENT SERVER**: loads model once, serves requests via Unix socket
 │   ├── download_models.sh            # Download SAM3 + GraspGen weights from HuggingFace
 │   ├── build_workspace.sh            # colcon build helper
 │   ├── test_environment.sh           # Verify full environment setup
 │   ├── test_sam3.py                  # Test SAM3 loading + inference
 │   ├── test_graspgen.py              # Test GraspGen loading + inference
 │   ├── test_camera.sh                # Test Orbbec Gemini 2 via ROS2
-│   └── test_full_pipeline.py         # End-to-end integration test (synthetic data)
+│   ├── test_full_pipeline.py         # End-to-end integration test (synthetic data)
+│   ├── demo_orbbec_gemini2.py        # Legacy demo (reference, use TEST scripts instead)
+│   └── TEST/                         # **PRIMARY WORKFLOW SCRIPTS** (Tkinter UIs)
+│       ├── demo_orbbec_gemini2_persistent_sam3.py  # Main UI: live preview → segmentation → grasp generation
+│       ├── grasp_execute_pipeline.py               # Extended UI: adds hand-eye calibration → robot execution
+│       ├── hand_eye_calibration.py                 # Calibration UI: ChArUco board capture & solve
+│       └── calibration_tester.py                   # Calibration validation: test accuracy with ArUco markers
 ├── config/                           # Global config overrides (currently empty)
-├── data/                             # Captured data (git-ignored)
+├── data/                             # Captured data and calibration (git-ignored)
+│   ├── calibration/                  # Hand-eye calibration outputs
+│   │   ├── hand_eye_calib.npz        # Calibration matrix (binary)
+│   │   ├── hand_eye_calib.json       # Calibration matrix (JSON)
+│   │   └── aruco_id0_4x4_50.png      # Printed ArUco marker (ID 0) for testing
+│   ├── rgb/                          # Captured RGB frames
+│   ├── depth/                        # Captured depth frames
+│   └── masks/                        # SAM3 segmentation masks
 ├── results/                          # Experiment results (git-ignored)
+│   └── best_grasp_<timestamp>.json   # Generated grasp poses per execution
 └── docs/                             # Thesis notes & documentation (currently empty)
 ```
 
@@ -180,32 +192,56 @@ Verify the camera is visible in WSL2: `lsusb | grep Orbbec`
 
 Then test individual components as needed (see [Testing Each Component](#testing-each-component) below).
 
-### Step 5a: Run the standalone Python pipeline (recommended)
+### Step 5a: Run the primary Tkinter UI (recommended)
 
-This is the primary workflow — runs the full capture → segmentation → grasp generation → execution cycle without ROS2 overhead. Useful for quick experiments and debugging.
+This is the primary workflow — a graphical interface that captures live RGB-D frames, applies SAM3 segmentation, generates grasps, and visualizes results in real-time.
 
 ```bash
-# Basic demo: depth-based auto-mask (no SAM3)
-python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
-    --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml
+# Terminal 1: Start the SAM3 persistent server (loads model once)
+python3 /ros2_ws/scripts/sam3_server.py
 
-# With SAM3 text-prompted segmentation:
-python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
-    --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml \
-    --sam3_use \
-    --sam3_prompt "red mug"
-
-# Interactive mode (press Enter to capture, q to quit):
-python3 /ros2_ws/scripts/demo_orbbec_gemini2.py \
-    --gripper_config /opt/GraspGen/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml \
-    --sam3_use --sam3_prompt "bottle" \
-    --collision_filter \
-    --keypress
+# Terminal 2 (or add --sam3_autostart flag to avoid Terminal 1):
+python3 /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py
 ```
 
-SAM3 segmentation is handled by `sam3_segment_once.py` running in the Python 3.12 venv (subprocess call), bridging the version gap between GraspGen (3.10) and SAM3 (3.12).
+Or run both in one terminal with automatic server startup:
 
-### Step 5b: Run the ROS2-based pipeline (optional, for UR robot integration)
+```bash
+python3 /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py --sam3_autostart
+```
+
+The UI provides:
+- **Live RGB preview** with depth overlay
+- **Gripper selection dropdown** — auto-scans `/opt/GraspGen/GraspGenModels/checkpoints/` for available models
+- **SAM3 text prompt input** — enter object description (e.g., "red mug", "bottle")
+- **Capture & Run button** — captures current frame and runs full pipeline
+- **Green mask overlay** on RGB after SAM3 inference
+- **Meshcat visualization** at `http://127.0.0.1:7000` — shows 3D point cloud and grasp poses
+- **Results saved** to `/ros2_ws/results/best_grasp_<timestamp>.json` after each inference
+- **Grasp sampler cached per gripper** — reloads only when gripper selection changes (faster subsequent runs)
+
+### Step 5b: Run extended pipeline with robot execution (optional)
+
+For full robot integration with hand-eye calibration and execution:
+
+```bash
+# Terminal 1: Start the SAM3 persistent server
+python3 /ros2_ws/scripts/sam3_server.py
+
+# Terminal 2: Run the extended pipeline with execution
+python3 /ros2_ws/scripts/TEST/grasp_execute_pipeline.py
+```
+
+This extends the main UI with:
+- **Hand-eye calibration matrix loading** from `data/calibration/hand_eye_calib.npz`
+- **6-DOF pose transformation** — converts camera frame grasps to robot base frame
+- **Pre-grasp → Grasp → Retreat motion** planning and execution
+- **Vacuum tool control** — ON/OFF buttons (requires robot to support vacuum actuator)
+- **Robot IP configuration** — set via command-line flag
+
+See [Hand-Eye Calibration](#hand-eye-calibration) section below for calibration workflow.
+
+### Step 5c: Run the ROS2-based pipeline (optional, for UR robot integration)
 
 If you are integrating with a UR robot and MoveIt2 motion planning, use the full ROS2 pipeline instead:
 
@@ -236,6 +272,192 @@ ros2 service call /pipeline_orchestrator/trigger_pick std_srvs/srv/Trigger
 ros2 topic pub --once /segmentation/set_prompt std_msgs/String "data: 'bottle'"
 ```
 
+**Note:** The ROS2 pipeline is fully functional but the primary workflow is the standalone Tkinter UI (Step 5a). ROS2 mode is recommended for UR robot + MoveIt2 integration; Dobot and vacuum-based systems use the Tkinter pipeline.
+
+## TEST Scripts (Primary Workflow)
+
+All primary scripts are Tkinter-based graphical applications located in `scripts/TEST/`. These are the recommended entry points for the pipeline.
+
+### 1. demo_orbbec_gemini2_persistent_sam3.py
+
+**Main segmentation and grasp generation UI.**
+
+Features:
+- Live RGB preview with depth overlay
+- Automatic gripper detection dropdown (scans `/opt/GraspGen/GraspGenModels/checkpoints/`)
+- SAM3 text prompt input (e.g., "red mug")
+- "Capture & Run" button to execute the full pipeline
+- Green mask overlay after SAM3 segmentation
+- Meshcat 3D visualization at `http://127.0.0.1:7000`
+- Results saved to `/ros2_ws/results/best_grasp_<timestamp>.json`
+- Grasp sampler cached per gripper (only reloaded on gripper change)
+
+**Usage:**
+
+```bash
+# With manual SAM3 server (2 terminals)
+# Terminal 1:
+python3 /ros2_ws/scripts/sam3_server.py
+
+# Terminal 2:
+python3 /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py
+
+# Or auto-start SAM3 server (single terminal)
+python3 /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py --sam3_autostart
+```
+
+### 2. grasp_execute_pipeline.py
+
+**Extended UI with hand-eye calibration and robot execution.**
+
+Extends the main demo with:
+- Hand-eye calibration matrix loading from `data/calibration/hand_eye_calib.npz`
+- 6-DOF pose transformation (camera frame → robot base frame)
+- Pre-grasp → Grasp → Retreat motion planning and execution
+- Vacuum tool control (ON/OFF buttons)
+- Robot IP configuration via command-line flag
+
+**Usage:**
+
+```bash
+# Terminal 1:
+python3 /ros2_ws/scripts/sam3_server.py
+
+# Terminal 2 (requires calibration in place):
+python3 /ros2_ws/scripts/TEST/grasp_execute_pipeline.py --robot_ip 192.168.5.1
+```
+
+### 3. hand_eye_calibration.py
+
+**Interactive hand-eye calibration UI using ChArUco boards.**
+
+Workflow:
+1. Print a ChArUco board (generated automatically by the script)
+2. Mount it on the robot gripper (or end-effector)
+3. In **Auto mode**: robot moves through pre-programmed poses automatically
+4. In **Manual mode**: you move the robot manually, click "Capture Pose" at each position
+5. Collect ≥10 poses, then click "Solve" to run `cv2.calibrateHandEye()`
+6. Results saved to:
+   - `data/calibration/hand_eye_calib.npz` (binary calibration matrix)
+   - `data/calibration/hand_eye_calib.json` (human-readable)
+
+**Usage:**
+
+```bash
+python3 /ros2_ws/scripts/TEST/hand_eye_calibration.py --robot_ip 192.168.5.1
+```
+
+Flags:
+- `--robot_ip <IP>` — Dobot robot IP (default: 192.168.1.6)
+- `--auto_mode` — Run in automatic mode (robot moves itself)
+
+### 4. calibration_tester.py
+
+**Hand-eye calibration quality assessment and correction UI.**
+
+Tests the accuracy of an existing hand-eye calibration using ArUco markers. Supports correction of systematic offsets (XYZ translation, Roll/Pitch/Yaw rotation).
+
+**Setup:**
+1. Calibration must exist at `data/calibration/hand_eye_calib.npz` (from `hand_eye_calibration.py`)
+2. Print an ArUco marker (4X4_50, ID 0) — script can auto-generate with "Gen Marker" button
+3. Place marker in the workspace at a fixed, known location
+
+**Workflow:**
+
+**Test A (Move to Predicted):**
+- Robot moves TCP to the camera-predicted marker position (using calibration)
+- Logs XY error automatically
+- Tests if the calibration transforms correctly
+
+**Test B (Ground Truth):**
+- Camera detects marker position
+- You manually jog the TCP to the marker center (using controller)
+- Click button to capture actual TCP pose
+- Computes error: predicted vs. actual pose
+
+**Results table shows per-test-point:**
+- Predicted XYZ / Actual XYZ / Error XYZ / 3D distance
+
+**Correction workflow:**
+1. Run multiple test points to find systematic bias
+2. Use 6-DOF sliders (ΔX/Y/Z ±200mm, ΔRoll/Pitch/Yaw ±30°) to dial in corrections
+3. Click "Auto-Fill From Errors" — fills sliders with negative mean error (zero out bias)
+4. Click "Save Corrected Calibration" — writes new `.npz`/`.json` for use in execution
+
+**Usage:**
+
+```bash
+python3 /ros2_ws/scripts/TEST/calibration_tester.py \
+    --robot_ip 192.168.5.1 \
+    --calib data/calibration/hand_eye_calib.npz
+```
+
+Flags:
+- `--robot_ip <IP>` — Dobot robot IP
+- `--calib <path>` — Path to calibration `.npz` file (default: `data/calibration/hand_eye_calib.npz`)
+
+---
+
+## Hand-Eye Calibration
+
+Hand-eye calibration is the process of finding the transformation matrix between the camera frame and the robot base frame. This is critical for accurate grasp execution.
+
+### Calibration Workflow
+
+**Step 1: Capture calibration poses**
+
+```bash
+# Generate and print a ChArUco board:
+python3 /ros2_ws/scripts/TEST/hand_eye_calibration.py --robot_ip 192.168.5.1
+```
+
+The script will display a window with a ChArUco board image and print its location:
+```
+ChArUco board saved to: data/calibration/charuco_board.png
+Print and mount on robot gripper
+```
+
+Mount the printed board on the robot's gripper or end-effector.
+
+**Step 2: Solve calibration**
+
+In the UI, select Auto or Manual mode:
+- **Auto**: Robot moves through pre-programmed poses automatically
+- **Manual**: You move the robot, click "Capture Pose" at each position
+
+Collect **≥10 poses** (more is better, ≥20 recommended). The camera must see the ChArUco board clearly in each capture.
+
+Click **Solve** — this runs `cv2.calibrateHandEye()` and displays the reprojection error. Typical good error: < 5 mm.
+
+Output files:
+```
+data/calibration/hand_eye_calib.npz    # Binary (used by grasp_execute_pipeline.py)
+data/calibration/hand_eye_calib.json   # Human-readable
+```
+
+**Step 3: Test calibration quality (optional but recommended)**
+
+```bash
+python3 /ros2_ws/scripts/TEST/calibration_tester.py --robot_ip 192.168.5.1
+```
+
+This validates the calibration by:
+1. Running test points with the robot
+2. Measuring predicted vs. actual error
+3. Allowing you to correct systematic offsets
+4. Saving a corrected calibration if needed
+
+### Troubleshooting Calibration
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "Cannot detect ChArUco board" | Poor lighting or board too small | Ensure good overhead lighting, print board larger |
+| Reprojection error > 10 mm | Not enough poses or board out of frame | Collect more poses (≥20), ensure board fully visible |
+| Grasp execution off by 50+ mm | Systematic bias in camera extrinsics | Use `calibration_tester.py` to measure and correct |
+| Robot hits table/gripper collision | Calibration matrix transposed/inverted | Verify calibration with hand-eye solver output; re-calibrate if needed |
+
+---
+
 ## Dobot Robot Control
 
 The [Dobot TCP/IP API](https://github.com/dauken85/Dobot_hv) is included at `/opt/Dobot_hv` and available on `PYTHONPATH`. It provides control of Dobot robots (CR series) via TCP/IP protocol.
@@ -259,7 +481,7 @@ A tkinter-based GUI is also available: `python /opt/Dobot_hv/ui.py` (requires X1
 Inside the container, the GraspGen Python 3.10 venv is activated by default. To switch environments:
 
 ```bash
-# Switch to SAM3 (Python 3.12)
+# Switch to SAM3 (Python 3.9)
 sam3_activate
 
 # Switch back to GraspGen (Python 3.10)
@@ -315,7 +537,7 @@ To return to your working directory afterwards: `cd /ros2_ws`
 
 ### 3. SAM3 (text-prompted segmentation)
 
-Tests SAM3 in its Python 3.12 venv: verifies the package imports (native API and HuggingFace Transformers API), loads the model, runs inference on a synthetic image with a text prompt, and saves a 3-panel visualization.
+Tests SAM3 in its Python 3.9 venv: verifies the package imports (native API and HuggingFace Transformers API), loads the model, runs inference on a synthetic image with a text prompt, and saves a 3-panel visualization.
 
 ```bash
 /opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py
@@ -334,6 +556,21 @@ Headless (no X11 display needed):
 ```
 
 Output is saved to `/ros2_ws/results/sam3_test_result.png`.
+
+**SAM3 Server (persistent inference):**
+
+For repeated inference calls (e.g., in the Tkinter UI), use the persistent socket server to load the model once:
+
+```bash
+# Terminal 1: Start server
+python3 /ros2_ws/scripts/sam3_server.py
+# Server listens on /tmp/sam3_server.sock and loads model once
+
+# Terminal 2: Run UI (connects to server)
+python3 /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py
+```
+
+The server accepts JSON + raw RGB bytes over a Unix socket and returns segmentation masks efficiently.
 
 ### 4. Orbbec Gemini 2 Camera
 
@@ -457,9 +694,8 @@ docker compose exec graspgen bash -c "export HF_TOKEN=hf_xxx && ./scripts/downlo
 
 | Port | Service |
 |------|---------|
+| 7000 | Meshcat 3D visualization (grasp poses, point clouds) |
 | 8080 | Viser web UI |
-| 7860 | Viser alternate |
-| 7000 | General use |
 | 6000 | General use |
 | 29999 | Dobot dashboard (TCP/IP control) |
 | 30004 | Dobot real-time feedback |
