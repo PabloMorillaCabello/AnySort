@@ -426,9 +426,8 @@ class DobotDashboard:
     def move_linear(self, x, y, z, rx, ry, rz):
         resp = self._dashboard.MovL(
             x, y, z, rx, ry, rz,
-            0,                  # coordinateMode=0 → pose (Cartesian)
-            a=self._speed,
-            v=self._speed
+            0,                  # coordinateMode=0 → Cartesian
+            a=self._speed, v=self._speed
         )
         return self._send_motion(resp)
 
@@ -446,9 +445,8 @@ class DobotDashboard:
         j1, j2, j3, j4, j5, j6 = (_wrap(a) for a in (j1, j2, j3, j4, j5, j6))
         resp = self._dashboard.MovJ(
             j1, j2, j3, j4, j5, j6,
-            1,                  # coordinateMode=1 → joint
-            a=self._speed,
-            v=self._speed
+            1,                  # coordinateMode=1 → joint angles
+            a=self._speed, v=self._speed
         )
         return self._send_motion(resp)
 
@@ -603,6 +601,10 @@ class GraspExecuteApp:
         self._last_mask  = None
         self._best_grasp_cam: np.ndarray = None   # 4×4, camera frame, meters
         self._best_grasp_info: dict = {}
+        self._all_grasps_cam: np.ndarray = None   # (N,4,4) sorted conf desc, camera frame
+        self._all_grasps_centered: np.ndarray = None  # same, centered for meshcat
+        self._all_grasp_scores = None             # (N,3) uint8 original colors
+        self._current_grasp_idx: int = 0
 
         # Hand-eye calibration
         self._T_cam2base = None    # 4×4, t in mm
@@ -807,6 +809,22 @@ class GraspExecuteApp:
                  font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
         self._approach_var = tk.StringVar(value=str(APPROACH_OFFSET))
         tk.Entry(row3, textvariable=self._approach_var, width=5, bg="#3a3a3a",
+                 fg="white", insertbackground="white", relief="flat",
+                 font=("Helvetica", 9)).pack(side="left")
+
+        row4 = tk.Frame(right, bg="#252525"); row4.pack(fill="x", padx=12, pady=2)
+        tk.Label(row4, text="Num grasps:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
+        self._num_grasps_var = tk.StringVar(value=str(self.args.num_grasps))
+        tk.Entry(row4, textvariable=self._num_grasps_var, width=5, bg="#3a3a3a",
+                 fg="white", insertbackground="white", relief="flat",
+                 font=("Helvetica", 9)).pack(side="left")
+
+        row5 = tk.Frame(right, bg="#252525"); row5.pack(fill="x", padx=12, pady=2)
+        tk.Label(row5, text="Top-K grasps:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
+        self._topk_grasps_var = tk.StringVar(value=str(self.args.topk_num_grasps))
+        tk.Entry(row5, textvariable=self._topk_grasps_var, width=5, bg="#3a3a3a",
                  fg="white", insertbackground="white", relief="flat",
                  font=("Helvetica", 9)).pack(side="left")
 
@@ -1061,12 +1079,21 @@ class GraspExecuteApp:
             if len(object_pc) > args.max_object_points:
                 idx = np.random.choice(len(object_pc), args.max_object_points, replace=False)
                 object_pc = object_pc[idx]
+                object_colors = object_colors[idx]
 
             pc_torch = torch.from_numpy(object_pc)
             pc_filtered, _ = point_cloud_outlier_removal(pc_torch)
             pc_filtered = pc_filtered.numpy()
             if len(pc_filtered) == 0:
                 raise RuntimeError("Point cloud empty after outlier removal")
+
+            # Match colors to the surviving points after outlier removal.
+            # pc_filtered ⊆ object_pc (outlier removal only drops points),
+            # so every filtered point has an exact match in object_pc.
+            nn_idx = np.argmin(
+                np.linalg.norm(object_pc[:, None, :] - pc_filtered[None, :, :], axis=2),
+                axis=0)
+            object_colors_filtered = object_colors[nn_idx]
 
             t_center = tra.translation_matrix(-pc_filtered.mean(axis=0))
             pc_centered = tra.transform_points(pc_filtered, t_center)
@@ -1077,39 +1104,52 @@ class GraspExecuteApp:
                 make_frame(self._vis, "world", h=0.12, radius=0.004)
                 _sc = scene_colors if scene_colors is not None else \
                     np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
-                visualize_pointcloud(self._vis, "pc_scene", scene_centered, _sc,
+                # Merge background + object into one fully colored cloud,
+                # both shifted by the same t_center so grasps will align.
+                full_pc_centered = np.vstack([scene_centered,
+                                              tra.transform_points(pc_filtered, t_center)])
+                full_colors = np.vstack([_sc, object_colors_filtered])
+                visualize_pointcloud(self._vis, "pc_full", full_pc_centered, full_colors,
                                      size=args.scene_point_size)
-                visualize_pointcloud(self._vis, "pc_obj", pc_centered,
-                                     np.tile([[255,255,255]],(len(pc_centered),1)).astype(np.uint8),
-                                     size=args.object_point_size)
 
             self._log("[GraspGen] Running inference…")
             t1 = time.time()
             grasps, grasp_conf = GraspGenSampler.run_inference(
-                pc_filtered, sampler,
+                pc_centered, sampler,
                 grasp_threshold=args.grasp_threshold,
-                num_grasps=args.num_grasps,
-                topk_num_grasps=args.topk_num_grasps)
+                num_grasps=int(self._num_grasps_var.get()),
+                topk_num_grasps=int(self._topk_grasps_var.get()))
             self._log(f"[GraspGen] {time.time()-t1:.2f}s — {len(grasps)} grasps")
 
             if len(grasps) == 0:
                 raise RuntimeError("No grasps found")
 
-            grasps_np = grasps.cpu().numpy()
+            grasps_obj_np = grasps.cpu().numpy()   # object/centered frame
             grasp_conf_np = grasp_conf.cpu().numpy()
+
+            # Un-center: bring grasps from object frame back to camera frame
+            t_center_inv = np.linalg.inv(t_center)
+            grasps_np = np.array([t_center_inv @ g for g in grasps_obj_np])
 
             pc_centered, grasps_centered, scores, _ = _process_point_cloud(
                 pc_filtered, grasps_np, grasp_conf_np)
 
+            # Sort all grasps by confidence descending and store for retry loop
+            sort_idx = np.argsort(grasp_conf_np.ravel())[::-1]
+            self._all_grasps_cam      = grasps_np[sort_idx]
+            self._all_grasps_centered = grasps_centered[sort_idx]
+            self._all_grasp_scores    = scores[sort_idx]
+            self._current_grasp_idx   = 0
+
             if self._vis:
                 gripper_name = grasp_cfg.data.gripper_name
-                for j, g in enumerate(grasps_centered):
-                    visualize_grasp(self._vis, f"grasps/{j:03d}/grasp", g,
-                                    color=scores[j], gripper_name=gripper_name, linewidth=1.2)
+                for i, g in enumerate(self._all_grasps_centered):
+                    col = [255, 255, 0] if i == 0 else self._all_grasp_scores[i].tolist()
+                    visualize_grasp(self._vis, f"grasps/{i:03d}/grasp", g,
+                                    color=col, gripper_name=gripper_name, linewidth=1.2)
 
             best_info = _save_best_grasp(grasps_np, grasp_conf_np)
-            best_idx = int(np.argmax(grasp_conf_np.ravel()))
-            self._best_grasp_cam = grasps_np[best_idx].copy()   # camera frame, meters
+            self._best_grasp_cam = self._all_grasps_cam[0].copy()   # camera frame, meters
 
             conf_min, conf_max = float(grasp_conf_np.min()), float(grasp_conf_np.max())
             best_conf = best_info.get("confidence", 0.0)
@@ -1222,6 +1262,20 @@ class GraspExecuteApp:
     # ------------------------------------------------------------------
     # Execute grasp
     # ------------------------------------------------------------------
+    def _highlight_grasp(self, idx: int, color):
+        """Repaint a single grasp in meshcat.  Safe to call from any thread."""
+        if self._vis is None or self._all_grasps_centered is None:
+            return
+        if idx < 0 or idx >= len(self._all_grasps_centered):
+            return
+        try:
+            gripper_name = self._grasp_cfg.data.gripper_name
+            visualize_grasp(self._vis, f"grasps/{idx:03d}/grasp",
+                            self._all_grasps_centered[idx],
+                            color=color, gripper_name=gripper_name, linewidth=1.2)
+        except Exception:
+            pass
+
     def _on_execute(self):
         if not self._robot_connected or self._executing:
             return

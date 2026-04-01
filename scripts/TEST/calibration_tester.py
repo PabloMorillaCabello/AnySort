@@ -73,7 +73,6 @@ CALIB_FILE_DEFAULT  = "/ros2_ws/data/calibration/hand_eye_calib.npz"
 CALIB_DIR           = Path("/ros2_ws/data/calibration")
 ROBOT_IP_DEFAULT    = "192.168.5.1"
 ROBOT_PORT          = 29999
-HOME_POSE           = [300, 0, 450, 0, 0, 0]   # safe home [X,Y,Z,Rx,Ry,Rz]
 APPROACH_OFFSET_MM  = 80                         # mm above marker for Mode A
 MOVE_SPEED          = 15                         # % speed for test moves
 
@@ -509,6 +508,7 @@ class CalibTesterApp:
         self._calib_path    = args.calib
         self._robot_ip      = args.robot_ip
         self._test_results  = []     # list of result dicts
+        self._home_pose     = None   # [X,Y,Z,Rx,Ry,Rz] set by user
         self._ground_truth  = None   # (x,y,z) mm in robot frame
         self._last_det      = None   # last ArUco detection result
         self._last_pred_mm  = None   # last predicted robot coords (corrected)
@@ -516,6 +516,8 @@ class CalibTesterApp:
         self._worker_busy   = False
         self._cam_connected = False
         self._robot_connected = False
+        self._cam_dot_state  = "init"    # track last dot state to avoid redundant config
+        self._robot_dot_state = "init"
 
         # 6-DOF correction variables
         self._cv = {k: tk.DoubleVar(value=0.0) for k in
@@ -589,7 +591,11 @@ class CalibTesterApp:
         tk.Button(util, text="Gen Marker", command=self._gen_marker).pack(side=tk.LEFT, padx=2)
         tk.Button(util, text="Enable Robot", command=self._enable_robot).pack(side=tk.LEFT, padx=2)
         tk.Button(util, text="Clear Error", command=self._clear_error).pack(side=tk.LEFT, padx=2)
-        tk.Button(util, text="Go Home", command=self._go_home, bg="#5d4037", fg="white").pack(side=tk.LEFT, padx=2)
+        tk.Button(util, text="Set Home\n(current pose)", command=self._set_home,
+                  bg="#4e342e", fg="white").pack(side=tk.LEFT, padx=2)
+        self._home_btn = tk.Button(util, text="Go Home", command=self._go_home,
+                                   bg="#5d4037", fg="white", state="disabled")
+        self._home_btn.pack(side=tk.LEFT, padx=2)
 
     def _build_detection_frame(self, parent):
         lf = tk.LabelFrame(parent, text="Live Detection")
@@ -606,9 +612,12 @@ class CalibTesterApp:
         btn_row = tk.Frame(lf)
         btn_row.pack(fill=tk.X, padx=4, pady=4)
 
-        tk.Button(btn_row, text="[A] Move to Predicted",
+        tk.Button(btn_row, text="[A] Approach\n(+offset)",
                   command=self._test_a_move,
-                  bg="#1565c0", fg="white", width=20).pack(side=tk.LEFT, padx=2)
+                  bg="#1565c0", fg="white", width=16).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_row, text="[A2] Descend\nto Marker",
+                  command=self._test_a2_descend,
+                  bg="#0d47a1", fg="white", width=16).pack(side=tk.LEFT, padx=2)
         tk.Button(btn_row, text="[B] Set Ground Truth\n(current pose)",
                   command=self._test_b_set_gt,
                   bg="#6a1b9a", fg="white", width=22).pack(side=tk.LEFT, padx=2)
@@ -732,11 +741,6 @@ class CalibTesterApp:
                 robot = DobotDashboard(ip)
                 self._robot = robot
                 self._robot_connected = True
-                self.root.after(0, lambda: self._robot_dot.config(
-                    text=f"● Robot: {ip}", fg="green"))
-                self.root.after(0, lambda: self._connect_btn.config(
-                    text="Disconnect", command=self._disconnect_robot,
-                    bg="#c62828"))
                 self._log_msg(f"Robot connected: {ip}")
             except Exception as ex:
                 self._log_msg(f"[ERROR] Robot connection: {ex}")
@@ -753,7 +757,6 @@ class CalibTesterApp:
         self._robot_connected = False
         self._connect_btn.config(text="Connect Robot", command=self._connect_robot,
                                  bg="#2e7d32")
-        self._robot_dot.config(text="● Robot: disconnected", fg="red")
         self._log_msg("Robot disconnected.")
 
     def _enable_robot(self):
@@ -774,13 +777,26 @@ class CalibTesterApp:
         except Exception as ex:
             self._log_msg(f"[ERROR] ClearError: {ex}")
 
+    def _set_home(self):
+        if not self._robot:
+            self._log_msg("[WARN] Robot not connected"); return
+        try:
+            pose = self._robot.get_pose()
+            self._home_pose = list(pose)
+            self._home_btn.config(state="normal")
+            self._log_msg(f"Home set: {[f'{v:.1f}' for v in self._home_pose]}")
+        except Exception as ex:
+            self._log_msg(f"[ERROR] Set home: {ex}")
+
     def _go_home(self):
         if not self._robot:
             self._log_msg("[WARN] Robot not connected"); return
+        if not self._home_pose:
+            self._log_msg("[WARN] Home not set — click 'Set Home' first"); return
         def _thread():
             try:
-                self._log_msg(f"Going home: {HOME_POSE}")
-                cmd = self._robot.move_linear(*HOME_POSE)
+                self._log_msg(f"Going home: {[f'{v:.1f}' for v in self._home_pose]}")
+                cmd = self._robot.move_linear(*self._home_pose)
                 self._robot.wait_motion(cmd)
                 self._log_msg("Home reached.")
             except Exception as ex:
@@ -804,12 +820,9 @@ class CalibTesterApp:
                 cam.start()
                 self._cam = cam
                 self._cam_connected = True
-                self.root.after(0, lambda: self._cam_dot.config(
-                    text="● Camera: OK", fg="green"))
                 self._log_msg("Camera started.")
             except Exception as ex:
-                self.root.after(0, lambda: self._cam_dot.config(
-                    text="● Camera: FAILED", fg="red"))
+                self._cam_connected = False
                 self._log_msg(f"[WARN] Camera not available: {ex}")
         threading.Thread(target=_init, daemon=True).start()
         self.root.after(50, self._ui_loop)
@@ -823,6 +836,26 @@ class CalibTesterApp:
         self.root.after(40, self._ui_loop)   # ~25 fps
 
     def _tick(self):
+        # Update status dots from state flags (safe — main thread only)
+        cam_state = "ok" if self._cam_connected else "off"
+        if cam_state != self._cam_dot_state:
+            self._cam_dot_state = cam_state
+            if cam_state == "ok":
+                self._cam_dot.config(text="● Camera: OK", fg="green")
+            else:
+                self._cam_dot.config(text="● Camera: disconnected", fg="red")
+
+        robot_state = "ok" if self._robot_connected else "off"
+        if robot_state != self._robot_dot_state:
+            self._robot_dot_state = robot_state
+            if robot_state == "ok":
+                ip = self._ip_var.get().strip()
+                self._robot_dot.config(text=f"● Robot: {ip}", fg="green")
+                self._connect_btn.config(text="Disconnect",
+                                         command=self._disconnect_robot, bg="#c62828")
+            else:
+                self._robot_dot.config(text="● Robot: disconnected", fg="red")
+
         if self._cam is None:
             return
         rgb, depth_m, intr = self._cam.get_latest()
@@ -930,10 +963,26 @@ class CalibTesterApp:
         try:
             npz_path, json_path = save_corrected_calibration(
                 self._calib_path, T_corrected, T_corr, CALIB_DIR)
-            self._log_msg(f"Saved corrected calibration:")
+            self._log_msg("Saved corrected calibration:")
             self._log_msg(f"  {npz_path}")
             self._log_msg(f"  {json_path}")
-            messagebox.showinfo("Saved", f"Corrected calibration saved:\n{npz_path}")
+
+            # Ask whether to overwrite the main calibration so all tools pick it up
+            overwrite = messagebox.askyesno(
+                "Overwrite main calibration?",
+                f"Overwrite the main calibration file used by the pipeline?\n\n"
+                f"  {self._calib_path}\n\n"
+                "Yes → pipeline will use the corrected calibration immediately.\n"
+                "No  → only the timestamped backup is saved.")
+            if overwrite:
+                import shutil
+                shutil.copy2(str(npz_path), self._calib_path)
+                # Also update the .json sidecar (same name, .json extension)
+                json_main = str(Path(self._calib_path).with_suffix(".json"))
+                shutil.copy2(str(json_path), json_main)
+                self._log_msg(f"Main calibration overwritten: {self._calib_path}")
+                # Reload so the tester itself uses the corrected matrix
+                self._T_cam2base = T_corrected
         except Exception as ex:
             messagebox.showerror("Save error", str(ex))
 
@@ -989,6 +1038,72 @@ class CalibTesterApp:
                 self.root.after(0, lambda: self._add_result(result))
             except Exception as ex:
                 self.root.after(0, lambda: self._log_msg(f"[ERROR] Test A: {ex}"))
+            finally:
+                self._worker_busy = False
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    # ---------------------------------------------------------------- Test A2
+    def _test_a2_descend(self):
+        """Approach + descend to the predicted marker position, record error, then retreat."""
+        if self._robot is None:
+            messagebox.showerror("Error", "Robot not connected."); return
+        if self._T_cam2base is None:
+            messagebox.showerror("Error", "Calibration not loaded."); return
+        if self._last_pred_mm is None:
+            messagebox.showinfo("No detection", "No marker detected — aim camera at marker."); return
+        if self._worker_busy:
+            return
+
+        pred = self._last_pred_mm.copy()
+        try:
+            current_pose = self._robot.get_pose()
+            rx, ry, rz   = current_pose[3], current_pose[4], current_pose[5]
+        except Exception:
+            rx, ry, rz = 0.0, 0.0, 0.0
+
+        approach = (float(pred[0]), float(pred[1]),
+                    float(pred[2]) + APPROACH_OFFSET_MM,
+                    rx, ry, rz)
+        target   = (float(pred[0]), float(pred[1]), float(pred[2]),
+                    rx, ry, rz)
+
+        self._log_msg(f"[A2] Predicted @ [{pred[0]:.1f}, {pred[1]:.1f}, {pred[2]:.1f}] mm")
+
+        def _thread():
+            self._worker_busy = True
+            try:
+                # 1 — approach
+                self._log_msg(f"[A2] → approach Z+{APPROACH_OFFSET_MM}mm")
+                cmd = self._robot.move_linear(*approach)
+                self._robot.wait_motion(cmd)
+                # 2 — descend
+                self._log_msg(f"[A2] → descend to marker")
+                cmd = self._robot.move_linear(*target)
+                self._robot.wait_motion(cmd)
+                # 3 — record
+                actual = self._robot.get_pose()
+                err_x = actual[0] - pred[0]
+                err_y = actual[1] - pred[1]
+                err_z = actual[2] - pred[2]
+                dist  = float(np.linalg.norm([err_x, err_y, err_z]))
+                self.root.after(0, lambda: self._log_msg(
+                    f"[A2] Actual: [{actual[0]:.1f}, {actual[1]:.1f}, {actual[2]:.1f}] mm  "
+                    f"err=[{err_x:+.1f}, {err_y:+.1f}, {err_z:+.1f}]  |3D|={dist:.1f} mm"))
+                result = {
+                    "mode": "A2",
+                    "pred_x": pred[0], "pred_y": pred[1], "pred_z": pred[2],
+                    "actual_x": actual[0], "actual_y": actual[1], "actual_z": actual[2],
+                    "err_x": err_x, "err_y": err_y, "err_z": err_z,
+                    "dist": dist,
+                }
+                self.root.after(0, lambda: self._add_result(result))
+                # 4 — retreat
+                self._log_msg(f"[A2] → retreat")
+                cmd = self._robot.move_linear(*approach)
+                self._robot.wait_motion(cmd)
+            except Exception as ex:
+                self.root.after(0, lambda: self._log_msg(f"[ERROR] Test A2: {ex}"))
             finally:
                 self._worker_busy = False
 
