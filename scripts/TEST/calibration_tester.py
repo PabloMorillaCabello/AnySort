@@ -73,7 +73,6 @@ CALIB_FILE_DEFAULT  = "/ros2_ws/data/calibration/hand_eye_calib.npz"
 CALIB_DIR           = Path("/ros2_ws/data/calibration")
 ROBOT_IP_DEFAULT    = "192.168.5.1"
 ROBOT_PORT          = 29999
-HOME_POSE           = [300, 0, 450, 0, 0, 0]   # safe home [X,Y,Z,Rx,Ry,Rz]
 APPROACH_OFFSET_MM  = 80                         # mm above marker for Mode A
 MOVE_SPEED          = 15                         # % speed for test moves
 
@@ -274,47 +273,134 @@ def _to_rgb_array(color_frame, OBFormat):
     raise RuntimeError(f"Unsupported color format: {fmt}")
 
 
-def _extract_depth_intrinsics(depth_profile, depth_frame):
-    for obj in [depth_frame, depth_profile]:
-        if obj is None:
+def _extract_intrinsics(profile_or_frame):
+    """Try to read (fx, fy, cx, cy) from a stream profile or frame object."""
+    if profile_or_frame is None:
+        raise RuntimeError("Cannot read intrinsics from None")
+    for method in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
+        if not hasattr(profile_or_frame, method):
             continue
-        for method in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
-            if not hasattr(obj, method):
-                continue
-            intr = getattr(obj, method)()
-            try:
-                fx = float(next(getattr(intr, a) for a in ["fx", "focal_x"] if hasattr(intr, a)))
-                fy = float(next(getattr(intr, a) for a in ["fy", "focal_y"] if hasattr(intr, a)))
-                cx = float(next(getattr(intr, a) for a in ["cx", "ppx", "principal_x"] if hasattr(intr, a)))
-                cy = float(next(getattr(intr, a) for a in ["cy", "ppy", "principal_y"] if hasattr(intr, a)))
-                return fx, fy, cx, cy
-            except StopIteration:
-                continue
-    raise RuntimeError("Cannot read depth intrinsics")
+        intr = getattr(profile_or_frame, method)()
+        try:
+            fx = float(next(getattr(intr, a) for a in ["fx", "focal_x"] if hasattr(intr, a)))
+            fy = float(next(getattr(intr, a) for a in ["fy", "focal_y"] if hasattr(intr, a)))
+            cx = float(next(getattr(intr, a) for a in ["cx", "ppx", "principal_x"] if hasattr(intr, a)))
+            cy = float(next(getattr(intr, a) for a in ["cy", "ppy", "principal_y"] if hasattr(intr, a)))
+            return fx, fy, cx, cy
+        except StopIteration:
+            continue
+    raise RuntimeError("Cannot read camera intrinsics")
 
 
 class OrbbecCamera:
+    """Orbbec Gemini 2 camera with HW D2C alignment and frame sync.
+
+    After start(), depth is hardware-aligned to the color sensor so every
+    depth pixel corresponds 1:1 to the same color pixel.  Intrinsics are
+    taken from the **color** profile (the alignment target).
+    """
+
     def __init__(self):
-        from pyorbbecsdk import Config, OBSensorType, Pipeline, OBFormat
+        from pyorbbecsdk import (Config, OBAlignMode, OBFormat,
+                                 OBSensorType, Pipeline)
         self._OBFormat = OBFormat
+        self._OBAlignMode = OBAlignMode
+        self._OBSensorType = OBSensorType
         self._lock     = threading.Lock()
         self._rgb      = None
         self._depth_m  = None
         self._intr     = None
         self._running  = False
-        self._depth_profile = None
+        self._color_profile = None
+        self._depth_filters = []
 
     def start(self):
-        from pyorbbecsdk import Config, OBSensorType, Pipeline
+        from pyorbbecsdk import Config, OBAlignMode, OBFormat, OBSensorType, Pipeline
         pipeline = Pipeline()
-        config   = Config()
-        depth_list  = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        depth_prof  = depth_list.get_default_video_stream_profile()
-        config.enable_stream(depth_prof)
-        self._depth_profile = depth_prof
-        color_list  = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-        config.enable_stream(color_list.get_default_video_stream_profile())
+
+        # Enable hardware frame sync
+        try:
+            pipeline.enable_frame_sync()
+            print("[Camera] Frame sync enabled")
+        except Exception as e:
+            print(f"[Camera] Frame sync failed: {e}")
+
+        config = Config()
+
+        # Find an RGB colour profile and a matching HW-D2C depth profile
+        color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        hw_d2c_ok = False
+        for i in range(len(color_profiles)):
+            cp = color_profiles[i]
+            if cp.get_format() != OBFormat.RGB:
+                continue
+            try:
+                d2c_list = pipeline.get_d2c_depth_profile_list(cp, OBAlignMode.HW_MODE)
+            except Exception:
+                continue
+            if len(d2c_list) == 0:
+                continue
+            dp = None
+            for j in range(len(d2c_list)):
+                if d2c_list[j].get_format() == OBFormat.Y16:
+                    dp = d2c_list[j]
+                    break
+            if dp is None:
+                dp = d2c_list[0]
+            config.enable_stream(dp)
+            config.enable_stream(cp)
+            config.set_align_mode(OBAlignMode.HW_MODE)
+            self._color_profile = cp
+            hw_d2c_ok = True
+            print(f"[Camera] HW D2C: color {cp.get_width()}x{cp.get_height()} "
+                  f"depth {dp.get_width()}x{dp.get_height()}")
+            break
+
+        if not hw_d2c_ok:
+            print("[Camera] WARNING: HW D2C unavailable -- falling back to defaults")
+            depth_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+            dp = None
+            for j in range(len(depth_list)):
+                if depth_list[j].get_format() == OBFormat.Y16:
+                    dp = depth_list[j]
+                    break
+            if dp is None:
+                dp = depth_list.get_default_video_stream_profile()
+            config.enable_stream(dp)
+            color_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+            cp = color_list.get_default_video_stream_profile()
+            config.enable_stream(cp)
+            self._color_profile = cp
+
         pipeline.start(config)
+
+        try:
+            import orbbec_quiet
+            orbbec_quiet.reapply()
+        except Exception:
+            pass
+
+        # Depth post-processing filters
+        try:
+            device = pipeline.get_device()
+            sensor = device.get_sensor(OBSensorType.DEPTH_SENSOR)
+            filters = sensor.get_recommended_filters()
+            for f in filters:
+                f.enable(True)
+                print(f"[Camera] Depth filter: {f.get_name()} (enabled)")
+            self._depth_filters = filters
+        except Exception as e:
+            print(f"[Camera] Depth filters unavailable: {e}")
+            self._depth_filters = []
+
+        # Let the sensor stabilise
+        print("[Camera] Stabilising sensor (15 frames)...")
+        for _ in range(15):
+            try:
+                pipeline.wait_for_frames(200)
+            except Exception:
+                pass
+
         self._pipeline = pipeline
         self._running  = True
         threading.Thread(target=self._loop, daemon=True).start()
@@ -337,21 +423,37 @@ class OrbbecCamera:
             except Exception:
                 continue
             try:
+                # Apply depth post-processing filters
+                for filt in self._depth_filters:
+                    if filt.is_enabled():
+                        try:
+                            df = filt.process(df)
+                        except Exception:
+                            pass
+                if hasattr(df, "as_depth_frame"):
+                    df = df.as_depth_frame()
                 dh, dw = df.get_height(), df.get_width()
-                raw    = np.frombuffer(df.get_data(), dtype=np.uint16).reshape(dh, dw)
-                scale  = float(df.get_depth_scale())
-                depth  = raw.astype(np.float32) * scale
-                valid  = depth[(depth > 0.05) & np.isfinite(depth)]
+                depth_raw = np.frombuffer(df.get_data(),
+                                          dtype=np.uint16).reshape(dh, dw)
+                scale = float(df.get_depth_scale())
+                depth_m = depth_raw.astype(np.float32) * scale
+                # Auto-detect mm vs m
+                valid = depth_m[(depth_m > 0.05) & np.isfinite(depth_m)]
                 if valid.size > 0 and float(np.median(valid)) > 20.0:
-                    depth /= 1000.0
+                    depth_m /= 1000.0
+
+                # With HW D2C, depth is already aligned to colour resolution
                 if rgb.shape[0] != dh or rgb.shape[1] != dw:
-                    rgb = np.array(PILImage.fromarray(rgb).resize((dw, dh), PILImage.BILINEAR))
-                intr = _extract_depth_intrinsics(self._depth_profile, df)
+                    rgb = np.array(PILImage.fromarray(rgb).resize(
+                        (dw, dh), PILImage.BILINEAR))
+
+                # Use colour intrinsics (the D2C alignment target)
+                intr = _extract_intrinsics(self._color_profile)
             except Exception:
                 continue
             with self._lock:
                 self._rgb     = rgb
-                self._depth_m = depth
+                self._depth_m = depth_m
                 self._intr    = intr
 
     def get_latest(self):
@@ -447,6 +549,11 @@ class DobotDashboard:
         raise ValueError(f"Cannot parse pose: {self._dashboard.GetPose()!r}")
 
     def _send_motion(self, resp):
+        if resp is None or resp == b'' or resp == '':
+            try:
+                resp = self._dashboard.wait_reply()
+            except Exception:
+                pass
         parsed = _parse_result_id(resp)
         if len(parsed) < 2 or parsed[0] != 0:
             raise RuntimeError(f"Move rejected (err={parsed[0] if parsed else '?'}): {resp!r}")
@@ -509,6 +616,7 @@ class CalibTesterApp:
         self._calib_path    = args.calib
         self._robot_ip      = args.robot_ip
         self._test_results  = []     # list of result dicts
+        self._home_pose     = None   # [X,Y,Z,Rx,Ry,Rz] set by user
         self._ground_truth  = None   # (x,y,z) mm in robot frame
         self._last_det      = None   # last ArUco detection result
         self._last_pred_mm  = None   # last predicted robot coords (corrected)
@@ -516,6 +624,8 @@ class CalibTesterApp:
         self._worker_busy   = False
         self._cam_connected = False
         self._robot_connected = False
+        self._cam_dot_state  = "init"    # track last dot state to avoid redundant config
+        self._robot_dot_state = "init"
 
         # 6-DOF correction variables
         self._cv = {k: tk.DoubleVar(value=0.0) for k in
@@ -589,7 +699,11 @@ class CalibTesterApp:
         tk.Button(util, text="Gen Marker", command=self._gen_marker).pack(side=tk.LEFT, padx=2)
         tk.Button(util, text="Enable Robot", command=self._enable_robot).pack(side=tk.LEFT, padx=2)
         tk.Button(util, text="Clear Error", command=self._clear_error).pack(side=tk.LEFT, padx=2)
-        tk.Button(util, text="Go Home", command=self._go_home, bg="#5d4037", fg="white").pack(side=tk.LEFT, padx=2)
+        tk.Button(util, text="Set Home\n(current pose)", command=self._set_home,
+                  bg="#4e342e", fg="white").pack(side=tk.LEFT, padx=2)
+        self._home_btn = tk.Button(util, text="Go Home", command=self._go_home,
+                                   bg="#5d4037", fg="white", state="disabled")
+        self._home_btn.pack(side=tk.LEFT, padx=2)
 
     def _build_detection_frame(self, parent):
         lf = tk.LabelFrame(parent, text="Live Detection")
@@ -606,9 +720,12 @@ class CalibTesterApp:
         btn_row = tk.Frame(lf)
         btn_row.pack(fill=tk.X, padx=4, pady=4)
 
-        tk.Button(btn_row, text="[A] Move to Predicted",
+        tk.Button(btn_row, text="[A] Approach\n(+offset)",
                   command=self._test_a_move,
-                  bg="#1565c0", fg="white", width=20).pack(side=tk.LEFT, padx=2)
+                  bg="#1565c0", fg="white", width=16).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_row, text="[A2] Descend\nto Marker",
+                  command=self._test_a2_descend,
+                  bg="#0d47a1", fg="white", width=16).pack(side=tk.LEFT, padx=2)
         tk.Button(btn_row, text="[B] Set Ground Truth\n(current pose)",
                   command=self._test_b_set_gt,
                   bg="#6a1b9a", fg="white", width=22).pack(side=tk.LEFT, padx=2)
@@ -732,11 +849,6 @@ class CalibTesterApp:
                 robot = DobotDashboard(ip)
                 self._robot = robot
                 self._robot_connected = True
-                self.root.after(0, lambda: self._robot_dot.config(
-                    text=f"● Robot: {ip}", fg="green"))
-                self.root.after(0, lambda: self._connect_btn.config(
-                    text="Disconnect", command=self._disconnect_robot,
-                    bg="#c62828"))
                 self._log_msg(f"Robot connected: {ip}")
             except Exception as ex:
                 self._log_msg(f"[ERROR] Robot connection: {ex}")
@@ -753,7 +865,6 @@ class CalibTesterApp:
         self._robot_connected = False
         self._connect_btn.config(text="Connect Robot", command=self._connect_robot,
                                  bg="#2e7d32")
-        self._robot_dot.config(text="● Robot: disconnected", fg="red")
         self._log_msg("Robot disconnected.")
 
     def _enable_robot(self):
@@ -774,13 +885,26 @@ class CalibTesterApp:
         except Exception as ex:
             self._log_msg(f"[ERROR] ClearError: {ex}")
 
+    def _set_home(self):
+        if not self._robot:
+            self._log_msg("[WARN] Robot not connected"); return
+        try:
+            pose = self._robot.get_pose()
+            self._home_pose = list(pose)
+            self._home_btn.config(state="normal")
+            self._log_msg(f"Home set: {[f'{v:.1f}' for v in self._home_pose]}")
+        except Exception as ex:
+            self._log_msg(f"[ERROR] Set home: {ex}")
+
     def _go_home(self):
         if not self._robot:
             self._log_msg("[WARN] Robot not connected"); return
+        if not self._home_pose:
+            self._log_msg("[WARN] Home not set — click 'Set Home' first"); return
         def _thread():
             try:
-                self._log_msg(f"Going home: {HOME_POSE}")
-                cmd = self._robot.move_linear(*HOME_POSE)
+                self._log_msg(f"Going home: {[f'{v:.1f}' for v in self._home_pose]}")
+                cmd = self._robot.move_linear(*self._home_pose)
                 self._robot.wait_motion(cmd)
                 self._log_msg("Home reached.")
             except Exception as ex:
@@ -804,12 +928,9 @@ class CalibTesterApp:
                 cam.start()
                 self._cam = cam
                 self._cam_connected = True
-                self.root.after(0, lambda: self._cam_dot.config(
-                    text="● Camera: OK", fg="green"))
                 self._log_msg("Camera started.")
             except Exception as ex:
-                self.root.after(0, lambda: self._cam_dot.config(
-                    text="● Camera: FAILED", fg="red"))
+                self._cam_connected = False
                 self._log_msg(f"[WARN] Camera not available: {ex}")
         threading.Thread(target=_init, daemon=True).start()
         self.root.after(50, self._ui_loop)
@@ -823,6 +944,26 @@ class CalibTesterApp:
         self.root.after(40, self._ui_loop)   # ~25 fps
 
     def _tick(self):
+        # Update status dots from state flags (safe — main thread only)
+        cam_state = "ok" if self._cam_connected else "off"
+        if cam_state != self._cam_dot_state:
+            self._cam_dot_state = cam_state
+            if cam_state == "ok":
+                self._cam_dot.config(text="● Camera: OK", fg="green")
+            else:
+                self._cam_dot.config(text="● Camera: disconnected", fg="red")
+
+        robot_state = "ok" if self._robot_connected else "off"
+        if robot_state != self._robot_dot_state:
+            self._robot_dot_state = robot_state
+            if robot_state == "ok":
+                ip = self._ip_var.get().strip()
+                self._robot_dot.config(text=f"● Robot: {ip}", fg="green")
+                self._connect_btn.config(text="Disconnect",
+                                         command=self._disconnect_robot, bg="#c62828")
+            else:
+                self._robot_dot.config(text="● Robot: disconnected", fg="red")
+
         if self._cam is None:
             return
         rgb, depth_m, intr = self._cam.get_latest()
@@ -930,10 +1071,26 @@ class CalibTesterApp:
         try:
             npz_path, json_path = save_corrected_calibration(
                 self._calib_path, T_corrected, T_corr, CALIB_DIR)
-            self._log_msg(f"Saved corrected calibration:")
+            self._log_msg("Saved corrected calibration:")
             self._log_msg(f"  {npz_path}")
             self._log_msg(f"  {json_path}")
-            messagebox.showinfo("Saved", f"Corrected calibration saved:\n{npz_path}")
+
+            # Ask whether to overwrite the main calibration so all tools pick it up
+            overwrite = messagebox.askyesno(
+                "Overwrite main calibration?",
+                f"Overwrite the main calibration file used by the pipeline?\n\n"
+                f"  {self._calib_path}\n\n"
+                "Yes → pipeline will use the corrected calibration immediately.\n"
+                "No  → only the timestamped backup is saved.")
+            if overwrite:
+                import shutil
+                shutil.copy2(str(npz_path), self._calib_path)
+                # Also update the .json sidecar (same name, .json extension)
+                json_main = str(Path(self._calib_path).with_suffix(".json"))
+                shutil.copy2(str(json_path), json_main)
+                self._log_msg(f"Main calibration overwritten: {self._calib_path}")
+                # Reload so the tester itself uses the corrected matrix
+                self._T_cam2base = T_corrected
         except Exception as ex:
             messagebox.showerror("Save error", str(ex))
 
@@ -989,6 +1146,72 @@ class CalibTesterApp:
                 self.root.after(0, lambda: self._add_result(result))
             except Exception as ex:
                 self.root.after(0, lambda: self._log_msg(f"[ERROR] Test A: {ex}"))
+            finally:
+                self._worker_busy = False
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    # ---------------------------------------------------------------- Test A2
+    def _test_a2_descend(self):
+        """Approach + descend to the predicted marker position, record error, then retreat."""
+        if self._robot is None:
+            messagebox.showerror("Error", "Robot not connected."); return
+        if self._T_cam2base is None:
+            messagebox.showerror("Error", "Calibration not loaded."); return
+        if self._last_pred_mm is None:
+            messagebox.showinfo("No detection", "No marker detected — aim camera at marker."); return
+        if self._worker_busy:
+            return
+
+        pred = self._last_pred_mm.copy()
+        try:
+            current_pose = self._robot.get_pose()
+            rx, ry, rz   = current_pose[3], current_pose[4], current_pose[5]
+        except Exception:
+            rx, ry, rz = 0.0, 0.0, 0.0
+
+        approach = (float(pred[0]), float(pred[1]),
+                    float(pred[2]) + APPROACH_OFFSET_MM,
+                    rx, ry, rz)
+        target   = (float(pred[0]), float(pred[1]), float(pred[2]),
+                    rx, ry, rz)
+
+        self._log_msg(f"[A2] Predicted @ [{pred[0]:.1f}, {pred[1]:.1f}, {pred[2]:.1f}] mm")
+
+        def _thread():
+            self._worker_busy = True
+            try:
+                # 1 — approach
+                self._log_msg(f"[A2] → approach Z+{APPROACH_OFFSET_MM}mm")
+                cmd = self._robot.move_linear(*approach)
+                self._robot.wait_motion(cmd)
+                # 2 — descend
+                self._log_msg(f"[A2] → descend to marker")
+                cmd = self._robot.move_linear(*target)
+                self._robot.wait_motion(cmd)
+                # 3 — record
+                actual = self._robot.get_pose()
+                err_x = actual[0] - pred[0]
+                err_y = actual[1] - pred[1]
+                err_z = actual[2] - pred[2]
+                dist  = float(np.linalg.norm([err_x, err_y, err_z]))
+                self.root.after(0, lambda: self._log_msg(
+                    f"[A2] Actual: [{actual[0]:.1f}, {actual[1]:.1f}, {actual[2]:.1f}] mm  "
+                    f"err=[{err_x:+.1f}, {err_y:+.1f}, {err_z:+.1f}]  |3D|={dist:.1f} mm"))
+                result = {
+                    "mode": "A2",
+                    "pred_x": pred[0], "pred_y": pred[1], "pred_z": pred[2],
+                    "actual_x": actual[0], "actual_y": actual[1], "actual_z": actual[2],
+                    "err_x": err_x, "err_y": err_y, "err_z": err_z,
+                    "dist": dist,
+                }
+                self.root.after(0, lambda: self._add_result(result))
+                # 4 — retreat
+                self._log_msg(f"[A2] → retreat")
+                cmd = self._robot.move_linear(*approach)
+                self._robot.wait_motion(cmd)
+            except Exception as ex:
+                self.root.after(0, lambda: self._log_msg(f"[ERROR] Test A2: {ex}"))
             finally:
                 self._worker_busy = False
 

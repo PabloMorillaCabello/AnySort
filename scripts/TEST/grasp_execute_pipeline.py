@@ -27,11 +27,17 @@ import queue
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+
+# Redirect OrbbecSDK C-level stderr to file — prevents timestamp-anomaly spam
+# from flooding the terminal. Full log available at /tmp/orbbec_sdk.log
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import orbbec_quiet  # noqa: E402
 
 import cv2
 import numpy as np
@@ -99,15 +105,31 @@ def _find_sam3_python():
     raise RuntimeError("Cannot find SAM3 Python interpreter.")
 
 
-def _wait_for_sam3_socket(sock_path, timeout=120.0):
+def _wait_for_sam3_socket(sock_path, timeout=600.0, proc=None):
+    """Wait for the SAM3 server Unix socket to appear and accept connections.
+
+    The socket is created only AFTER the model finishes loading, which can take
+    several minutes on first run (downloading facebook/sam3 weights).
+    """
     import socket as _s
     deadline = time.time() + timeout
+    last_log = time.time()
     while time.time() < deadline:
+        # Fail fast if the subprocess already died
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(f"SAM3 server process exited early (code {proc.returncode})")
         try:
             s = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
             s.settimeout(2.0); s.connect(sock_path); s.close(); return
         except OSError:
-            time.sleep(0.5)
+            pass
+        now = time.time()
+        if now - last_log >= 30.0:
+            elapsed = now - (deadline - timeout)
+            print(f"[SAM3] Still loading model… ({elapsed:.0f}s elapsed, "
+                  f"timeout={timeout:.0f}s) — waiting for {sock_path}")
+            last_log = now
+        time.sleep(0.5)
     raise RuntimeError(f"SAM3 server not ready within {timeout:.0f}s")
 
 
@@ -120,7 +142,7 @@ def start_sam3_server(sock_path, device="cuda:0", fp16=True):
     env.pop("VIRTUAL_ENV", None); env.pop("PYTHONHOME", None)
     print(f"[SAM3] Starting server: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, env=env)
-    _wait_for_sam3_socket(sock_path, timeout=120.0)
+    _wait_for_sam3_socket(sock_path, timeout=600.0, proc=proc)
     print("[SAM3] Server ready.")
     return proc
 
@@ -201,51 +223,146 @@ def _to_rgb_array(color_frame, OBFormat):
     raise RuntimeError(f"Unsupported format {fmt}")
 
 
-def _extract_intrinsics(depth_profile, depth_frame):
-    for obj in [depth_frame, depth_profile]:
-        if obj is None:
+def _extract_intrinsics(profile_or_frame):
+    """Try to read (fx, fy, cx, cy) from a stream profile or frame object."""
+    if profile_or_frame is None:
+        raise RuntimeError("Cannot read intrinsics from None")
+    for method in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
+        if not hasattr(profile_or_frame, method):
             continue
-        for method in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
-            if not hasattr(obj, method):
-                continue
-            intr = getattr(obj, method)()
-            try:
-                fx = float(next(getattr(intr, a) for a in ["fx","focal_x"] if hasattr(intr,a)))
-                fy = float(next(getattr(intr, a) for a in ["fy","focal_y"] if hasattr(intr,a)))
-                cx = float(next(getattr(intr, a) for a in ["cx","ppx","principal_x"] if hasattr(intr,a)))
-                cy = float(next(getattr(intr, a) for a in ["cy","ppy","principal_y"] if hasattr(intr,a)))
-                return fx, fy, cx, cy
-            except StopIteration:
-                continue
+        intr = getattr(profile_or_frame, method)()
+        try:
+            fx = float(next(getattr(intr, a) for a in ["fx","focal_x"] if hasattr(intr,a)))
+            fy = float(next(getattr(intr, a) for a in ["fy","focal_y"] if hasattr(intr,a)))
+            cx = float(next(getattr(intr, a) for a in ["cx","ppx","principal_x"] if hasattr(intr,a)))
+            cy = float(next(getattr(intr, a) for a in ["cy","ppy","principal_y"] if hasattr(intr,a)))
+            return fx, fy, cx, cy
+        except StopIteration:
+            continue
     raise RuntimeError("Cannot read camera intrinsics")
 
 
 class OrbbecCamera:
+    """Orbbec Gemini 2 camera with hardware D2C alignment and frame sync.
+
+    After start(), depth is hardware-aligned to the color sensor so every
+    depth pixel corresponds 1:1 to the same color pixel.  Intrinsics are
+    taken from the **color** profile (the alignment target).
+    """
+
     def __init__(self):
-        from pyorbbecsdk import Config, OBSensorType, Pipeline, OBFormat
+        from pyorbbecsdk import (Config, OBAlignMode, OBFormat,
+                                 OBSensorType, Pipeline)
         self._OBFormat = OBFormat
+        self._OBAlignMode = OBAlignMode
+        self._OBSensorType = OBSensorType
         self._lock = threading.Lock()
         self._latest_rgb = None
         self._latest_depth_m = None
         self._latest_intrinsics = None
         self._running = False
-        self._depth_profile = None
+        self._started = False
+        self._color_profile = None    # intrinsics come from colour (D2C target)
+        self._depth_filters = []      # SDK post-processing filters
 
+    # ------------------------------------------------------------------ #
     def start(self):
-        from pyorbbecsdk import Config, OBSensorType, Pipeline
+        from pyorbbecsdk import Config, OBAlignMode, OBFormat, OBSensorType, Pipeline
         pipeline = Pipeline()
+
+        # ── Enable hardware frame sync to avoid timestamp anomalies ──
+        try:
+            pipeline.enable_frame_sync()
+            print("[Camera] Frame sync enabled")
+        except Exception as e:
+            print(f"[Camera] Frame sync failed: {e}")
+
         config = Config()
-        depth_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        depth_profile = depth_list.get_default_video_stream_profile()
-        config.enable_stream(depth_profile)
-        self._depth_profile = depth_profile
-        color_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-        config.enable_stream(color_list.get_default_video_stream_profile())
+
+        # ── Find an RGB colour profile and a matching HW-D2C depth profile ──
+        color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        hw_d2c_ok = False
+        for i in range(len(color_profiles)):
+            cp = color_profiles[i]
+            if cp.get_format() != OBFormat.RGB:
+                continue
+            try:
+                d2c_list = pipeline.get_d2c_depth_profile_list(cp, OBAlignMode.HW_MODE)
+            except Exception:
+                continue
+            if len(d2c_list) == 0:
+                continue
+            # Prefer Y16 — RLE depth is not supported by ThresholdFilter/pixel-size API
+            dp = None
+            for j in range(len(d2c_list)):
+                if d2c_list[j].get_format() == OBFormat.Y16:
+                    dp = d2c_list[j]
+                    break
+            if dp is None:
+                dp = d2c_list[0]
+            config.enable_stream(dp)
+            config.enable_stream(cp)
+            config.set_align_mode(OBAlignMode.HW_MODE)
+            self._color_profile = cp
+            hw_d2c_ok = True
+            print(f"[Camera] HW D2C: color {cp.get_width()}x{cp.get_height()} "
+                  f"depth {dp.get_width()}x{dp.get_height()}")
+            break
+
+        if not hw_d2c_ok:
+            # Fallback: default profiles, no alignment
+            print("[Camera] WARNING: HW D2C unavailable — falling back to defaults")
+            depth_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+            dp = None
+            for j in range(len(depth_list)):
+                if depth_list[j].get_format() == OBFormat.Y16:
+                    dp = depth_list[j]
+                    break
+            if dp is None:
+                dp = depth_list.get_default_video_stream_profile()
+            config.enable_stream(dp)
+            color_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+            cp = color_list.get_default_video_stream_profile()
+            config.enable_stream(cp)
+            self._color_profile = cp
+
         pipeline.start(config)
+
+        # Re-apply the fd 2 redirect: SDK extensions loaded during start()
+        # can reset C-level stderr back to the terminal.
+        try:
+            import orbbec_quiet
+            orbbec_quiet.reapply()
+        except Exception:
+            pass
+
+        # ── Depth post-processing: enable device-recommended filters ──
+        try:
+            device = pipeline.get_device()
+            sensor = device.get_sensor(OBSensorType.DEPTH_SENSOR)
+            filters = sensor.get_recommended_filters()
+            for f in filters:
+                f.enable(True)
+                print(f"[Camera] Depth filter: {f.get_name()} (enabled)")
+            self._depth_filters = filters
+        except Exception as e:
+            print(f"[Camera] Depth filters unavailable: {e}")
+            self._depth_filters = []
+
+        # Let the sensor stabilise (avoid early timestamp anomalies)
+        print("[Camera] Stabilising sensor (15 frames)…")
+        for _ in range(15):
+            try:
+                pipeline.wait_for_frames(200)
+            except Exception:
+                pass
+
         self._pipeline = pipeline
         self._running = True
+        self._started = True
         threading.Thread(target=self._loop, daemon=True).start()
 
+    # ------------------------------------------------------------------ #
     def _loop(self):
         OBFormat = self._OBFormat
         while self._running:
@@ -264,16 +381,33 @@ class OrbbecCamera:
             except Exception:
                 continue
             try:
+                # Apply depth post-processing filters (temporal, spatial, etc.)
+                for filt in self._depth_filters:
+                    if filt.is_enabled():
+                        try:
+                            df = filt.process(df)
+                        except Exception:
+                            pass
+                if hasattr(df, 'as_depth_frame'):
+                    df = df.as_depth_frame()
                 dh, dw = df.get_height(), df.get_width()
-                depth_raw = np.frombuffer(df.get_data(), dtype=np.uint16).reshape(dh, dw)
+                depth_raw = np.frombuffer(df.get_data(),
+                                          dtype=np.uint16).reshape(dh, dw)
                 scale = float(df.get_depth_scale())
                 depth_m = depth_raw.astype(np.float32) * scale
+                # Auto-detect mm vs m: if median valid depth > 20, scale gave mm
                 valid = depth_m[(depth_m > 0.05) & np.isfinite(depth_m)]
                 if valid.size > 0 and float(np.median(valid)) > 20.0:
                     depth_m /= 1000.0
+
+                # With HW D2C, depth is already aligned to colour resolution.
+                # Resize colour only as safety fallback.
                 if rgb.shape[0] != dh or rgb.shape[1] != dw:
-                    rgb = np.array(PILImage.fromarray(rgb).resize((dw, dh), PILImage.BILINEAR))
-                intr = _extract_intrinsics(self._depth_profile, df)
+                    rgb = np.array(PILImage.fromarray(rgb).resize(
+                        (dw, dh), PILImage.BILINEAR))
+
+                # Use colour intrinsics (the D2C alignment target)
+                intr = _extract_intrinsics(self._color_profile)
             except Exception:
                 continue
             with self._lock:
@@ -281,14 +415,18 @@ class OrbbecCamera:
                 self._latest_depth_m = depth_m
                 self._latest_intrinsics = intr
 
+    # ------------------------------------------------------------------ #
     def get_latest(self):
         with self._lock:
             if self._latest_rgb is None:
                 return None, None, None
-            return self._latest_rgb.copy(), self._latest_depth_m.copy(), self._latest_intrinsics
+            return (self._latest_rgb.copy(),
+                    self._latest_depth_m.copy(),
+                    self._latest_intrinsics)
 
     def stop(self):
         self._running = False
+        self._started = False
         try:
             self._pipeline.stop()
         except Exception:
@@ -418,6 +556,11 @@ class DobotDashboard:
     # ------------------------------------------------------------------
     def _send_motion(self, resp):
         """Parse response, return CommandID (or -1 on error)."""
+        if resp is None or resp == b'' or resp == '':
+            try:
+                resp = self._dashboard.wait_reply()
+            except Exception:
+                pass
         parsed = _parse_result_id(resp)
         if len(parsed) < 2 or parsed[0] != 0:
             raise RuntimeError(f"Move rejected (ErrorID={parsed[0] if parsed else '?'}): {resp!r}")
@@ -426,9 +569,8 @@ class DobotDashboard:
     def move_linear(self, x, y, z, rx, ry, rz):
         resp = self._dashboard.MovL(
             x, y, z, rx, ry, rz,
-            0,                  # coordinateMode=0 → pose (Cartesian)
-            a=self._speed,
-            v=self._speed
+            0,                  # coordinateMode=0 → Cartesian
+            a=self._speed, v=self._speed
         )
         return self._send_motion(resp)
 
@@ -446,9 +588,8 @@ class DobotDashboard:
         j1, j2, j3, j4, j5, j6 = (_wrap(a) for a in (j1, j2, j3, j4, j5, j6))
         resp = self._dashboard.MovJ(
             j1, j2, j3, j4, j5, j6,
-            1,                  # coordinateMode=1 → joint
-            a=self._speed,
-            v=self._speed
+            1,                  # coordinateMode=1 → joint angles
+            a=self._speed, v=self._speed
         )
         return self._send_motion(resp)
 
@@ -499,8 +640,8 @@ class DobotDashboard:
 def load_calibration(path=CALIB_FILE):
     """Load T_cam2base (4×4).  Translation stored in mm."""
     data = np.load(path)
-    T = data["T_cam2base"]              # 4×4, t in mm
-    K = data.get("camera_matrix", None)
+    T = data["T_cam2base"].copy()       # 4×4, t in mm
+    K = data["camera_matrix"].copy() if "camera_matrix" in data else None
     return T, K
 
 
@@ -596,13 +737,22 @@ class GraspExecuteApp:
         self.sam3_proc  = sam3_proc
         self._vis       = vis
 
+        # Replay mode — (rgb uint8, depth_m float32, intrinsics tuple) or None for live
+        self._replay_frame = None
+        self._replay_label_var = tk.StringVar(value="")
+
         # GraspGen state
         self._loaded_config_name = None
         self._grasp_cfg  = None
         self._sampler    = None
         self._last_mask  = None
-        self._best_grasp_cam: np.ndarray = None   # 4×4, camera frame, meters
+        self._best_grasp_base: np.ndarray = None  # 4×4, robot base frame, meters
         self._best_grasp_info: dict = {}
+        self._all_grasps_base: np.ndarray = None  # (N,4,4) sorted conf desc, base frame
+        self._all_grasps_work: np.ndarray = None  # (N,4,4) Z-up work frame for vis
+        self._all_grasps_centered: np.ndarray = None  # same, centered for meshcat
+        self._all_grasp_scores = None             # (N,3) uint8 original colors
+        self._current_grasp_idx: int = 0
 
         # Hand-eye calibration
         self._T_cam2base = None    # 4×4, t in mm
@@ -612,11 +762,18 @@ class GraspExecuteApp:
         self._robot: DobotDashboard = None
         self._robot_connected = False
 
+        # Pipeline options
+        self._collision_var  = tk.BooleanVar(value=False)  # enable GraspGen collision check
+        self._debug_var      = tk.BooleanVar(value=False)  # step-by-step debug mode
+        self._debug_event    = threading.Event()
+        self._debug_event.set()  # start in "go" state
+
         # Flags
         self._inference_running = False
         self._config_loading    = False
         self._executing         = False
         self._show_mask         = tk.BooleanVar(value=True)
+        self._live_preview      = tk.BooleanVar(value=True)
 
         self._log_queue = queue.Queue()
         self._cb_queue  = queue.Queue()
@@ -647,6 +804,17 @@ class GraspExecuteApp:
             self._cb_queue.put(lambda: self._calib_status.config(
                 text="⚠  No calibration — run hand_eye_calibration.py first",
                 fg="#e06c75"))
+        # Load calibrated camera intrinsics (K + distortion) from camera_calibration.py
+        self._calib_dist = np.zeros(5, np.float64)
+        intrinsics_path = Path(path).parent / "camera_intrinsics.npz"
+        try:
+            ci = np.load(str(intrinsics_path))
+            self._calib_dist = ci["dist_coeffs"].ravel().astype(np.float64)
+            if self._calib_K is None and "camera_matrix" in ci:
+                self._calib_K = ci["camera_matrix"].astype(np.float64)
+            self._log(f"[Calib] Loaded camera intrinsics: dist={self._calib_dist.round(4).tolist()}")
+        except Exception as e:
+            self._log(f"[Calib] camera_intrinsics.npz not found — using SDK intrinsics (no distortion correction)")
 
     def _start_config_if_available(self):
         if self.config_map:
@@ -677,6 +845,43 @@ class GraspExecuteApp:
         tk.Checkbutton(left, text="Show mask overlay", variable=self._show_mask,
                        bg="#1e1e1e", fg="#aaa", activebackground="#1e1e1e",
                        selectcolor="#2d2d2d").pack(anchor="w", padx=4, pady=(4,0))
+        tk.Checkbutton(left, text="Live camera preview", variable=self._live_preview,
+                       bg="#1e1e1e", fg="#aaa", activebackground="#1e1e1e",
+                       selectcolor="#2d2d2d").pack(anchor="w", padx=4, pady=(2,0))
+
+        # ── Camera connect / disconnect ──
+        cam_row = tk.Frame(left, bg="#1e1e1e")
+        cam_row.pack(fill="x", padx=4, pady=(8, 0))
+        self._cam_connect_btn = tk.Button(
+            cam_row, text="📷  Connect Camera",
+            bg="#3a3a3a", fg="#61afef", activebackground="#4a4a4a",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+            command=self._on_camera_connect)
+        self._cam_connect_btn.pack(side="left", ipady=4)
+        self._cam_status_var = tk.StringVar(
+            value="● Connected" if self.camera._started else "● No camera")
+        self._cam_status_lbl = tk.Label(
+            cam_row, textvariable=self._cam_status_var, bg="#1e1e1e",
+            fg="#98c379" if self.camera._started else "#e06c75",
+            font=("Helvetica", 8))
+        self._cam_status_lbl.pack(side="left", padx=(8, 0))
+
+        # ── Replay mode controls ──
+        replay_row = tk.Frame(left, bg="#1e1e1e")
+        replay_row.pack(fill="x", padx=4, pady=(6, 0))
+        tk.Button(replay_row, text="📂  Load Saved Frame",
+                  bg="#3a3a3a", fg="#e5c07b", activebackground="#4a4a4a",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+                  command=self._on_load_replay).pack(side="left", ipady=4, padx=(0, 6))
+        tk.Button(replay_row, text="✕ Live",
+                  bg="#3a3a3a", fg="#aaa", activebackground="#4a4a4a",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+                  command=self._on_clear_replay).pack(side="left", ipady=4)
+        self._replay_info = tk.Label(left, textvariable=self._replay_label_var,
+                                     bg="#1e1e1e", fg="#c678dd",
+                                     font=("Courier", 7), wraplength=_PREVIEW_W - 8,
+                                     justify="left", anchor="w")
+        self._replay_info.pack(fill="x", padx=4, pady=(2, 0))
 
         # ---- Middle: GraspGen controls ----
         mid = tk.Frame(self.root, bg="#2d2d2d", width=310)
@@ -695,6 +900,20 @@ class GraspExecuteApp:
                                        bg="#2d2d2d", fg="#888",
                                        font=("Courier", 8), wraplength=280)
         self._calib_status.pack(anchor="w", padx=12, pady=(4,2))
+
+        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
+
+        # ── Pipeline options ──
+        tk.Checkbutton(mid, text="Check collisions (filter colliding grasps)",
+                       variable=self._collision_var,
+                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
+                       selectcolor="#3a3a3a", font=("Helvetica", 8)
+                       ).pack(anchor="w", padx=12, pady=(4, 2))
+        tk.Checkbutton(mid, text="Process debug (step-by-step)",
+                       variable=self._debug_var,
+                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
+                       selectcolor="#3a3a3a", font=("Helvetica", 8)
+                       ).pack(anchor="w", padx=12, pady=(0, 4))
 
         ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
 
@@ -730,6 +949,13 @@ class GraspExecuteApp:
                                    font=("Helvetica", 11, "bold"), relief="flat",
                                    cursor="hand2", bd=0, command=self._on_run)
         self._run_btn.pack(padx=12, pady=2, fill="x", ipady=10)
+
+        self._continue_btn = tk.Button(
+            mid, text="▶  Continue to next step",
+            bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a44e",
+            font=("Helvetica", 10, "bold"), relief="flat", cursor="hand2", bd=0,
+            state="disabled", command=self._on_debug_continue)
+        self._continue_btn.pack(padx=12, pady=(2, 2), fill="x", ipady=8)
 
         tk.Button(mid, text="✕  Clear mask", bg="#3a3a3a", fg="#aaa",
                   activebackground="#444", font=("Helvetica", 9), relief="flat",
@@ -810,15 +1036,53 @@ class GraspExecuteApp:
                  fg="white", insertbackground="white", relief="flat",
                  font=("Helvetica", 9)).pack(side="left")
 
+        row4 = tk.Frame(right, bg="#252525"); row4.pack(fill="x", padx=12, pady=2)
+        tk.Label(row4, text="Num grasps:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
+        self._num_grasps_var = tk.StringVar(value=str(self.args.num_grasps))
+        tk.Entry(row4, textvariable=self._num_grasps_var, width=5, bg="#3a3a3a",
+                 fg="white", insertbackground="white", relief="flat",
+                 font=("Helvetica", 9)).pack(side="left")
+
+        row5 = tk.Frame(right, bg="#252525"); row5.pack(fill="x", padx=12, pady=2)
+        tk.Label(row5, text="Top-K grasps:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
+        self._topk_grasps_var = tk.StringVar(value=str(self.args.topk_num_grasps))
+        tk.Entry(row5, textvariable=self._topk_grasps_var, width=5, bg="#3a3a3a",
+                 fg="white", insertbackground="white", relief="flat",
+                 font=("Helvetica", 9)).pack(side="left")
+
         ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
 
         # Grasp target display
-        tk.Label(right, text="Best Grasp  (Robot Frame)", bg="#252525", fg="#e5c07b",
+        tk.Label(right, text="Selected Grasp  (Robot Frame)", bg="#252525", fg="#e5c07b",
                  font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
         self._grasp_display = tk.Label(right, text="—  run GraspGen first",
                                         bg="#252525", fg="#666",
                                         font=("Courier", 8), wraplength=260, justify="left")
-        self._grasp_display.pack(anchor="w", padx=12, pady=(0,6))
+        self._grasp_display.pack(anchor="w", padx=12, pady=(0,4))
+
+        # Grasp navigation (prev / index label / next)
+        nav_row = tk.Frame(right, bg="#252525")
+        nav_row.pack(fill="x", padx=12, pady=(0, 6))
+        self._prev_grasp_btn = tk.Button(
+            nav_row, text="◀  Prev", width=8,
+            bg="#3a3a3a", fg="#ccc", activebackground="#444",
+            relief="flat", cursor="hand2", bd=0,
+            font=("Helvetica", 9), state="disabled",
+            command=self._on_prev_grasp)
+        self._prev_grasp_btn.pack(side="left")
+        self._grasp_idx_label = tk.Label(
+            nav_row, text="— / —", bg="#252525", fg="#abb2bf",
+            font=("Courier", 9, "bold"))
+        self._grasp_idx_label.pack(side="left", expand=True)
+        self._next_grasp_btn = tk.Button(
+            nav_row, text="Next  ▶", width=8,
+            bg="#3a3a3a", fg="#ccc", activebackground="#444",
+            relief="flat", cursor="hand2", bd=0,
+            font=("Helvetica", 9), state="disabled",
+            command=self._on_next_grasp)
+        self._next_grasp_btn.pack(side="right")
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
 
@@ -827,7 +1091,7 @@ class GraspExecuteApp:
                  font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
 
         self._execute_btn = tk.Button(
-            right, text="🤖  Execute Best Grasp",
+            right, text="🤖  Execute Selected Grasp",
             bg="#c678dd", fg="white", activebackground="#a85dc0",
             relief="flat", cursor="hand2", bd=0,
             font=("Helvetica", 11, "bold"), state="disabled",
@@ -875,6 +1139,126 @@ class GraspExecuteApp:
         self.root.rowconfigure(0, weight=1)
 
     # ------------------------------------------------------------------
+    # Camera connect / disconnect
+    # ------------------------------------------------------------------
+    def _on_camera_connect(self):
+        if self.camera._started:
+            # Disconnect
+            self.camera.stop()
+            self._cam_status_var.set("● No camera")
+            self._cam_status_lbl.config(fg="#e06c75")
+            self._cam_connect_btn.config(text="📷  Connect Camera")
+            self._log("[Camera] Disconnected.")
+        else:
+            # Connect in background (Pipeline() can take a moment)
+            self._cam_connect_btn.config(state="disabled", text="Connecting…")
+            self._cam_status_var.set("● Connecting…")
+            self._cam_status_lbl.config(fg="#e5c07b")
+            threading.Thread(target=self._camera_connect_worker, daemon=True).start()
+
+    def _camera_connect_worker(self):
+        try:
+            self.camera.start()
+            self._log("[Camera] Connected — live stream running.")
+            def _ok():
+                self._cam_status_var.set("● Connected")
+                self._cam_status_lbl.config(fg="#98c379")
+                self._cam_connect_btn.config(state="normal", text="⏏  Disconnect Camera")
+            self._cb_queue.put(_ok)
+        except Exception as e:
+            self._log(f"[Camera] Failed to connect: {e}")
+            def _err():
+                self._cam_status_var.set(f"● Error: {e}")
+                self._cam_status_lbl.config(fg="#e06c75")
+                self._cam_connect_btn.config(state="normal", text="📷  Connect Camera")
+            self._cb_queue.put(_err)
+
+    # ------------------------------------------------------------------
+    # Replay mode
+    # ------------------------------------------------------------------
+    def _on_load_replay(self):
+        from tkinter import filedialog
+        rgb_path = filedialog.askopenfilename(
+            title="Select RGB image",
+            initialdir=str(Path(self.args.calib_file).parent.parent / "rgb"),
+            filetypes=[("PNG images", "*.png"), ("All files", "*.*")])
+        if not rgb_path:
+            return
+        try:
+            rgb = np.array(__import__("PIL").Image.open(rgb_path).convert("RGB"))
+
+            # Auto-detect matching depth_aligned .npy from timestamp in filename
+            import re as _re
+            ts_match = _re.search(r"(\d{8}_\d{6})", rgb_path)
+            depth_m = None
+            if ts_match:
+                ts = ts_match.group(1)
+                data_root = Path(rgb_path).parent.parent
+                for candidate in [
+                    data_root / "depth_aligned" / f"depth_aligned_{ts}.npy",
+                    data_root / "depth"         / f"depth_{ts}.npy",
+                ]:
+                    if candidate.exists():
+                        raw = np.load(str(candidate))          # uint16, mm
+                        depth_m = raw.astype(np.float32) / 1000.0
+                        self._log(f"[Replay] Depth: {candidate.name}")
+                        break
+
+            if depth_m is None:
+                # Manual depth selection
+                depth_path = filedialog.askopenfilename(
+                    title="Select depth .npy (uint16 mm)",
+                    initialdir=str(Path(rgb_path).parent.parent / "depth_aligned"),
+                    filetypes=[("NumPy arrays", "*.npy"), ("All files", "*.*")])
+                if not depth_path:
+                    return
+                raw = np.load(depth_path)
+                depth_m = raw.astype(np.float32) / 1000.0
+
+            # Use calibrated intrinsics if available, else fall back to Gemini 2 defaults
+            if self._calib_K is not None:
+                K = self._calib_K
+                intr = (float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2]))
+            else:
+                h, w = rgb.shape[:2]
+                intr = (684.7, 685.9, w / 2.0, h / 2.0)
+
+            self._replay_frame = (rgb, depth_m, intr)
+            fname = Path(rgb_path).name
+            self._replay_label_var.set(f"REPLAY: {fname}")
+            self._log(f"[Replay] Loaded {fname}  rgb={rgb.shape}  "
+                      f"depth={depth_m.shape} ({depth_m[depth_m>0].mean()*1000:.0f}mm avg)")
+            # Show the replay frame in the preview immediately
+            self._show_replay_in_canvas(rgb)
+        except Exception as e:
+            self._log(f"[Replay] Load error: {e}")
+            import traceback; traceback.print_exc()
+
+    def _on_clear_replay(self):
+        self._replay_frame = None
+        self._replay_label_var.set("")
+        self._last_mask = None
+        if not self.camera._started:
+            self._canvas.itemconfig(self._no_cam_txt, state="normal")
+        self._log("[Replay] Cleared — back to live camera")
+
+    def _show_replay_in_canvas(self, rgb):
+        if not _PIL_OK:
+            return
+        from PIL import Image as _PILImg, ImageTk as _ITk
+        h, w = rgb.shape[:2]
+        scale = min(_PREVIEW_W / w, _PREVIEW_H / h)
+        nw, nh = int(w * scale), int(h * scale)
+        resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        padded = np.zeros((_PREVIEW_H, _PREVIEW_W, 3), dtype=np.uint8)
+        yo, xo = (_PREVIEW_H - nh) // 2, (_PREVIEW_W - nw) // 2
+        padded[yo:yo+nh, xo:xo+nw] = resized
+        tk_img = _ITk.PhotoImage(_PILImg.fromarray(padded))
+        self._canvas.itemconfig(self._canvas_img_id, image=tk_img)
+        self._canvas.itemconfig(self._no_cam_txt, state="hidden")
+        self._canvas._tk_ref = tk_img
+
+    # ------------------------------------------------------------------
     # Preview
     # ------------------------------------------------------------------
     def _schedule_preview(self):
@@ -884,12 +1268,19 @@ class GraspExecuteApp:
     def _update_preview(self):
         if not _PIL_OK:
             return
+        if not self._live_preview.get():
+            return
         rgb, _, _ = self.camera.get_latest()
         if rgb is None:
-            return
+            # No live frame — fall back to replay image so mask overlay still works
+            if self._replay_frame is not None:
+                rgb = self._replay_frame[0]
+            else:
+                return
         self._canvas.itemconfig(self._no_cam_txt, state="hidden")
         if self._status_var.get().startswith("Waiting"):
-            self._status_var.set("Camera ready.")
+            self._status_var.set("Replay mode." if self._replay_frame is not None
+                                 else "Camera ready.")
 
         display = rgb.copy()
         mask = self._last_mask
@@ -1006,6 +1397,22 @@ class GraspExecuteApp:
         self._start_config_load(name)
 
     # ------------------------------------------------------------------
+    # Debug step control
+    # ------------------------------------------------------------------
+    def _debug_pause(self, step_label):
+        """Block the pipeline worker at a debug checkpoint until the user continues."""
+        if not self._debug_var.get():
+            return
+        self._debug_event.clear()
+        self._set_status(f"Debug — {step_label}  ▶ click Continue")
+        self._cb_queue.put(lambda: self._continue_btn.configure(state="normal"))
+        self._debug_event.wait(timeout=600)   # auto-release after 10 min
+        self._cb_queue.put(lambda: self._continue_btn.configure(state="disabled"))
+
+    def _on_debug_continue(self):
+        self._debug_event.set()
+
+    # ------------------------------------------------------------------
     # Run GraspGen pipeline
     # ------------------------------------------------------------------
     def _on_run(self):
@@ -1018,12 +1425,19 @@ class GraspExecuteApp:
         if self._sampler is None:
             self._set_status("No gripper config loaded.")
             return
-        rgb, depth_m, intrinsics = self.camera.get_latest()
+        if self._replay_frame is not None:
+            rgb, depth_m, intrinsics = self._replay_frame
+            self._log(f"[Source] Using saved frame (replay mode)")
+        else:
+            rgb, depth_m, intrinsics = self.camera.get_latest()
         if rgb is None or depth_m is None:
             self._set_status("No camera frame yet.")
             return
         self._inference_running = True
-        self._best_grasp_cam = None
+        self._best_grasp_base = None
+        self._preview_was_on = self._live_preview.get()
+        if not self._debug_var.get():
+            self._live_preview.set(False)  # suppress live refresh during normal run
         self._cb_queue.put(lambda: self._execute_btn.configure(state="disabled"))
         self._run_btn.configure(state="disabled", text="Running…")
         self._set_status("Running pipeline…")
@@ -1050,7 +1464,31 @@ class GraspExecuteApp:
             if mask.sum() < 50:
                 raise RuntimeError(f"Only {mask.sum()} px — try a different prompt")
 
-            fx, fy, cx, cy = intrinsics
+            # ── Debug step 1: SAM3 segmentation ─────────────────────────────
+            # Preview timer picks up _last_mask and shows green overlay on canvas
+            self._debug_pause(f"Step 1/7 — SAM3  ({int(mask.sum())} px masked)")
+            # ────────────────────────────────────────────────────────────────
+
+            # Prefer calibrated intrinsics over SDK defaults
+            if self._calib_K is not None:
+                K = self._calib_K
+                fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+                self._log("[PC] Using calibrated camera intrinsics")
+            else:
+                fx, fy, cx, cy = intrinsics
+                self._log("[PC] Using SDK camera intrinsics")
+
+            # Undistort RGB only — depth must NOT be undistorted with bilinear
+            # interpolation: at object edges cv2.undistort blends foreground and
+            # background depth values, producing interpolated points that project
+            # to 3D positions floating between surfaces (the "flying pixel" halo).
+            dist = getattr(self, '_calib_dist', None)
+            if dist is not None and np.any(dist != 0):
+                K_mat = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], np.float64)
+                rgb = cv2.undistort(rgb, K_mat, dist)
+                self._log("[PC] Applied lens distortion correction (RGB only)")
+
+
             scene_pc, object_pc, scene_colors, object_colors = \
                 depth_and_segmentation_to_point_clouds(
                     depth_image=depth_m, segmentation_mask=mask,
@@ -1061,6 +1499,16 @@ class GraspExecuteApp:
             if len(object_pc) > args.max_object_points:
                 idx = np.random.choice(len(object_pc), args.max_object_points, replace=False)
                 object_pc = object_pc[idx]
+                object_colors = object_colors[idx]
+
+            # ── Debug step 2: raw object point cloud (camera frame) ──────────
+            if self._debug_var.get() and self._vis:
+                self._vis.delete()
+                visualize_pointcloud(self._vis, "pc_raw_cam", object_pc, object_colors,
+                                     size=args.scene_point_size)
+            self._debug_pause(
+                f"Step 2/7 — Raw object cloud  ({len(object_pc)} pts, camera frame)")
+            # ────────────────────────────────────────────────────────────────
 
             pc_torch = torch.from_numpy(object_pc)
             pc_filtered, _ = point_cloud_outlier_removal(pc_torch)
@@ -1068,52 +1516,282 @@ class GraspExecuteApp:
             if len(pc_filtered) == 0:
                 raise RuntimeError("Point cloud empty after outlier removal")
 
-            t_center = tra.translation_matrix(-pc_filtered.mean(axis=0))
-            pc_centered = tra.transform_points(pc_filtered, t_center)
-            scene_centered = tra.transform_points(scene_pc, t_center)
+            # Match colors to the surviving points after outlier removal.
+            # pc_filtered ⊆ object_pc (outlier removal only drops points),
+            # so every filtered point has an exact match in object_pc.
+            # Use cKDTree instead of broadcasting to avoid O(N*M) memory blowup.
+            from scipy.spatial import cKDTree
+            _tree = cKDTree(object_pc)
+            _, nn_idx = _tree.query(pc_filtered, k=1, workers=1)
+            object_colors_filtered = object_colors[nn_idx]
+
+            # ── Debug step 3: before vs after outlier removal (camera frame) ──
+            if self._debug_var.get() and self._vis:
+                # Find which object_pc points were removed as outliers
+                _outlier_mask = np.ones(len(object_pc), dtype=bool)
+                _outlier_mask[nn_idx] = False
+                _outlier_pc = object_pc[_outlier_mask]
+                self._vis.delete()
+                # Kept points in their real colors
+                visualize_pointcloud(self._vis, "pc_kept", pc_filtered,
+                                     object_colors_filtered, size=args.scene_point_size)
+                # Removed outliers in red so the difference is obvious
+                if len(_outlier_pc) > 0:
+                    _red = np.tile([[255, 50, 50]], (len(_outlier_pc), 1)).astype(np.uint8)
+                    visualize_pointcloud(self._vis, "pc_outliers", _outlier_pc, _red,
+                                         size=args.scene_point_size)
+            self._debug_pause(
+                f"Step 3/7 — Outlier removal  "
+                f"({len(pc_filtered)} kept, "
+                f"{len(object_pc)-len(pc_filtered)} removed in red)")
+            # ────────────────────────────────────────────────────────────────
+
+            # ── Transform point clouds from camera frame to robot base
+            #    frame using the FULL T_cam2base (rotation + translation)
+            #    so everything is referenced from the robot base.
+            if self._T_cam2base is not None:
+                T_cam2base_m = self._T_cam2base.copy()
+                T_cam2base_m[:3, 3] /= 1000.0          # mm → m
+            else:
+                T_cam2base_m = np.eye(4)
+            R_cam2base = T_cam2base_m[:3, :3]
+            self._log(f"[GraspGen] Transforming PC to robot base frame "
+                      f"(det(R)={np.linalg.det(R_cam2base):.4f})")
+
+            # Full rigid transform: p_base = R * p_cam + t
+            pc_base = (T_cam2base_m[:3, :3] @ pc_filtered.T).T + T_cam2base_m[:3, 3]
+            scene_base = (T_cam2base_m[:3, :3] @ scene_pc.T).T + T_cam2base_m[:3, 3] \
+                if scene_pc is not None and len(scene_pc) > 0 else scene_pc
+
+            # ── Ensure Z-up for GraspGen ──
+            # Camera forward [0,0,1] in cam frame → "down" in real world
+            # (camera looks down at the table).  In base frame this becomes:
+            cam_down_in_base = R_cam2base @ np.array([0.0, 0.0, 1.0])
+            z_needs_flip = cam_down_in_base[2] > 0   # base Z is DOWN → flip
+            if z_needs_flip:
+                # Rotate 180° around X to flip Y and Z (preserves right-hand rule)
+                R_flip = np.diag([1.0, -1.0, -1.0])
+                pc_base = (R_flip @ pc_base.T).T
+                if scene_base is not None and len(scene_base) > 0:
+                    scene_base = (R_flip @ scene_base.T).T
+                self._log("[GraspGen] Z-axis was pointing down — flipped to Z-up")
+            else:
+                R_flip = np.eye(3)
+                self._log("[GraspGen] Z-axis already points up — no flip needed")
+
+            # Store object centroid in base frame (for un-centering later)
+            obj_centroid_base = pc_base.mean(axis=0)
+            self._log(f"[GraspGen] Object centroid (work frame): "
+                      f"[{obj_centroid_base[0]*1000:.1f}, "
+                      f"{obj_centroid_base[1]*1000:.1f}, "
+                      f"{obj_centroid_base[2]*1000:.1f}] mm")
+            t_center     = tra.translation_matrix(-obj_centroid_base)
+            t_center_inv = tra.translation_matrix(obj_centroid_base)   # inverse = +centroid
+            pc_centered = tra.transform_points(pc_base, t_center)
+            scene_centered = tra.transform_points(scene_base, t_center) \
+                if scene_base is not None and len(scene_base) > 0 \
+                else np.empty((0, 3))
+
+            # Camera position in the (possibly flipped) base frame
+            cam_pos_base = R_flip @ T_cam2base_m[:3, 3]
 
             if self._vis:
                 self._vis.delete()
-                make_frame(self._vis, "world", h=0.12, radius=0.004)
+                # Robot base frame at origin
+                make_frame(self._vis, "robot_base", h=0.15, radius=0.005)
+                # Camera frame
+                cam_frame_4x4 = np.eye(4)
+                cam_frame_4x4[:3, :3] = R_flip @ T_cam2base_m[:3, :3]
+                cam_frame_4x4[:3, 3]  = cam_pos_base
+                self._vis["camera_frame"].set_transform(cam_frame_4x4)
+                make_frame(self._vis["camera_frame"], "axes", h=0.08, radius=0.003)
+                # Object centroid frame
+                obj_frame = np.eye(4)
+                obj_frame[:3, 3] = obj_centroid_base
+                self._vis["object_frame"].set_transform(obj_frame)
+                make_frame(self._vis["object_frame"], "axes", h=0.06, radius=0.003)
+
                 _sc = scene_colors if scene_colors is not None else \
                     np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
-                visualize_pointcloud(self._vis, "pc_scene", scene_centered, _sc,
+                # Show full point cloud in work frame (Z-up)
+                full_pc_base = np.vstack([scene_base, pc_base]) \
+                    if scene_base is not None and len(scene_base) > 0 else pc_base
+                full_colors = np.vstack([_sc, object_colors_filtered]) \
+                    if scene_base is not None and len(scene_base) > 0 \
+                    else object_colors_filtered
+                visualize_pointcloud(self._vis, "pc_full", full_pc_base, full_colors,
                                      size=args.scene_point_size)
-                visualize_pointcloud(self._vis, "pc_obj", pc_centered,
-                                     np.tile([[255,255,255]],(len(pc_centered),1)).astype(np.uint8),
-                                     size=args.object_point_size)
+
+            # ── Debug step 4: point cloud in robot base frame ────────────────
+            self._debug_pause(
+                f"Step 4/7 — Point cloud in robot frame  ({len(pc_filtered)} obj pts, "
+                f"{len(scene_pc) if scene_pc is not None else 0} scene pts)")
+            # ────────────────────────────────────────────────────────────────
 
             self._log("[GraspGen] Running inference…")
             t1 = time.time()
             grasps, grasp_conf = GraspGenSampler.run_inference(
-                pc_filtered, sampler,
+                pc_centered, sampler,
                 grasp_threshold=args.grasp_threshold,
-                num_grasps=args.num_grasps,
-                topk_num_grasps=args.topk_num_grasps)
+                num_grasps=int(self._num_grasps_var.get()),
+                topk_num_grasps=int(self._topk_grasps_var.get()))
             self._log(f"[GraspGen] {time.time()-t1:.2f}s — {len(grasps)} grasps")
 
             if len(grasps) == 0:
                 raise RuntimeError("No grasps found")
 
-            grasps_np = grasps.cpu().numpy()
+            grasps_obj_np = grasps.cpu().numpy()   # object/centered frame
             grasp_conf_np = grasp_conf.cpu().numpy()
 
-            pc_centered, grasps_centered, scores, _ = _process_point_cloud(
-                pc_filtered, grasps_np, grasp_conf_np)
+            # ── Debug step 5: all raw GraspGen poses (work frame) ────────────
+            if self._debug_var.get() and self._vis:
+                _grasps_all_work = np.array([t_center_inv @ g for g in grasps_obj_np])
+                self._vis.delete()
+                visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
+                                     size=args.scene_point_size)
+                _gn = grasp_cfg.data.gripper_name
+                for _i, _g in enumerate(_grasps_all_work):
+                    visualize_grasp(self._vis, f"grasps_all/{_i:03d}/grasp", _g,
+                                    color=[180, 180, 255], gripper_name=_gn, linewidth=0.8)
+            self._debug_pause(
+                f"Step 5/7 — All GraspGen poses  ({len(grasps_obj_np)} raw grasps)")
+            # ────────────────────────────────────────────────────────────────
+
+            # Filter: keep only grasps approaching from above (Z-axis points down)
+            approach_z = np.array([g[2, 2] for g in grasps_obj_np])
+            top_down = approach_z < 0  # approach Z-axis pointing downward = from above
+            if top_down.sum() == 0:
+                self._log("[GraspGen] WARNING: no top-down grasps — keeping all")
+            else:
+                n_before = len(grasps_obj_np)
+                grasps_obj_np = grasps_obj_np[top_down]
+                grasp_conf_np = grasp_conf_np[top_down]
+                self._log(f"[GraspGen] Top-down filter: {n_before} → "
+                          f"{len(grasps_obj_np)} grasps")
+
+            # ── Debug step 6: top-down filtered grasps ───────────────────────
+            if self._debug_var.get() and self._vis:
+                _grasps_td_work = np.array([t_center_inv @ g for g in grasps_obj_np])
+                self._vis.delete()
+                visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
+                                     size=args.scene_point_size)
+                _gn = grasp_cfg.data.gripper_name
+                for _i, _g in enumerate(_grasps_td_work):
+                    visualize_grasp(self._vis, f"grasps_td/{_i:03d}/grasp", _g,
+                                    color=[180, 255, 180], gripper_name=_gn, linewidth=0.8)
+            self._debug_pause(
+                f"Step 6/7 — Top-down filtered  ({len(grasps_obj_np)} grasps)")
+            # ────────────────────────────────────────────────────────────────
+
+            # Un-center: grasps go from centered → work frame (Z-up base)
+            grasps_work_np = np.array([t_center_inv @ g for g in grasps_obj_np])
+
+            # grasps_work_np are in the Z-up "work" frame.
+            # Flip them back to the real robot base frame for motor commands.
+            if z_needs_flip:
+                R_unflip_4x4 = np.eye(4)
+                R_unflip_4x4[:3, :3] = R_flip  # 180° around X is its own inverse
+                grasps_base_np = np.array([R_unflip_4x4 @ g for g in grasps_work_np])
+            else:
+                grasps_base_np = grasps_work_np
+
+            # Visualization uses the Z-up work frame (same as point cloud above)
+            _, grasps_centered, scores, _ = _process_point_cloud(
+                pc_base, grasps_work_np, grasp_conf_np)
+
+            # ── Collision filtering ──────────────────────────────────────────
+            if self._collision_var.get():
+                try:
+                    gripper_info = get_gripper_info(grasp_cfg.data.gripper_name)
+                    scene_col = scene_centered
+                    if scene_col is not None and len(scene_col) > args.max_scene_points:
+                        idx = np.random.choice(len(scene_col), args.max_scene_points,
+                                               replace=False)
+                        scene_col = scene_col[idx]
+                    free_mask = filter_colliding_grasps(
+                        scene_pc=scene_col,
+                        grasp_poses=grasps_centered,
+                        gripper_collision_mesh=gripper_info.collision_mesh,
+                        collision_threshold=args.collision_threshold,
+                    )
+                    # ── Debug step 6b: collision filter result ────────────────
+                    if self._debug_var.get() and self._vis:
+                        self._vis.delete()
+                        visualize_pointcloud(self._vis, "pc_obj", pc_base,
+                                             object_colors_filtered, size=args.scene_point_size)
+                        _gn = grasp_cfg.data.gripper_name
+                        for _i, _g in enumerate(grasps_work_np):
+                            _col = [50, 255, 50] if free_mask[_i] else [255, 50, 50]
+                            visualize_grasp(self._vis, f"grasps_col/{_i:03d}/grasp", _g,
+                                            color=_col, gripper_name=_gn, linewidth=0.8)
+                        self._debug_pause(
+                            f"Step 6b — Collision filter  "
+                            f"({int(free_mask.sum())} free / "
+                            f"{int((~free_mask).sum())} colliding)")
+                    # ─────────────────────────────────────────────────────────
+                    n_before = len(grasps_work_np)
+                    grasps_work_np  = grasps_work_np[free_mask]
+                    grasps_base_np  = grasps_base_np[free_mask]
+                    grasps_centered = grasps_centered[free_mask]
+                    grasp_conf_np   = grasp_conf_np[free_mask]
+                    scores          = scores[free_mask]
+                    self._log(f"[Collision] {n_before} → {free_mask.sum()} "
+                              f"collision-free grasps")
+                    if len(grasps_work_np) == 0:
+                        raise RuntimeError("All grasps filtered by collision check")
+                except Exception as ce:
+                    self._log(f"[Collision] WARNING: {ce}")
+            # ────────────────────────────────────────────────────────────────
+
+            # Sort all grasps by confidence descending and store for retry loop
+            sort_idx = np.argsort(grasp_conf_np.ravel())[::-1]
+            self._all_grasps_base     = grasps_base_np[sort_idx]   # real base frame
+            self._all_grasps_work     = grasps_work_np[sort_idx]   # Z-up for vis
+            self._all_grasps_centered = grasps_centered[sort_idx]
+            self._all_grasp_scores    = scores[sort_idx]
+            self._current_grasp_idx   = 0
 
             if self._vis:
                 gripper_name = grasp_cfg.data.gripper_name
-                for j, g in enumerate(grasps_centered):
-                    visualize_grasp(self._vis, f"grasps/{j:03d}/grasp", g,
-                                    color=scores[j], gripper_name=gripper_name, linewidth=1.2)
+                if self._debug_var.get():
+                    # Rebuild full scene so step 7 looks identical to the normal result
+                    self._vis.delete()
+                    make_frame(self._vis, "robot_base", h=0.15, radius=0.005)
+                    _cf = np.eye(4)
+                    _cf[:3, :3] = R_flip @ T_cam2base_m[:3, :3]
+                    _cf[:3, 3]  = cam_pos_base
+                    self._vis["camera_frame"].set_transform(_cf)
+                    make_frame(self._vis["camera_frame"], "axes", h=0.08, radius=0.003)
+                    _of = np.eye(4); _of[:3, 3] = obj_centroid_base
+                    self._vis["object_frame"].set_transform(_of)
+                    make_frame(self._vis["object_frame"], "axes", h=0.06, radius=0.003)
+                    _sc = scene_colors if scene_colors is not None else \
+                        np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
+                    _fp = np.vstack([scene_base, pc_base]) \
+                        if scene_base is not None and len(scene_base) > 0 else pc_base
+                    _fc = np.vstack([_sc, object_colors_filtered]) \
+                        if scene_base is not None and len(scene_base) > 0 \
+                        else object_colors_filtered
+                    visualize_pointcloud(self._vis, "pc_full", _fp, _fc,
+                                         size=args.scene_point_size)
+                # Visualize grasps in Z-up work frame (matches point cloud)
+                for i, g in enumerate(self._all_grasps_work):
+                    col = [255, 255, 0] if i == 0 else self._all_grasp_scores[i].tolist()
+                    visualize_grasp(self._vis, f"grasps/{i:03d}/grasp", g,
+                                    color=col, gripper_name=gripper_name, linewidth=1.2)
 
-            best_info = _save_best_grasp(grasps_np, grasp_conf_np)
-            best_idx = int(np.argmax(grasp_conf_np.ravel()))
-            self._best_grasp_cam = grasps_np[best_idx].copy()   # camera frame, meters
+            # ── Debug step 7: final sorted grasps ────────────────────────────
+            self._debug_pause(
+                f"Step 7/7 — Final sorted grasps  ({len(self._all_grasps_work)} poses, "
+                f"best conf {float(grasp_conf_np.max()):.3f})")
+            # ────────────────────────────────────────────────────────────────
+
+            best_info = _save_best_grasp(grasps_base_np, grasp_conf_np)
+            self._best_grasp_base = self._all_grasps_base[0].copy()  # robot base frame, meters
 
             conf_min, conf_max = float(grasp_conf_np.min()), float(grasp_conf_np.max())
             best_conf = best_info.get("confidence", 0.0)
-            summary = (f"{len(grasps_np)} grasps [{conf_min:.3f}–{conf_max:.3f}]\n"
+            summary = (f"{len(grasps_base_np)} grasps [{conf_min:.3f}–{conf_max:.3f}]\n"
                        f"Best conf: {best_conf:.4f}")
             self._log("─" * 36)
             self._log(summary)
@@ -1132,29 +1810,82 @@ class GraspExecuteApp:
                 pass
             gc.collect()
             self._inference_running = False
+            if getattr(self, '_preview_was_on', True):
+                self._cb_queue.put(lambda: self._live_preview.set(True))
             self._cb_queue.put(self._restore_run_btn)
 
+    @staticmethod
+    def _grasp_base_to_robot_coords(grasp_4x4_base: np.ndarray) -> tuple:
+        """Extract (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg) from a
+        grasp pose already in robot base frame (meters)."""
+        pos_mm = grasp_4x4_base[:3, 3] * 1000.0
+        R = grasp_4x4_base[:3, :3]
+        if _SCIPY_OK:
+            rz, ry, rx = Rotation.from_matrix(R).as_euler("ZYX", degrees=True)
+        else:
+            rx, ry, rz = 0.0, 0.0, 0.0
+        return float(pos_mm[0]), float(pos_mm[1]), float(pos_mm[2]), \
+               float(rx), float(ry), float(rz)
+
     def _update_grasp_display(self):
-        """Compute robot-frame pose and update the display label."""
-        if self._best_grasp_cam is None or self._T_cam2base is None:
+        """Read robot-frame pose directly and update the display label + nav buttons."""
+        if self._best_grasp_base is None:
             return
+        idx = self._current_grasp_idx
+        total = len(self._all_grasps_base) if self._all_grasps_base is not None else 0
+        conf = float(self._all_grasp_scores[idx].mean()) if self._all_grasp_scores is not None else 0
         try:
-            x, y, z, rx, ry, rz = transform_grasp_to_robot(
-                self._best_grasp_cam, self._T_cam2base)
+            x, y, z, rx, ry, rz = self._grasp_base_to_robot_coords(
+                self._best_grasp_base)
             txt = (f"X  = {x:+8.1f} mm\n"
                    f"Y  = {y:+8.1f} mm\n"
                    f"Z  = {z:+8.1f} mm\n"
                    f"Rx = {rx:+7.2f} °\n"
                    f"Ry = {ry:+7.2f} °\n"
                    f"Rz = {rz:+7.2f} °")
-            self._log(f"[Transform] Robot frame: X={x:.1f} Y={y:.1f} Z={z:.1f} mm  "
-                      f"Rx={rx:.1f} Ry={ry:.1f} Rz={rz:.1f} deg")
-            self._cb_queue.put(lambda t=txt: (
-                self._grasp_display.config(text=t, fg="#98c379"),
+            # Approach direction = Z-axis of the grasp rotation matrix
+            approach = self._best_grasp_base[:3, 2]  # 3rd column = local Z
+            self._log(f"[Grasp {idx+1}/{total}] Robot frame: "
+                      f"X={x:.1f} Y={y:.1f} Z={z:.1f} mm  "
+                      f"Rx={rx:.1f} Ry={ry:.1f} Rz={rz:.1f} deg  "
+                      f"approach=[{approach[0]:+.2f},{approach[1]:+.2f},{approach[2]:+.2f}]")
+            def _ui_update(t=txt, i=idx, n=total):
+                self._grasp_display.config(text=t, fg="#98c379")
+                self._grasp_idx_label.config(text=f"{i+1} / {n}")
                 self._execute_btn.configure(
-                    state="normal" if self._robot_connected else "disabled")))
+                    state="normal" if self._robot_connected else "disabled")
+                self._prev_grasp_btn.config(
+                    state="normal" if i > 0 else "disabled")
+                self._next_grasp_btn.config(
+                    state="normal" if i < n - 1 else "disabled")
+            self._cb_queue.put(_ui_update)
         except Exception as e:
             self._log(f"[Transform] ERROR: {e}")
+
+    def _select_grasp(self, idx: int):
+        """Switch to grasp at index idx, update Meshcat highlight and display."""
+        if self._all_grasps_base is None or idx < 0:
+            return
+        total = len(self._all_grasps_base)
+        if idx >= total:
+            return
+        # Un-highlight previous, highlight new
+        prev_idx = self._current_grasp_idx
+        if prev_idx != idx:
+            self._highlight_grasp(prev_idx,
+                                  self._all_grasp_scores[prev_idx].tolist()
+                                  if self._all_grasp_scores is not None
+                                  else [128, 128, 128])
+        self._highlight_grasp(idx, [255, 255, 0])
+        self._current_grasp_idx = idx
+        self._best_grasp_base = self._all_grasps_base[idx].copy()
+        self._update_grasp_display()
+
+    def _on_prev_grasp(self):
+        self._select_grasp(self._current_grasp_idx - 1)
+
+    def _on_next_grasp(self):
+        self._select_grasp(self._current_grasp_idx + 1)
 
     # ------------------------------------------------------------------
     # Robot connection
@@ -1216,27 +1947,37 @@ class GraspExecuteApp:
         self._vac_on_btn.config(state="normal")
         self._vac_off_btn.config(state="normal")
         # Enable execute only if we already have a grasp
-        if self._best_grasp_cam is not None and self._T_cam2base is not None:
+        if self._best_grasp_base is not None:
             self._execute_btn.config(state="normal")
 
     # ------------------------------------------------------------------
     # Execute grasp
     # ------------------------------------------------------------------
+    def _highlight_grasp(self, idx: int, color):
+        """Repaint a single grasp in meshcat.  Safe to call from any thread."""
+        work = getattr(self, '_all_grasps_work', None)
+        if self._vis is None or work is None:
+            return
+        if idx < 0 or idx >= len(work):
+            return
+        try:
+            gripper_name = self._grasp_cfg.data.gripper_name
+            visualize_grasp(self._vis, f"grasps/{idx:03d}/grasp",
+                            work[idx],
+                            color=color, gripper_name=gripper_name, linewidth=1.2)
+        except Exception:
+            pass
+
     def _on_execute(self):
         if not self._robot_connected or self._executing:
             return
-        if self._best_grasp_cam is None:
+        if self._best_grasp_base is None:
             messagebox.showwarning("No grasp", "Run GraspGen first.")
-            return
-        if self._T_cam2base is None:
-            messagebox.showerror("No calibration",
-                                  "Hand-eye calibration not loaded.\n"
-                                  "Run hand_eye_calibration.py first.")
             return
 
         try:
-            x, y, z, rx, ry, rz = transform_grasp_to_robot(
-                self._best_grasp_cam, self._T_cam2base)
+            x, y, z, rx, ry, rz = self._grasp_base_to_robot_coords(
+                self._best_grasp_base)
         except Exception as e:
             messagebox.showerror("Transform error", str(e)); return
 
@@ -1438,17 +2179,22 @@ def main():
     except Exception as e:
         print(f"[Meshcat] Not available: {e}")
 
-    # Camera
+    # Camera — optional, can connect later via the UI button
     print("[Camera] Starting Orbbec pipeline…")
     camera = OrbbecCamera()
-    camera.start()
-    print("[Camera] Live stream running.")
+    try:
+        camera.start()
+        print("[Camera] Live stream running.")
+    except Exception as e:
+        print(f"[Camera] No device found ({e}) — starting without camera. "
+              f"Use '📷 Connect Camera' in the UI once the device is attached.")
 
     root = tk.Tk()
-    GraspExecuteApp(root, args, camera, config_map, sam3_proc=sam3_proc, vis=vis)
+    app_ref = [GraspExecuteApp(root, args, camera, config_map, sam3_proc=sam3_proc, vis=vis)]
 
     def _on_close():
         print("Shutting down…")
+        app_ref[0]._debug_event.set()   # unblock any waiting debug pause
         camera.stop()
         if sam3_proc:
             try:

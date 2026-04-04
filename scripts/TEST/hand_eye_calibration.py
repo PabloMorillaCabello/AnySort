@@ -30,6 +30,11 @@ from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# Redirect OrbbecSDK C-level stderr to file — prevents timestamp-anomaly spam
+# from flooding the terminal. Full log available at /tmp/orbbec_sdk.log
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import orbbec_quiet  # noqa: E402
+
 import cv2
 import numpy as np
 import tkinter as tk
@@ -60,6 +65,7 @@ except ImportError:
 ROBOT_IP_DEFAULT = "192.168.5.1"
 ROBOT_PORT       = 29999
 OUTPUT_DIR       = Path("/ros2_ws/data/calibration")
+SAVED_POSES_FILE = OUTPUT_DIR / "auto_calib_poses.json"
 MOVE_SPEED       = 15
 SETTLE_TIME      = 2.5
 MIN_CORNERS      = 6
@@ -70,22 +76,46 @@ _DEFAULT_FX, _DEFAULT_FY = 905.0, 905.0
 _DEFAULT_CX, _DEFAULT_CY = 640.0, 360.0
 
 # Pre-programmed calibration poses  [X_mm, Y_mm, Z_mm, Rx_deg, Ry_deg, Rz_deg]
+#
+# Design rules for good rotation accuracy:
+#   1. Board must appear at DIFFERENT places in the camera image → vary X, Y, Z
+#   2. Rotation axes each need ≥ 45° total spread → large Rx/Rz range, Ry 0–45°
+#   3. Avoid clustering many poses at the same position with only small angle changes
+#
+# !! BEFORE RUNNING: verify poses 1–4 in manual mode to confirm the board is
+#    visible in the camera at each position, then run auto mode. !!
 CALIB_POSES = [
-    [300, -100, 400,   0,  30,   0],
-    [300, -100, 400,  20,  30,   0],
-    [300, -100, 400, -20,  30,   0],
-    [300, -100, 400,   0,  15,   0],
-    [300, -100, 400,   0,  45,   0],
-    [300, -100, 400,   0,  30,  20],
-    [300, -100, 400,   0,  30, -20],
-    [250, -150, 380,  10,  30,  10],
-    [350,  -50, 420, -10,  30, -10],
-    [280, -100, 350,  15,  25,   5],
-    [320, -100, 450, -15,  35,  -5],
-    [300, -120, 400,   5,  30,  15],
-    [300,  -80, 400,  -5,  30, -15],
-    [270, -110, 395,  10,  20,   0],
-    [330,  -90, 405, -10,  40,   0],
+    # ── Centre — sweep each rotation axis independently (big range) ──────
+    [300, -100, 400,   0,   0,   0],   # neutral: board flat facing camera
+    [300, -100, 400,  40,   0,   0],   # Rx +40
+    [300, -100, 400, -40,   0,   0],   # Rx -40
+    [300, -100, 400,   0,  40,   0],   # Ry +40 (tilt forward)
+    [300, -100, 400,   0,   0,  45],   # Rz +45
+    [300, -100, 400,   0,   0, -45],   # Rz -45
+    # ── Centre — combined / diagonal rotations ───────────────────────────
+    [300, -100, 400,  30,  20,  30],
+    [300, -100, 400, -30,  20, -30],
+    [300, -100, 400,  30,  20, -30],
+    [300, -100, 400, -30,  20,  30],
+    # ── Different XY — board at different corners of the camera FOV ──────
+    [210, -200, 390,   0,  20,   0],   # far left / back
+    [390, -200, 390,   0,  20,   0],   # far right / back
+    [210,  -20, 390,   0,  20,   0],   # far left / front
+    [390,  -20, 390,   0,  20,   0],   # far right / front
+    # ── Different XY with rotations ──────────────────────────────────────
+    [220, -190, 380,  25,  25,  25],
+    [380, -190, 380, -25,  25, -25],
+    [220,  -30, 380,  25,  25, -25],
+    [380,  -30, 380, -25,  25,  25],
+    # ── Z variation (different camera distances) ─────────────────────────
+    [300, -100, 320,   0,  15,   0],   # closer
+    [300, -100, 320,  30,  15,  30],
+    [300, -100, 480,   0,  15,   0],   # further
+    [300, -100, 480, -30,  15, -30],
+    # ── Extreme rotations — needed to break rotation degeneracy ──────────
+    [300, -100, 400,  40,   5,  40],
+    [300, -100, 400, -40,   5, -40],
+    [300, -100, 400,   0,  45,  45],
 ]
 
 # ===========================================================================
@@ -128,7 +158,7 @@ class OrbbecCamera:
         cfg.enable_stream(color_profile)
         pipeline.start(cfg)
         self._pipeline = pipeline
-        # Read intrinsics
+        # Read intrinsics from SDK
         try:
             cp = pipeline.get_camera_param()
             for attr in ("rgb_intrinsic", "color_intrinsic"):
@@ -170,7 +200,23 @@ class OrbbecCamera:
             return None if self._latest_rgb is None else self._latest_rgb.copy()
 
     def intrinsics(self) -> Tuple[np.ndarray, np.ndarray]:
-        return self._K, np.zeros((5,), np.float64)
+        # Try to load distortion from camera_calibration.py output
+        calib_file = Path("/ros2_ws/data/calibration/camera_intrinsics.npz")
+        if calib_file.exists():
+            try:
+                data = np.load(str(calib_file))
+                d = data["dist_coeffs"].ravel().astype(np.float64)
+                # Also use calibrated K if image size matches
+                sz = tuple(data["image_size"].astype(int)) if "image_size" in data else None
+                if sz is not None and self._K is not None:
+                    # Check resolution match (within 10px tolerance)
+                    cx_ok = abs(data["camera_matrix"][0, 2] - self._K[0, 2]) < 50
+                    if cx_ok:
+                        return data["camera_matrix"].astype(np.float64), d
+                return self._K, d
+            except Exception:
+                pass
+        return self._K, np.zeros(5, np.float64)
 
     def stop(self):
         self._running = False
@@ -260,6 +306,10 @@ class DobotDashboard:
         self._speed = max(1, min(100, int(p)))
         return self._dashboard.SpeedFactor(self._speed)
 
+    def set_tool(self, index: int):
+        """Select active tool TCP by index (0 = base flange, 1+ = user-defined tools)."""
+        return self._dashboard.Tool(index)
+
     # ------------------------------------------------------------------
     # Position getter
     # ------------------------------------------------------------------
@@ -275,22 +325,56 @@ class DobotDashboard:
             return tuple(nums[:6])
         raise ValueError(f"Cannot parse pose — raw response: {resp!r}")
 
+    def get_angle(self) -> tuple:
+        """Returns (J1, J2, J3, J4, J5, J6) in degrees."""
+        resp = self._dashboard.GetAngle()
+        nums = self._nums(resp)
+        if len(nums) >= 7:
+            return tuple(nums[1:7])
+        if len(nums) >= 6:
+            return tuple(nums[:6])
+        raise ValueError(f"Cannot parse angles — raw response: {resp!r}")
+
     # ------------------------------------------------------------------
     # Motion  (returns CommandID)
     # ------------------------------------------------------------------
     def _send_motion(self, resp):
+        # DobotApiDashboard methods may return None or b'' if the response
+        # wasn't read yet.  Try reading once more via wait_reply().
+        if resp is None or resp == b'' or resp == '':
+            try:
+                resp = self._dashboard.wait_reply()
+            except Exception:
+                pass
         parsed = _parse_result_id(resp)
         if len(parsed) < 2 or parsed[0] != 0:
             raise RuntimeError(f"Move rejected (ErrorID={parsed[0] if parsed else '?'}): {resp!r}")
         return parsed[1]
 
+    def _send_raw(self, cmd: str) -> str:
+        """Send a raw command string and read the response.
+
+        DobotApiDashboard.send_data() only sends (returns None).
+        The response must be read separately via wait_reply().
+        """
+        self._dashboard.send_data(cmd)
+        return self._dashboard.wait_reply()
+
     def move_joint(self, x, y, z, rx, ry, rz):
-        """Move to Cartesian pose using joint-space motion (MovJ, coordinateMode=0)."""
+        """Move to Cartesian pose using joint-space motion."""
         resp = self._dashboard.MovJ(
             x, y, z, rx, ry, rz,
-            0,               # coordinateMode=0 → Cartesian pose
-            a=self._speed,
-            v=self._speed
+            0,                  # coordinateMode=0 → Cartesian
+            a=self._speed, v=self._speed
+        )
+        return self._send_motion(resp)
+
+    def move_joint_angles(self, j1, j2, j3, j4, j5, j6):
+        """Move to joint-angle target (coordinateMode=1, no IK)."""
+        resp = self._dashboard.MovJ(
+            j1, j2, j3, j4, j5, j6,
+            1,
+            a=self._speed, v=self._speed
         )
         return self._send_motion(resp)
 
@@ -299,12 +383,21 @@ class DobotDashboard:
     # ------------------------------------------------------------------
     def wait_motion(self, cmd_id, timeout=90.0):
         """Block until the robot finishes cmd_id."""
+        # Wait up to 3s for the feedback thread to get its first packet
+        # (self._cmd_id starts at -1; -1 > cmd_id is always False)
+        fb_wait = time.time() + 3.0
+        while time.time() < fb_wait:
+            with self._lock:
+                if self._cmd_id >= 0:
+                    break
+            time.sleep(0.05)
+
         t0 = time.time()
         while time.time() - t0 < timeout:
             with self._lock:
                 mode   = self._mode
                 cur_id = self._cmd_id
-            if cur_id > cmd_id or (mode == self.MODE_ENABLED and cur_id == cmd_id):
+            if cur_id >= cmd_id and mode != self.MODE_RUNNING:
                 return True
             if mode == self.MODE_ERROR:
                 raise RuntimeError("Robot entered error state during motion")
@@ -322,6 +415,12 @@ class DobotDashboard:
                 return True
             time.sleep(0.15)
         return False
+
+    def vacuum_on(self, port: int = 1):
+        return self._dashboard.ToolDO(port, 1)
+
+    def vacuum_off(self, port: int = 1):
+        return self._dashboard.ToolDO(port, 0)
 
     def close(self):
         self._feed_running = False
@@ -431,13 +530,44 @@ def euler_zyx_to_rmat(rx, ry, rz):
     return Rz @ Ry @ Rx
 
 
+def _handeye_residual(R_c2b, t_c2b, R_b2g, t_b2g, R_t2c, t_t2c):
+    """
+    Consistency residual for eye-to-hand: for a perfect calibration,
+    T_gripper2base_i^-1 @ T_cam2base @ T_target2cam_i = T_target2gripper (constant).
+    Returns (rms_rotation_deg, rms_translation_mm).
+    """
+    def T4(R, t):
+        M = np.eye(4); M[:3, :3] = R; M[:3, 3] = np.asarray(t).ravel(); return M
+
+    TX = T4(R_c2b, t_c2b)
+    Ms = []
+    for i in range(len(R_b2g)):
+        # R_b2g[i] IS already T_base2gripper (FK was inverted in solve_hand_eye).
+        # Eye-to-hand constraint: T_base2gripper @ T_cam2base @ T_target2cam = constant
+        T_b2g = T4(R_b2g[i], t_b2g[i])
+        T_t2c = T4(R_t2c[i], t_t2c[i])
+        Ms.append(T_b2g @ TX @ T_t2c)
+
+    ts = np.array([M[:3, 3] for M in Ms])
+    t_rms = float(np.sqrt(np.mean(np.linalg.norm(ts - ts.mean(axis=0), axis=1) ** 2)))
+
+    R_ref = Ms[0][:3, :3]
+    rot_errs = []
+    for M in Ms:
+        cos_a = np.clip((np.trace(R_ref.T @ M[:3, :3]) - 1) / 2, -1.0, 1.0)
+        rot_errs.append(np.degrees(np.arccos(cos_a)))
+    r_rms = float(np.sqrt(np.mean(np.array(rot_errs) ** 2)))
+
+    return r_rms, t_rms
+
+
 def solve_hand_eye(robot_poses: list, board_poses: list) -> dict:
     n = len(robot_poses)
     R_b2g, t_b2g, R_t2c, t_t2c = [], [], [], []
     for (x, y, z, rx, ry, rz) in robot_poses:
         R = euler_zyx_to_rmat(rx, ry, rz)
         t = np.array([[x],[y],[z]], np.float64)
-        Ri, ti = R.T, -R.T @ t
+        Ri, ti = R.T, -R.T @ t          # eye-to-hand: invert FK → T_base2gripper
         R_b2g.append(Ri); t_b2g.append(ti)
     for (rvec, tvec) in board_poses:
         Rv, _ = cv2.Rodrigues(rvec.reshape(3,1))
@@ -452,20 +582,27 @@ def solve_hand_eye(robot_poses: list, board_poses: list) -> dict:
         "DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
     }
     results = {}
+    residuals = {}
     for name, flag in methods.items():
         try:
             R_c2b, t_c2b = cv2.calibrateHandEye(R_b2g, t_b2g, R_t2c, t_t2c, method=flag)
+            r_rms, t_rms = _handeye_residual(R_c2b, t_c2b, R_b2g, t_b2g, R_t2c, t_t2c)
             results[name] = (R_c2b, t_c2b)
-        except Exception as e:
+            residuals[name] = (r_rms, t_rms)
+        except Exception:
             results[name] = None
+            residuals[name] = (float("inf"), float("inf"))
 
-    primary = next((k for k in ("TSAI","PARK","HORAUD","ANDREFF","DANIILIDIS")
-                    if results.get(k) is not None), None)
-    if primary is None:
+    # Pick method with lowest translation residual (most reliable metric in mm space)
+    valid = [(k, residuals[k][1]) for k in results if results[k] is not None]
+    if not valid:
         raise RuntimeError("All hand-eye methods failed.")
+    primary = min(valid, key=lambda x: x[1])[0]
+
     R_c2b, t_c2b = results[primary]
     T = np.eye(4); T[:3,:3] = R_c2b; T[:3,3] = t_c2b.ravel()
-    return {"T": T, "R": R_c2b, "t": t_c2b, "primary": primary, "all": results}
+    return {"T": T, "R": R_c2b, "t": t_c2b, "primary": primary,
+            "all": results, "residuals": residuals}
 
 
 def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
@@ -514,23 +651,28 @@ class HandEyeCalibApp:
         # Data
         self._robot_poses: list = []
         self._board_poses: list = []
+        self._guide_idx: int = 0   # tracks which CALIB_POSES target to show next
+        self._goto_chaining = False  # True while stepping through poses automatically
         self._state = self.IDLE
         self._board = None
         self._aruco_dict = None
         self._detector = None
         self._camera: Optional[OrbbecCamera] = None
         self._robot: Optional[DobotDashboard] = None
+        self._robot_connected = False
         self._K = np.array([[_DEFAULT_FX,0,_DEFAULT_CX],[0,_DEFAULT_FY,_DEFAULT_CY],[0,0,1]], np.float64)
         self._d = np.zeros((5,), np.float64)
         self._last_det_result = (None, None, None, 0)  # rvec, tvec, bgr, n
         self._auto_thread: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
+        self._auto_poses: List[List[float]] = []   # user-saved positions for auto mode
 
         self._cb_queue: queue.Queue = queue.Queue()
         self._log_queue: queue.Queue = queue.Queue()
 
         self._build_ui()
         self._rebuild_board()
+        self._load_auto_poses()
         self._start_camera()
         self._schedule_preview()
         self._schedule_flush()
@@ -543,7 +685,7 @@ class HandEyeCalibApp:
         self.root.configure(bg="#1e1e1e")
         self.root.resizable(False, False)
 
-        # Left: camera preview
+        # ── Column 0: camera preview ──────────────────────────────────
         left = tk.Frame(self.root, bg="#1e1e1e")
         left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
 
@@ -559,22 +701,22 @@ class HandEyeCalibApp:
                                      bg="#1e1e1e", fg="#666", font=("Courier", 9))
         self._det_status.pack(anchor="w", padx=4, pady=(4,0))
 
-        # Right: controls
-        right = tk.Frame(self.root, bg="#2d2d2d", width=360)
-        right.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=8)
-        right.grid_propagate(False)
+        # ── Column 1: Board setup + Auto-Mode Positions ───────────────
+        mid = tk.Frame(self.root, bg="#2d2d2d", width=300)
+        mid.grid(row=0, column=1, sticky="nsew", padx=(4,2), pady=8)
+        mid.grid_propagate(False)
 
-        tk.Label(right, text="Hand-Eye Calibration", bg="#2d2d2d", fg="#61afef",
-                 font=("Helvetica", 15, "bold")).pack(pady=(14,0))
-        tk.Label(right, text="Eye-to-Hand  |  Orbbec Gemini 2  +  Dobot CR",
+        tk.Label(mid, text="Hand-Eye Calibration", bg="#2d2d2d", fg="#61afef",
+                 font=("Helvetica", 13, "bold")).pack(pady=(14,0))
+        tk.Label(mid, text="Eye-to-Hand  |  Orbbec Gemini 2  +  Dobot CR",
                  bg="#2d2d2d", fg="#555", font=("Helvetica", 8)).pack(pady=(0,8))
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
+        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=2)
 
         # --- Board Parameters ---
-        self._section(right, "ChArUco Board Parameters")
+        self._section(mid, "ChArUco Board Parameters")
 
-        row1 = tk.Frame(right, bg="#2d2d2d"); row1.pack(fill="x", padx=12, pady=2)
+        row1 = tk.Frame(mid, bg="#2d2d2d"); row1.pack(fill="x", padx=12, pady=2)
         tk.Label(row1, text="Squares X:", bg="#2d2d2d", fg="#ccc",
                  font=("Helvetica", 9), width=11, anchor="w").pack(side="left")
         self._sq_x_var = tk.StringVar(value="5")
@@ -588,7 +730,7 @@ class HandEyeCalibApp:
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left")
 
-        row2 = tk.Frame(right, bg="#2d2d2d"); row2.pack(fill="x", padx=12, pady=2)
+        row2 = tk.Frame(mid, bg="#2d2d2d"); row2.pack(fill="x", padx=12, pady=2)
         tk.Label(row2, text="Square (m):", bg="#2d2d2d", fg="#ccc",
                  font=("Helvetica", 9), width=11, anchor="w").pack(side="left")
         self._sq_len_var = tk.StringVar(value="0.030")
@@ -602,46 +744,131 @@ class HandEyeCalibApp:
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left")
 
-        tk.Button(right, text="♟  Apply Parameters & Update Board",
+        tk.Button(mid, text="♟  Apply Parameters & Update Board",
                   bg="#3a3a3a", fg="#ccc", activebackground="#444",
                   relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
                   command=self._on_apply_params).pack(padx=12, pady=(4,2), fill="x", ipady=4)
 
-        tk.Button(right, text="🖨  Generate & Save Board Image",
+        self._board_active_lbl = tk.Label(
+            mid, text="Active: sq=3.0cm  mk=2.2cm",
+            bg="#2d2d2d", fg="#e5c07b", font=("Courier", 8), anchor="w")
+        self._board_active_lbl.pack(anchor="w", padx=14, pady=(0,2))
+
+        tk.Button(mid, text="🖨  Generate & Save Board Image",
                   bg="#3a3a3a", fg="#abb2bf", activebackground="#444",
                   relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
                   command=self._on_generate_board).pack(padx=12, pady=(2,4), fill="x", ipady=4)
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
+        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
+
+        # --- Auto-Mode Positions ---
+        self._section(mid, "Auto-Mode Positions")
+
+        poses_hdr = tk.Frame(mid, bg="#2d2d2d"); poses_hdr.pack(fill="x", padx=12, pady=(0,2))
+        self._poses_count_lbl = tk.Label(
+            poses_hdr, text="0 saved  (will use built-in 15 poses)",
+            bg="#2d2d2d", fg="#666", font=("Helvetica", 8), anchor="w")
+        self._poses_count_lbl.pack(side="left", fill="x", expand=True)
+
+        lb_frame = tk.Frame(mid, bg="#2d2d2d"); lb_frame.pack(fill="x", padx=12, pady=(0,4))
+        lb_scroll = tk.Scrollbar(lb_frame, orient="vertical")
+        self._poses_listbox = tk.Listbox(
+            lb_frame, height=6, yscrollcommand=lb_scroll.set,
+            bg="#1e1e1e", fg="#abb2bf", font=("Courier", 7),
+            selectbackground="#3a3a3a", selectforeground="white",
+            relief="flat", activestyle="none", exportselection=False)
+        lb_scroll.config(command=self._poses_listbox.yview)
+        self._poses_listbox.pack(side="left", fill="x", expand=True)
+        lb_scroll.pack(side="right", fill="y")
+
+        poses_btns = tk.Frame(mid, bg="#2d2d2d"); poses_btns.pack(fill="x", padx=12, pady=(0,4))
+        self._save_pose_btn = tk.Button(
+            poses_btns, text="📌 Save Robot Position",
+            bg="#98c379", fg="#1e1e1e", activebackground="#7aad5b",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8, "bold"),
+            command=self._on_save_auto_pose)
+        self._save_pose_btn.pack(side="left", fill="x", expand=True, ipady=4, padx=(0,2))
+        tk.Button(
+            poses_btns, text="✕ Remove",
+            bg="#3a3a3a", fg="#e06c75", activebackground="#444",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+            command=self._on_remove_auto_pose).pack(side="left", ipady=4, padx=(0,2))
+        tk.Button(
+            poses_btns, text="Clear All",
+            bg="#3a3a3a", fg="#aaa", activebackground="#444",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+            command=self._on_clear_saved_poses).pack(side="left", ipady=4)
+
+        # ── Column 2: Robot + Vacuum + Calibration + Log ─────────────
+        right = tk.Frame(self.root, bg="#252525", width=300)
+        right.grid(row=0, column=2, sticky="nsew", padx=(2,8), pady=8)
+        right.grid_propagate(False)
 
         # --- Robot ---
         self._section(right, "Robot")
-        row3 = tk.Frame(right, bg="#2d2d2d"); row3.pack(fill="x", padx=12, pady=2)
-        tk.Label(row3, text="IP:", bg="#2d2d2d", fg="#ccc",
+        row3 = tk.Frame(right, bg="#252525"); row3.pack(fill="x", padx=12, pady=2)
+        tk.Label(row3, text="IP:", bg="#252525", fg="#ccc",
                  font=("Helvetica", 9), width=7, anchor="w").pack(side="left")
         self._robot_ip_var = tk.StringVar(value=self.robot_ip)
-        tk.Entry(row3, textvariable=self._robot_ip_var, width=16,
+        tk.Entry(row3, textvariable=self._robot_ip_var, width=15,
                  bg="#3a3a3a", fg="white", insertbackground="white",
-                 relief="flat", font=("Helvetica", 9)).pack(side="left", padx=(0,10))
-        tk.Label(row3, text="Speed %:", bg="#2d2d2d", fg="#ccc",
+                 relief="flat", font=("Helvetica", 9)).pack(side="left", padx=(0,8))
+        tk.Label(row3, text="Spd%:", bg="#252525", fg="#ccc",
                  font=("Helvetica", 9)).pack(side="left")
         self._speed_var = tk.StringVar(value=str(MOVE_SPEED))
         tk.Entry(row3, textvariable=self._speed_var, width=4,
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left")
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
+        row3b = tk.Frame(right, bg="#252525"); row3b.pack(fill="x", padx=12, pady=2)
+        tk.Label(row3b, text="Tool TCP:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=7, anchor="w").pack(side="left")
+        self._tool_idx_var = tk.StringVar(value="1")
+        tk.Entry(row3b, textvariable=self._tool_idx_var, width=4,
+                 bg="#3a3a3a", fg="white", insertbackground="white",
+                 relief="flat", font=("Helvetica", 9)).pack(side="left")
+        tk.Label(row3b, text="(0=flange  1=vacuum)",
+                 bg="#252525", fg="#555", font=("Helvetica", 8)).pack(side="left", padx=(6,0))
+
+        self._connect_btn = tk.Button(
+            right, text="⚡  Connect Robot",
+            bg="#4a5568", fg="white", activebackground="#5a6578",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+            command=self._on_connect)
+        self._connect_btn.pack(padx=12, pady=(6,2), fill="x", ipady=5)
+
+        self._robot_status = tk.Label(
+            right, text="● Disconnected",
+            bg="#252525", fg="#e06c75", font=("Courier", 9))
+        self._robot_status.pack(anchor="w", padx=12, pady=(0,4))
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
+
+        # Vacuum buttons
+        vac_row = tk.Frame(right, bg="#252525"); vac_row.pack(fill="x", padx=12, pady=(4,2))
+        tk.Label(vac_row, text="Vacuum DO1:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=10, anchor="w").pack(side="left")
+        tk.Button(vac_row, text="ON",
+                  bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a55f",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9, "bold"),
+                  width=5, command=self._on_vacuum_on).pack(side="left", padx=(0,4), ipady=3)
+        tk.Button(vac_row, text="OFF",
+                  bg="#3a3a3a", fg="#ccc", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+                  width=5, command=self._on_vacuum_off).pack(side="left", ipady=3)
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=6)
 
         # --- Calibration ---
         self._section(right, "Calibration")
 
         self._mode_var = tk.StringVar(value="auto")
-        modes = tk.Frame(right, bg="#2d2d2d"); modes.pack(fill="x", padx=12, pady=(2,6))
+        modes = tk.Frame(right, bg="#252525"); modes.pack(fill="x", padx=12, pady=(2,6))
         for val, lbl in [("auto","Auto (robot moves)"), ("manual","Manual (I move robot)")]:
             tk.Radiobutton(modes, text=lbl, variable=self._mode_var, value=val,
-                           bg="#2d2d2d", fg="#ccc", selectcolor="#2d2d2d",
-                           activebackground="#2d2d2d", font=("Helvetica", 9),
-                           command=self._on_mode_change).pack(side="left", padx=(0,12))
+                           bg="#252525", fg="#ccc", selectcolor="#252525",
+                           activebackground="#252525", font=("Helvetica", 9),
+                           command=self._on_mode_change).pack(side="left", padx=(0,8))
 
         self._detect_btn = tk.Button(
             right, text="👁  Start Live Detection",
@@ -664,6 +891,23 @@ class HandEyeCalibApp:
             command=self._on_capture_manual, state="disabled")
         self._capture_btn.pack(padx=12, pady=2, fill="x", ipady=8)
 
+        # Guided pose target display (manual mode only)
+        self._guide_frame = tk.Frame(right, bg="#2a2a3a", relief="flat")
+        self._guide_frame.pack(padx=12, pady=(0, 4), fill="x")
+        tk.Label(self._guide_frame, text="Next target pose →",
+                 bg="#2a2a3a", fg="#e5c07b", font=("Helvetica", 8, "bold")
+                 ).pack(anchor="w", padx=6, pady=(4, 0))
+        self._guide_var = tk.StringVar(value="—")
+        tk.Label(self._guide_frame, textvariable=self._guide_var,
+                 bg="#2a2a3a", fg="#61afef", font=("Courier", 9),
+                 justify="left", anchor="w"
+                 ).pack(anchor="w", padx=6, pady=(0, 2))
+        self._goto_btn = tk.Button(
+            self._guide_frame, text="🤖  Send robot to this pose",
+            bg="#4a5568", fg="white", relief="flat", font=("Helvetica", 9),
+            command=self._on_goto_target)
+        self._goto_btn.pack(fill="x", padx=6, pady=(0, 6), ipady=4)
+
         self._stop_btn = tk.Button(
             right, text="■  Stop",
             bg="#e06c75", fg="white", activebackground="#c0505a",
@@ -672,11 +916,11 @@ class HandEyeCalibApp:
         self._stop_btn.pack(padx=12, pady=2, fill="x", ipady=5)
 
         # Progress
-        prog_row = tk.Frame(right, bg="#2d2d2d"); prog_row.pack(fill="x", padx=12, pady=(6,2))
-        tk.Label(prog_row, text="Poses:", bg="#2d2d2d", fg="#666",
+        prog_row = tk.Frame(right, bg="#252525"); prog_row.pack(fill="x", padx=12, pady=(6,2))
+        tk.Label(prog_row, text="Poses:", bg="#252525", fg="#666",
                  font=("Helvetica", 9)).pack(side="left")
         self._progress_var = tk.StringVar(value="0 / 0")
-        tk.Label(prog_row, textvariable=self._progress_var, bg="#2d2d2d", fg="#98c379",
+        tk.Label(prog_row, textvariable=self._progress_var, bg="#252525", fg="#98c379",
                  font=("Helvetica", 9, "bold")).pack(side="left", padx=6)
         self._clear_btn = tk.Button(prog_row, text="Clear", bg="#3a3a3a", fg="#aaa",
                                      activebackground="#444", relief="flat", cursor="hand2",
@@ -693,31 +937,34 @@ class HandEyeCalibApp:
         ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
 
         # Status
-        tk.Label(right, text="Status:", bg="#2d2d2d", fg="#666",
+        tk.Label(right, text="Status:", bg="#252525", fg="#666",
                  font=("Helvetica", 9)).pack(anchor="w", padx=12)
         self._status_var = tk.StringVar(value="Waiting for camera…")
-        tk.Label(right, textvariable=self._status_var, bg="#2d2d2d", fg="#98c379",
-                 font=("Helvetica", 9), wraplength=320, justify="left"
+        tk.Label(right, textvariable=self._status_var, bg="#252525", fg="#98c379",
+                 font=("Helvetica", 9), wraplength=270, justify="left"
                  ).pack(anchor="w", padx=12, pady=(2,6))
 
         # Log
         ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
-        tk.Label(right, text="Log:", bg="#2d2d2d", fg="#666",
+        tk.Label(right, text="Log:", bg="#252525", fg="#666",
                  font=("Helvetica", 9)).pack(anchor="w", padx=12)
         self._log_text = scrolledtext.ScrolledText(
-            right, width=40, height=10,
+            right, width=34, height=10,
             bg="#1e1e1e", fg="#abb2bf", font=("Courier", 8),
             state="disabled", relief="flat")
         self._log_text.pack(padx=12, pady=(2,10), fill="both", expand=True)
 
         self.root.columnconfigure(0, weight=1)
         self.root.columnconfigure(1, weight=0)
+        self.root.columnconfigure(2, weight=0)
         self.root.rowconfigure(0, weight=1)
 
         self._on_mode_change()  # set initial button states
 
-    def _section(self, parent, title: str):
-        tk.Label(parent, text=title, bg="#2d2d2d", fg="#e5c07b",
+    def _section(self, parent, title: str, bg: str = None):
+        if bg is None:
+            bg = str(parent.cget("bg"))
+        tk.Label(parent, text=title, bg=bg, fg="#e5c07b",
                  font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(6,2))
 
     # ------------------------------------------------------------------
@@ -731,7 +978,9 @@ class HandEyeCalibApp:
             self._camera = OrbbecCamera()
             self._camera.start()
             self._K, self._d = self._camera.intrinsics()
-            self._log(f"[Camera] Started  K.fx={self._K[0,0]:.1f}")
+            d_loaded = any(v != 0 for v in self._d)
+            self._log(f"[Camera] Started  K.fx={self._K[0,0]:.1f}  "
+                      f"dist={'loaded from file' if d_loaded else 'zeros (run camera_calibration.py first)'}")
         except Exception as e:
             self._log(f"[Camera] ERROR: {e}")
             self._camera = None
@@ -838,10 +1087,222 @@ class HandEyeCalibApp:
 
         self._aruco_dict, self._board = make_board(sq_x, sq_y, sq_len, mk_len)
         self._detector = make_charuco_detector(self._board)
-        self._log(f"[Board] {sq_x}×{sq_y}  sq={sq_len*100:.1f}cm  mk={mk_len*100:.1f}cm")
+        self._log(f"[Board] {sq_x}×{sq_y}  sq={sq_len*100:.2f}cm  mk={mk_len*100:.2f}cm")
+        lbl_txt = f"Active: sq={sq_len*100:.2f}cm  mk={mk_len*100:.2f}cm  ({sq_x}×{sq_y})"
+        try:
+            self._board_active_lbl.config(text=lbl_txt)
+        except AttributeError:
+            pass   # label not built yet (called from __init__ before _build_ui)
 
     # ------------------------------------------------------------------
     # Event handlers
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Auto-mode pose management
+    # ------------------------------------------------------------------
+    def _load_auto_poses(self):
+        try:
+            if SAVED_POSES_FILE.exists():
+                with open(SAVED_POSES_FILE, "r") as f:
+                    data = json.load(f)
+                raw = data.get("poses", [])
+                # Support both old format (plain list) and new format (dict with joints)
+                self._auto_poses = []
+                for p in raw:
+                    if isinstance(p, dict):
+                        self._auto_poses.append(p)
+                    elif isinstance(p, list):
+                        self._auto_poses.append({"cartesian": p, "joints": None})
+                    else:
+                        continue
+                self._log(f"[Poses] Loaded {len(self._auto_poses)} saved positions")
+            else:
+                self._log(f"[Poses] No saved positions file — will use built-in {len(CALIB_POSES)} poses")
+        except Exception as e:
+            self._log(f"[Poses] Load error: {e}")
+        self._update_poses_listbox()
+
+    def _save_auto_poses(self):
+        try:
+            SAVED_POSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(SAVED_POSES_FILE, "w") as f:
+                json.dump({"poses": self._auto_poses}, f, indent=2)
+        except Exception as e:
+            self._log(f"[Poses] Save error: {e}")
+
+    def _update_poses_listbox(self):
+        self._poses_listbox.delete(0, "end")
+        for i, entry in enumerate(self._auto_poses):
+            c = entry.get("cartesian") if isinstance(entry, dict) else entry
+            has_j = isinstance(entry, dict) and entry.get("joints") is not None
+            tag = "J" if has_j else "C"
+            if c:
+                self._poses_listbox.insert("end",
+                    f"#{i+1:02d} [{tag}] X={c[0]:.0f} Y={c[1]:.0f} Z={c[2]:.0f}"
+                    f"  Rx={c[3]:.1f} Ry={c[4]:.1f} Rz={c[5]:.1f}")
+            else:
+                self._poses_listbox.insert("end", f"#{i+1:02d} [J] (joint-only)")
+        n = len(self._auto_poses)
+        if n == 0:
+            self._poses_count_lbl.config(
+                text=f"0 saved  (will use built-in {len(CALIB_POSES)} poses)", fg="#666")
+        else:
+            self._poses_count_lbl.config(
+                text=f"{n} saved  (auto mode will use these)", fg="#98c379")
+
+    def _on_save_auto_pose(self):
+        ip = self._robot_ip_var.get().strip()
+        self._save_pose_btn.config(state="disabled", text="Reading…")
+        threading.Thread(target=self._save_auto_pose_thread, args=(ip,), daemon=True).start()
+
+    def _save_auto_pose_thread(self, ip: str):
+        try:
+            if not _DOBOT_API_OK:
+                raise RuntimeError("dobot_api not available")
+            if not self._robot_connected or self._robot is None:
+                raise RuntimeError("Robot not connected — click ⚡ Connect Robot first")
+            # Read both Cartesian pose (for display) and joint angles (for motion)
+            pose_resp = self._robot._dashboard.GetPose()
+            angle_resp = self._robot._dashboard.GetAngle()
+
+            def _parse6(resp):
+                nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", str(resp))]
+                if len(nums) >= 7:
+                    return list(nums[1:7])
+                if len(nums) >= 6:
+                    return list(nums[:6])
+                raise ValueError(f"Cannot parse: {resp!r}")
+
+            cartesian = _parse6(pose_resp)
+            joints = _parse6(angle_resp)
+            entry = {"cartesian": cartesian, "joints": joints}
+            self._auto_poses.append(entry)
+            self._save_auto_poses()
+            self._log(f"[Poses] Saved #{len(self._auto_poses)}: "
+                      f"cart=[{', '.join(f'{v:.1f}' for v in cartesian)}]  "
+                      f"J=[{', '.join(f'{v:.1f}' for v in joints)}]")
+            self._cb_queue.put(self._update_poses_listbox)
+        except Exception as e:
+            self._log(f"[Poses] Error reading robot pose: {e}")
+        finally:
+            self._cb_queue.put(lambda: self._save_pose_btn.config(
+                state="normal", text="📌 Save Robot Position"))
+
+    def _on_remove_auto_pose(self):
+        sel = self._poses_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if 0 <= idx < len(self._auto_poses):
+            removed = self._auto_poses.pop(idx)
+            self._save_auto_poses()
+            c = removed.get("cartesian") if isinstance(removed, dict) else removed
+            self._log(f"[Poses] Removed #{idx+1}: [{', '.join(f'{v:.1f}' for v in c)}]")
+            self._update_poses_listbox()
+
+    def _on_clear_saved_poses(self):
+        if not self._auto_poses:
+            return
+        if not messagebox.askyesno("Clear positions",
+                                    f"Delete all {len(self._auto_poses)} saved positions?"):
+            return
+        self._auto_poses.clear()
+        self._save_auto_poses()
+        self._log("[Poses] Cleared all saved positions.")
+        self._update_poses_listbox()
+
+    # ------------------------------------------------------------------
+    # Robot connect / disconnect
+    # ------------------------------------------------------------------
+    def _on_connect(self):
+        if self._robot_connected:
+            # Disconnect
+            if self._robot:
+                try:
+                    self._robot.close()
+                except Exception:
+                    pass
+                self._robot = None
+            self._robot_connected = False
+            self._robot_status.config(text="● Disconnected", fg="#e06c75")
+            self._connect_btn.config(text="⚡  Connect Robot", bg="#4a5568")
+            self._log("[Robot] Disconnected.")
+            return
+        ip = self._robot_ip_var.get().strip()
+        self._connect_btn.config(state="disabled", text="Connecting…")
+        self._robot_status.config(text="● Connecting…", fg="#e5c07b")
+        threading.Thread(target=self._connect_worker, args=(ip,), daemon=True).start()
+
+    def _connect_worker(self, ip: str):
+        try:
+            self._log(f"[Robot] Connecting to {ip}:{ROBOT_PORT}…")
+            robot = DobotDashboard(ip)
+            robot.clear_error(); time.sleep(0.3)
+            robot.enable()
+            # Wait for mode 5 (idle/enabled)
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
+                m = robot.get_mode()
+                if m == DobotDashboard.MODE_ENABLED:
+                    break
+                if m == DobotDashboard.MODE_ERROR:
+                    robot.clear_error(); time.sleep(0.3); robot.enable()
+                time.sleep(0.4)
+            m = robot.get_mode()
+            if m not in (DobotDashboard.MODE_ENABLED, DobotDashboard.MODE_RUNNING):
+                raise RuntimeError(f"Robot not ready (mode={m})")
+            try:
+                tool_idx = int(self._tool_idx_var.get())
+            except ValueError:
+                tool_idx = 1
+            robot.set_tool(tool_idx)
+            robot.set_speed(int(self._speed_var.get()))
+            self._robot = robot
+            self._robot_connected = True
+            self._log(f"[Robot] Connected  mode={m}  tool={tool_idx}")
+            self._ui(self._on_robot_connected_ui)
+        except Exception as e:
+            self._log(f"[Robot] Connection failed: {e}")
+            self._ui(lambda err=str(e): (
+                self._robot_status.config(text=f"● Error: {err}", fg="#e06c75"),
+                self._connect_btn.config(state="normal", text="⚡  Connect Robot",
+                                         bg="#4a5568")))
+
+    def _on_robot_connected_ui(self):
+        ip = self._robot_ip_var.get()
+        self._robot_status.config(text=f"● Connected  {ip}", fg="#98c379")
+        self._connect_btn.config(state="normal", text="⏏  Disconnect", bg="#3a6048")
+
+    # ------------------------------------------------------------------
+    # Vacuum handlers
+    # ------------------------------------------------------------------
+    def _on_vacuum_on(self):
+        ip = self._robot_ip_var.get().strip()
+        threading.Thread(target=self._vacuum_cmd, args=(ip, True), daemon=True).start()
+
+    def _on_vacuum_off(self):
+        ip = self._robot_ip_var.get().strip()
+        threading.Thread(target=self._vacuum_cmd, args=(ip, False), daemon=True).start()
+
+    def _vacuum_cmd(self, ip: str, on: bool):
+        try:
+            if not _DOBOT_API_OK:
+                raise RuntimeError("dobot_api not available")
+            if self._robot_connected and self._robot:
+                resp = self._robot.vacuum_on() if on else self._robot.vacuum_off()
+            else:
+                db = _DobotApiDashboard(ip, ROBOT_PORT)
+                resp = db.ToolDO(1, 1 if on else 0)
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            self._log(f"[Vacuum] {'ON' if on else 'OFF'}  resp={resp}")
+        except Exception as e:
+            self._log(f"[Vacuum] Error: {e}")
+
+    # ------------------------------------------------------------------
+    # Board param handlers
     # ------------------------------------------------------------------
     def _on_apply_params(self):
         self._rebuild_board()
@@ -887,8 +1348,11 @@ class HandEyeCalibApp:
         if mode == "auto":
             self._start_btn.config(text="▶  Start Auto Calibration", state="normal")
             self._capture_btn.config(state="disabled")
+            self._guide_frame.pack_forget()
         else:
             self._start_btn.config(text="▶  Start Manual Mode", state="normal")
+            self._guide_frame.pack(padx=12, pady=(0, 4), fill="x",
+                                   after=self._capture_btn)
             if self._state == self.MANUAL:
                 self._capture_btn.config(state="normal")
 
@@ -914,10 +1378,95 @@ class HandEyeCalibApp:
         else:
             self._start_manual()
 
+    def _update_guide(self):
+        """Update the guided-pose target label for manual mode."""
+        targets = self._auto_poses if self._auto_poses else CALIB_POSES
+        idx = self._guide_idx
+        if idx >= len(targets):
+            self._guide_var.set(f"All {len(targets)} targets done ✓\n(keep adding for more accuracy)")
+            return
+        entry = targets[idx]
+        c = entry.get("cartesian") if isinstance(entry, dict) else list(entry)
+        if c and len(c) >= 6:
+            self._guide_var.set(
+                f"#{idx+1}/{len(targets)}  "
+                f"Rx={c[3]:+.0f}°  Ry={c[4]:+.0f}°  Rz={c[5]:+.0f}°\n"
+                f"  aim for  X≈{c[0]:.0f}  Y≈{c[1]:.0f}  Z≈{c[2]:.0f} mm")
+        else:
+            self._guide_var.set(f"#{idx+1}/{len(targets)}")
+
+    def _on_goto_target(self):
+        if self._state != self.MANUAL:
+            return
+        if not self._robot_connected or self._robot is None:
+            self._log("[Goto] Robot not connected — click ⚡ Connect Robot first")
+            return
+        targets = self._auto_poses if self._auto_poses else CALIB_POSES
+        if self._guide_idx >= len(targets):
+            self._log("[Goto] All targets done.")
+            return
+        entry = targets[self._guide_idx]
+        c = entry.get("cartesian") if isinstance(entry, dict) else list(entry)
+        joints = entry.get("joints") if isinstance(entry, dict) else None
+        if not c and joints is None:
+            self._log("[Goto] No cartesian position for this target.")
+            return
+        self._goto_btn.config(state="disabled", text="Moving…")
+        self._capture_btn.config(state="disabled")
+        threading.Thread(target=self._goto_worker,
+                         args=(c, joints), daemon=True).start()
+
+    def _goto_worker(self, cart, joints):
+        try:
+            robot = self._robot
+            if joints is not None:
+                cmd_id = robot.move_joint_angles(*joints)
+            else:
+                x, y, z, rx, ry, rz = cart
+                cmd_id = robot.move_joint(x, y, z, rx, ry, rz)
+            robot.wait_motion(cmd_id, timeout=60.0)
+            self._log(f"[Goto] Arrived at pose #{self._guide_idx + 1}. "
+                      f"Settling {SETTLE_TIME}s…")
+            time.sleep(SETTLE_TIME)
+            # Auto-capture after arriving (chaining enabled)
+            self._goto_chaining = True
+            self._ui(self._trigger_capture_from_goto)
+        except Exception as e:
+            self._log(f"[Goto] Move error: {e}")
+            self._ui(lambda: (
+                self._goto_btn.config(state="normal",
+                                      text="🤖  Send robot to this pose"),
+                self._capture_btn.config(
+                    state="normal" if self._state == self.MANUAL else "disabled")))
+
+    def _trigger_capture_from_goto(self):
+        """Called on main thread after robot arrives — captures if board detected."""
+        self._goto_btn.config(state="normal", text="🤖  Send robot to this pose")
+        if self._camera is None:
+            self._capture_btn.config(state="normal")
+            return
+        rgb = self._camera.get_latest_rgb()
+        if rgb is None:
+            self._capture_btn.config(state="normal")
+            return
+        rvec, tvec, _, num = detect_charuco(
+            rgb, self._aruco_dict, self._board, self._detector, self._K, self._d)
+        if rvec is not None:
+            # Board detected — auto-capture
+            threading.Thread(target=self._capture_manual_worker, daemon=True).start()
+        else:
+            self._log(f"[Goto] Board not detected ({num} corners) — "
+                      f"reposition if needed, then click Capture manually.")
+            self._capture_btn.config(state="normal")
+
     def _start_manual(self):
         self._state = self.MANUAL
+        self._guide_idx = 0
+        self._update_guide()
+        targets = self._auto_poses if self._auto_poses else CALIB_POSES
         self._set_status("Manual mode — move robot, click Capture Pose.")
-        self._log("[Manual] Started. Move robot to each position and click Capture Pose.")
+        self._log(f"[Manual] Started. {len(targets)} target poses to collect.")
+        self._log("[Manual] Move robot to the shown orientation and click Capture Pose.")
         self._capture_btn.config(state="normal",
                                   text=f"📷  Capture Pose  ({len(self._robot_poses)} captured)")
         self._stop_btn.config(state="normal")
@@ -944,135 +1493,228 @@ class HandEyeCalibApp:
         self._auto_thread.start()
 
     def _auto_worker(self, ip: str, speed: int):
-        self._log(f"[Auto] Connecting to robot {ip}:{ROBOT_PORT} …")
         try:
-            robot = DobotDashboard(ip)
-            self._log("[Auto] Clearing errors…")
-            robot.clear_error(); time.sleep(0.5)
-            self._log("[Auto] PowerOn…")
-            robot.power_on(); time.sleep(3.0)
-            self._log("[Auto] Enabling robot…")
-            robot.enable(); time.sleep(2.0)
-            if robot.get_mode() == DobotDashboard.MODE_ERROR:
-                self._log("[Auto] Error state — clearing and re-enabling…")
-                robot.clear_error(); time.sleep(1.0); robot.enable(); time.sleep(2.0)
-            robot.set_speed(speed)
-            self._log(f"[Auto] Robot ready. Speed={speed}%  Poses={len(CALIB_POSES)}")
+            if self._robot_connected and self._robot is not None:
+                robot = self._robot
+                # Health-check: verify the socket is still alive
+                try:
+                    robot.get_pose()
+                    self._log("[Auto] Using existing robot connection.")
+                except Exception:
+                    self._log("[Auto] Existing connection dead — reconnecting…")
+                    try:
+                        robot.close()
+                    except Exception:
+                        pass
+                    self._robot = None
+                    self._robot_connected = False
+                    robot = None
+            else:
+                robot = None
+
+            if robot is not None:
+                robot.set_speed(speed)
+                try:
+                    tool_idx = int(self._tool_idx_var.get())
+                except ValueError:
+                    tool_idx = 1
+                robot.set_tool(tool_idx)
+                self._log(f"[Auto] Speed={speed}%  Tool={tool_idx}")
+            else:
+                self._log(f"[Auto] Connecting to robot {ip}:{ROBOT_PORT} …")
+                robot = DobotDashboard(ip)
+                self._log("[Auto] Clearing errors…")
+                robot.clear_error(); time.sleep(0.5)
+                self._log("[Auto] PowerOn…")
+                robot.power_on(); time.sleep(3.0)
+                self._log("[Auto] Enabling robot…")
+                robot.enable()
+                # Wait until robot is idle (mode 5)
+                deadline = time.time() + 20.0
+                while time.time() < deadline:
+                    m = robot.get_mode()
+                    self._log(f"[Auto] Waiting for idle… mode={m}")
+                    if m == DobotDashboard.MODE_ENABLED:
+                        break
+                    if m == DobotDashboard.MODE_ERROR:
+                        robot.clear_error(); time.sleep(0.5); robot.enable()
+                    time.sleep(0.5)
+                final_mode = robot.get_mode()
+                if final_mode != DobotDashboard.MODE_ENABLED:
+                    raise RuntimeError(f"Robot not idle after 20s (mode={final_mode}). "
+                                       f"Check pendant — may need manual enable.")
+                self._log(f"[Auto] Robot idle (mode={final_mode}). Proceeding.")
+                robot.set_speed(speed)
+                try:
+                    tool_idx = int(self._tool_idx_var.get())
+                except ValueError:
+                    tool_idx = 1
+                robot.set_tool(tool_idx)
+                self._log(f"[Auto] Tool TCP set to index {tool_idx}")
+                self._robot = robot
+                self._robot_connected = True
+                self._ui(self._on_robot_connected_ui)
+            poses_to_use = self._auto_poses if self._auto_poses else CALIB_POSES
+            src = "saved" if self._auto_poses else "built-in"
+            self._log(f"[Auto] Robot ready. Speed={speed}%  Poses={len(poses_to_use)} ({src})")
         except Exception as e:
             self._log(f"[Auto] Robot connection FAILED: {e}")
             self._set_status(f"Robot error: {e}")
             self._ui(self._reset_buttons)
             return
 
+        # Log current robot mode so we can see if it's actually ready
+        mode_now = robot.get_mode()
+        self._log(f"[Auto] Robot mode before moves: {mode_now} "
+                  f"(5=enabled, 7=running, 9=error)")
+
         new_r, new_b = [], []
-        for idx, target in enumerate(CALIB_POSES):
-            if self._stop_flag.is_set():
-                self._log("[Auto] Stopped by user.")
-                break
-            x, y, z, rx, ry, rz = target
-            self._log(f"[Auto] Pose {idx+1}/{len(CALIB_POSES)}: {target}")
-            self._set_status(f"Moving to pose {idx+1}/{len(CALIB_POSES)}…")
-            cmd_id = robot.move_joint(x, y, z, rx, ry, rz)
-            robot.wait_motion(cmd_id, timeout=60.0)
-            self._log(f"[Auto] Settling {SETTLE_TIME}s…")
-            time.sleep(SETTLE_TIME)
-
-            # Grab a few frames and pick the one with detection
-            det = None
-            for _ in range(4):
-                if self._camera is None:
+        try:
+            for idx, entry in enumerate(poses_to_use):
+                if self._stop_flag.is_set():
+                    self._log("[Auto] Stopped by user.")
                     break
-                rgb = self._camera.get_latest_rgb()
-                if rgb is None:
-                    time.sleep(0.3); continue
-                rvec, tvec, _, num = detect_charuco(
-                    rgb, self._aruco_dict, self._board, self._detector, self._K, self._d)
-                if rvec is not None:
-                    det = (rvec, tvec)
+
+                # Determine how to move: joint angles (saved) or Cartesian (built-in)
+                if isinstance(entry, dict):
+                    joints = entry.get("joints")
+                    cart = entry.get("cartesian", joints)
+                else:
+                    joints = None
+                    cart = list(entry)
+
+                self._log(f"[Auto] Pose {idx+1}/{len(poses_to_use)}: {cart}")
+                self._set_status(f"Moving to pose {idx+1}/{len(poses_to_use)}…")
+                try:
+                    if joints is not None:
+                        cmd_id = robot.move_joint_angles(*joints)
+                        self._log(f"[Auto] MovJ (joints) sent  cmd_id={cmd_id}")
+                    else:
+                        x, y, z, rx, ry, rz = cart
+                        cmd_id = robot.move_joint(x, y, z, rx, ry, rz)
+                        self._log(f"[Auto] MovJ (cartesian) sent  cmd_id={cmd_id}")
+                    robot.wait_motion(cmd_id, timeout=60.0)
+                except TimeoutError:
+                    self._log(f"[Auto] TIMEOUT waiting for pose {idx+1} — robot mode={robot.get_mode()}")
+                    self._set_status(f"Timeout at pose {idx+1}. Check robot state.")
                     break
-                time.sleep(0.4)
+                except RuntimeError as e:
+                    self._log(f"[Auto] MOVE ERROR at pose {idx+1}: {e}")
+                    self._set_status(f"Move error: {e}")
+                    break
+                self._log(f"[Auto] Arrived. Settling {SETTLE_TIME}s…")
+                time.sleep(SETTLE_TIME)
 
-            if det is None:
-                self._log(f"[Auto] Pose {idx+1}: detection FAILED — skipping")
-                continue
+                # Grab a few frames and pick the one with detection
+                det = None
+                for _ in range(4):
+                    if self._camera is None:
+                        break
+                    rgb = self._camera.get_latest_rgb()
+                    if rgb is None:
+                        time.sleep(0.3); continue
+                    rvec, tvec, _, num = detect_charuco(
+                        rgb, self._aruco_dict, self._board, self._detector, self._K, self._d)
+                    if rvec is not None:
+                        det = (rvec, tvec)
+                        break
+                    time.sleep(0.4)
 
-            try:
-                pose = robot.get_pose()
-            except Exception as e:
-                self._log(f"[Auto] GetPose error: {e} — using target")
-                pose = tuple(target)
+                if det is None:
+                    self._log(f"[Auto] Pose {idx+1}: detection FAILED — skipping")
+                    continue
 
-            new_r.append(pose)
-            new_b.append(det)
-            n = len(new_r)
-            self._log(f"[Auto] Pose {idx+1}: OK  ({n} collected)")
-            self._ui(lambda n=n: self._update_progress(n))
+                try:
+                    pose = robot.get_pose()
+                except Exception as e:
+                    self._log(f"[Auto] GetPose error: {e} — skipping pose {idx+1}")
+                    continue
 
-        robot.close()
-        self._robot_poses.extend(new_r)
-        self._board_poses.extend(new_b)
-        total = len(self._robot_poses)
-        self._log(f"[Auto] Done. Total collected: {total}")
-        self._set_status(f"Auto done — {total} poses. Click Solve to calibrate.")
-        self._ui(lambda t=total: self._post_collection(t))
+                new_r.append(pose)
+                new_b.append(det)
+                n = len(new_r)
+                self._log(f"[Auto] Pose {idx+1}: OK  ({n} collected)")
+                self._ui(lambda n=n: self._update_progress(n))
+
+        except Exception as e:
+            self._log(f"[Auto] Unexpected error: {e}")
+            self._set_status(f"Auto error: {e}")
+        finally:
+            # Only close if we opened the connection ourselves
+            if not self._robot_connected or self._robot is not robot:
+                try:
+                    robot.close()
+                except Exception:
+                    pass
+            self._robot_poses.extend(new_r)
+            self._board_poses.extend(new_b)
+            total = len(self._robot_poses)
+            self._log(f"[Auto] Done. Total collected: {total}")
+            self._set_status(f"Auto done — {total} poses. Click Solve to calibrate.")
+            self._ui(lambda t=total: self._post_collection(t))
 
     def _on_capture_manual(self):
+        self._goto_chaining = False  # manual click breaks auto-chain
         if self._state != self.MANUAL:
             return
         if self._camera is None:
             self._log("[Manual] No camera")
             return
-        rgb = self._camera.get_latest_rgb()
-        if rgb is None:
-            self._log("[Manual] Frame not ready — try again")
-            return
-        rvec, tvec, _, num = detect_charuco(
-            rgb, self._aruco_dict, self._board, self._detector, self._K, self._d)
-        if rvec is None:
-            self._log(f"[Manual] Detection failed ({num} corners) — reposition board")
-            self._set_status("Board not detected — reposition and try again.")
-            return
+        self._capture_btn.config(state="disabled", text="Capturing…")
+        threading.Thread(target=self._capture_manual_worker, daemon=True).start()
 
-        # Connect robot for pose if not already connected
-        if self._robot is None:
-            ip = self._robot_ip_var.get().strip()
-            try:
-                self._log(f"[Manual] Connecting to {ip}…")
-                self._robot = DobotDashboard(ip)
-                # In manual mode the robot is already on — skip PowerOn.
-                # Just clear any alarms and enable.
-                self._robot.clear_error(); time.sleep(0.5)
-                self._robot.enable();      time.sleep(1.5)
-                # Wait until mode == ENABLED (5) or timeout
-                deadline = time.time() + 8.0
-                while time.time() < deadline:
-                    if self._robot.get_mode() == DobotDashboard.MODE_ENABLED:
-                        break
-                    time.sleep(0.3)
-                self._log(f"[Manual] Robot ready (mode={self._robot.get_mode()})")
-            except Exception as e:
-                self._log(f"[Manual] Robot connection failed: {e}")
-                self._robot = None
+    def _capture_manual_worker(self):
+        try:
+            rgb = self._camera.get_latest_rgb()
+            if rgb is None:
+                self._log("[Manual] Frame not ready — try again")
+                return
+            rvec, tvec, _, num = detect_charuco(
+                rgb, self._aruco_dict, self._board, self._detector, self._K, self._d)
+            if rvec is None:
+                self._log(f"[Manual] Detection failed ({num} corners) — reposition board")
+                self._set_status("Board not detected — reposition and try again.")
                 return
 
-        try:
-            pose = self._robot.get_pose()
-            self._log(f"[Manual] Raw pose: {pose}")
-        except Exception as e:
-            self._log(f"[Manual] GetPose error: {e}")
-            return
+            # Use persistent connection, or fail if not connected
+            if not self._robot_connected or self._robot is None:
+                self._log("[Manual] Robot not connected — click ⚡ Connect Robot first")
+                self._set_status("Robot not connected.")
+                return
 
-        self._robot_poses.append(pose)
-        self._board_poses.append((rvec, tvec))
-        n = len(self._robot_poses)
-        self._log(f"[Manual] Capture {n}: pose=[{','.join(f'{v:.1f}' for v in pose)}]  "
-                  f"t=[{tvec[0,0]:.3f},{tvec[1,0]:.3f},{tvec[2,0]:.3f}]m")
-        self._update_progress(n)
+            try:
+                pose = self._robot.get_pose()
+                self._log(f"[Manual] Raw pose: {pose}")
+            except Exception as e:
+                self._log(f"[Manual] GetPose error: {e}")
+                return
+
+            self._robot_poses.append(pose)
+            self._board_poses.append((rvec, tvec))
+            n = len(self._robot_poses)
+            self._log(f"[Manual] Capture {n}: pose=[{','.join(f'{v:.1f}' for v in pose)}]  "
+                      f"t=[{tvec[0,0]:.3f},{tvec[1,0]:.3f},{tvec[2,0]:.3f}]m")
+            self._guide_idx += 1
+            chaining = self._goto_chaining
+            def _post(n=n, c=chaining):
+                self._update_progress(n)
+                self._update_guide()
+                if c:
+                    targets = self._auto_poses if self._auto_poses else CALIB_POSES
+                    if self._guide_idx < len(targets):
+                        self.root.after(1500, self._on_goto_target)
+                    else:
+                        self._goto_chaining = False
+                        self._log("[Goto] All poses captured — click Solve to calibrate.")
+            self._ui(_post)
+        finally:
+            n = len(self._robot_poses)
+            self._ui(lambda: self._capture_btn.config(
+                state="normal" if self._state == self.MANUAL else "disabled",
+                text=f"📷  Capture Pose  ({n} captured)"))
 
     def _on_stop(self):
         self._stop_flag.set()
-        if self._state == self.MANUAL and self._robot:
-            self._robot.close(); self._robot = None
         self._state = self.IDLE
         self._reset_buttons()
         self._set_status("Stopped.")
@@ -1108,19 +1750,26 @@ class HandEyeCalibApp:
                                   self._robot_poses, self._board_poses, OUTPUT_DIR)
             T = result["T"]
             t_mm = result["t"].ravel()
-            self._log(f"\n[Result] Primary method: {result['primary']}")
+            primary_r, primary_t = result["residuals"][result["primary"]]
+            self._log(f"\n[Result] Primary method: {result['primary']}  "
+                      f"(residual: rot={primary_r:.3f}°  t={primary_t:.2f}mm)")
             self._log(f"[Result] t_cam2base = [{t_mm[0]:.1f}, {t_mm[1]:.1f}, {t_mm[2]:.1f}] mm")
             if _SCIPY_OK:
                 e = Rotation.from_matrix(result["R"]).as_euler("ZYX", degrees=True)
                 self._log(f"[Result] R ZYX = [{e[0]:.2f}, {e[1]:.2f}, {e[2]:.2f}] deg")
             self._log(f"[Result] T_cam2base:\n{np.array2string(T, precision=3, suppress_small=True)}")
             self._log(f"[Result] Saved to {OUTPUT_DIR}/hand_eye_calib.npz + .json")
-            self._set_status(f"Calibration done!  t=[{t_mm[0]:.1f},{t_mm[1]:.1f},{t_mm[2]:.1f}]mm")
-            self._log("[All methods]")
+            quality = "GOOD" if primary_t < 3.0 else ("ACCEPTABLE" if primary_t < 8.0 else "POOR — recollect poses")
+            self._set_status(f"Calibration done! [{quality}]  residual={primary_t:.2f}mm  "
+                             f"t=[{t_mm[0]:.1f},{t_mm[1]:.1f},{t_mm[2]:.1f}]mm")
+            self._log("[All methods — translation residual (lower = better)]")
             for name, val in result["all"].items():
                 if val:
                     R, t = val
-                    self._log(f"  {name:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm")
+                    r_res, t_res = result["residuals"][name]
+                    marker = " ← selected" if name == result["primary"] else ""
+                    self._log(f"  {name:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm  "
+                              f"residual={t_res:.2f}mm{marker}")
         except Exception as e:
             self._log(f"[Solve] ERROR: {e}")
             self._set_status(f"Solve failed: {e}")
@@ -1134,7 +1783,7 @@ class HandEyeCalibApp:
     # UI state helpers
     # ------------------------------------------------------------------
     def _update_progress(self, n: int):
-        total = len(CALIB_POSES)
+        total = len(self._auto_poses) if self._auto_poses else len(CALIB_POSES)
         self._progress_var.set(f"{n} / {total}")
         self._capture_btn.config(text=f"📷  Capture Pose  ({n} captured)")
         self._solve_btn.config(state="normal" if n >= 3 else "disabled")
