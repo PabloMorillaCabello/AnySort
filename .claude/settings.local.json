@@ -10,7 +10,16 @@
       "Bash(find /c/Users/pablo/Desktop/HV/_THESIS/Tryes/GraspGen/GraspGen_Thesis_Repo -name *point_cloud* -type f)",
       "Bash(python3:*)",
       "Bash(wc -l scripts/TEST/*.py)",
-      "Bash(wc -l scripts/*.py docker/Dockerfile docker/docker-compose.yml)"
+      "Bash(wc -l scripts/*.py docker/Dockerfile docker/docker-compose.yml)",
+      "Bash(find C:UserspabloDesktopHV_THESISEnviormentGraspGenGraspGen_Thesis_Repo -name point_cloud_utils.py -o -name *point_cloud*)",
+      "Bash(find . -path */grasp_gen/* -type f)",
+      "Bash(grep -r meshcat_utils . --include=*.py)",
+      "Bash(grep -r 'from grasp_gen' . --include=*.py)",
+      "Bash(grep -r PYTHONPATH . --include=*.sh --include=*.py)",
+      "Bash(grep -r make_frame . --include=*.py -n)",
+      "Bash(grep -r visualize_pointcloud . --include=*.py -n)",
+      "Bash(grep -r meshcat . --include=*.py -A 3 -B 1)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

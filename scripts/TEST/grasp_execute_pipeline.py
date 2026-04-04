@@ -762,6 +762,12 @@ class GraspExecuteApp:
         self._robot: DobotDashboard = None
         self._robot_connected = False
 
+        # Pipeline options
+        self._collision_var  = tk.BooleanVar(value=False)  # enable GraspGen collision check
+        self._debug_var      = tk.BooleanVar(value=False)  # step-by-step debug mode
+        self._debug_event    = threading.Event()
+        self._debug_event.set()  # start in "go" state
+
         # Flags
         self._inference_running = False
         self._config_loading    = False
@@ -897,6 +903,20 @@ class GraspExecuteApp:
 
         ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
 
+        # ── Pipeline options ──
+        tk.Checkbutton(mid, text="Check collisions (filter colliding grasps)",
+                       variable=self._collision_var,
+                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
+                       selectcolor="#3a3a3a", font=("Helvetica", 8)
+                       ).pack(anchor="w", padx=12, pady=(4, 2))
+        tk.Checkbutton(mid, text="Process debug (step-by-step)",
+                       variable=self._debug_var,
+                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
+                       selectcolor="#3a3a3a", font=("Helvetica", 8)
+                       ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
+
         # Gripper config
         tk.Label(mid, text="Gripper / Tool:", bg="#2d2d2d", fg="#e5c07b",
                  font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
@@ -929,6 +949,13 @@ class GraspExecuteApp:
                                    font=("Helvetica", 11, "bold"), relief="flat",
                                    cursor="hand2", bd=0, command=self._on_run)
         self._run_btn.pack(padx=12, pady=2, fill="x", ipady=10)
+
+        self._continue_btn = tk.Button(
+            mid, text="▶  Continue to next step",
+            bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a44e",
+            font=("Helvetica", 10, "bold"), relief="flat", cursor="hand2", bd=0,
+            state="disabled", command=self._on_debug_continue)
+        self._continue_btn.pack(padx=12, pady=(2, 2), fill="x", ipady=8)
 
         tk.Button(mid, text="✕  Clear mask", bg="#3a3a3a", fg="#aaa",
                   activebackground="#444", font=("Helvetica", 9), relief="flat",
@@ -1210,6 +1237,9 @@ class GraspExecuteApp:
     def _on_clear_replay(self):
         self._replay_frame = None
         self._replay_label_var.set("")
+        self._last_mask = None
+        if not self.camera._started:
+            self._canvas.itemconfig(self._no_cam_txt, state="normal")
         self._log("[Replay] Cleared — back to live camera")
 
     def _show_replay_in_canvas(self, rgb):
@@ -1225,6 +1255,7 @@ class GraspExecuteApp:
         padded[yo:yo+nh, xo:xo+nw] = resized
         tk_img = _ITk.PhotoImage(_PILImg.fromarray(padded))
         self._canvas.itemconfig(self._canvas_img_id, image=tk_img)
+        self._canvas.itemconfig(self._no_cam_txt, state="hidden")
         self._canvas._tk_ref = tk_img
 
     # ------------------------------------------------------------------
@@ -1241,10 +1272,15 @@ class GraspExecuteApp:
             return
         rgb, _, _ = self.camera.get_latest()
         if rgb is None:
-            return
+            # No live frame — fall back to replay image so mask overlay still works
+            if self._replay_frame is not None:
+                rgb = self._replay_frame[0]
+            else:
+                return
         self._canvas.itemconfig(self._no_cam_txt, state="hidden")
         if self._status_var.get().startswith("Waiting"):
-            self._status_var.set("Camera ready.")
+            self._status_var.set("Replay mode." if self._replay_frame is not None
+                                 else "Camera ready.")
 
         display = rgb.copy()
         mask = self._last_mask
@@ -1361,6 +1397,22 @@ class GraspExecuteApp:
         self._start_config_load(name)
 
     # ------------------------------------------------------------------
+    # Debug step control
+    # ------------------------------------------------------------------
+    def _debug_pause(self, step_label):
+        """Block the pipeline worker at a debug checkpoint until the user continues."""
+        if not self._debug_var.get():
+            return
+        self._debug_event.clear()
+        self._set_status(f"Debug — {step_label}  ▶ click Continue")
+        self._cb_queue.put(lambda: self._continue_btn.configure(state="normal"))
+        self._debug_event.wait(timeout=600)   # auto-release after 10 min
+        self._cb_queue.put(lambda: self._continue_btn.configure(state="disabled"))
+
+    def _on_debug_continue(self):
+        self._debug_event.set()
+
+    # ------------------------------------------------------------------
     # Run GraspGen pipeline
     # ------------------------------------------------------------------
     def _on_run(self):
@@ -1384,7 +1436,8 @@ class GraspExecuteApp:
         self._inference_running = True
         self._best_grasp_base = None
         self._preview_was_on = self._live_preview.get()
-        self._live_preview.set(False)
+        if not self._debug_var.get():
+            self._live_preview.set(False)  # suppress live refresh during normal run
         self._cb_queue.put(lambda: self._execute_btn.configure(state="disabled"))
         self._run_btn.configure(state="disabled", text="Running…")
         self._set_status("Running pipeline…")
@@ -1411,6 +1464,11 @@ class GraspExecuteApp:
             if mask.sum() < 50:
                 raise RuntimeError(f"Only {mask.sum()} px — try a different prompt")
 
+            # ── Debug step 1: SAM3 segmentation ─────────────────────────────
+            # Preview timer picks up _last_mask and shows green overlay on canvas
+            self._debug_pause(f"Step 1/7 — SAM3  ({int(mask.sum())} px masked)")
+            # ────────────────────────────────────────────────────────────────
+
             # Prefer calibrated intrinsics over SDK defaults
             if self._calib_K is not None:
                 K = self._calib_K
@@ -1420,13 +1478,16 @@ class GraspExecuteApp:
                 fx, fy, cx, cy = intrinsics
                 self._log("[PC] Using SDK camera intrinsics")
 
-            # Undistort if calibrated distortion is available
+            # Undistort RGB only — depth must NOT be undistorted with bilinear
+            # interpolation: at object edges cv2.undistort blends foreground and
+            # background depth values, producing interpolated points that project
+            # to 3D positions floating between surfaces (the "flying pixel" halo).
             dist = getattr(self, '_calib_dist', None)
             if dist is not None and np.any(dist != 0):
                 K_mat = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], np.float64)
                 rgb = cv2.undistort(rgb, K_mat, dist)
-                depth_m = cv2.undistort(depth_m, K_mat, dist)
-                self._log("[PC] Applied lens distortion correction")
+                self._log("[PC] Applied lens distortion correction (RGB only)")
+
 
             scene_pc, object_pc, scene_colors, object_colors = \
                 depth_and_segmentation_to_point_clouds(
@@ -1439,6 +1500,15 @@ class GraspExecuteApp:
                 idx = np.random.choice(len(object_pc), args.max_object_points, replace=False)
                 object_pc = object_pc[idx]
                 object_colors = object_colors[idx]
+
+            # ── Debug step 2: raw object point cloud (camera frame) ──────────
+            if self._debug_var.get() and self._vis:
+                self._vis.delete()
+                visualize_pointcloud(self._vis, "pc_raw_cam", object_pc, object_colors,
+                                     size=args.scene_point_size)
+            self._debug_pause(
+                f"Step 2/7 — Raw object cloud  ({len(object_pc)} pts, camera frame)")
+            # ────────────────────────────────────────────────────────────────
 
             pc_torch = torch.from_numpy(object_pc)
             pc_filtered, _ = point_cloud_outlier_removal(pc_torch)
@@ -1454,6 +1524,27 @@ class GraspExecuteApp:
             _tree = cKDTree(object_pc)
             _, nn_idx = _tree.query(pc_filtered, k=1, workers=1)
             object_colors_filtered = object_colors[nn_idx]
+
+            # ── Debug step 3: before vs after outlier removal (camera frame) ──
+            if self._debug_var.get() and self._vis:
+                # Find which object_pc points were removed as outliers
+                _outlier_mask = np.ones(len(object_pc), dtype=bool)
+                _outlier_mask[nn_idx] = False
+                _outlier_pc = object_pc[_outlier_mask]
+                self._vis.delete()
+                # Kept points in their real colors
+                visualize_pointcloud(self._vis, "pc_kept", pc_filtered,
+                                     object_colors_filtered, size=args.scene_point_size)
+                # Removed outliers in red so the difference is obvious
+                if len(_outlier_pc) > 0:
+                    _red = np.tile([[255, 50, 50]], (len(_outlier_pc), 1)).astype(np.uint8)
+                    visualize_pointcloud(self._vis, "pc_outliers", _outlier_pc, _red,
+                                         size=args.scene_point_size)
+            self._debug_pause(
+                f"Step 3/7 — Outlier removal  "
+                f"({len(pc_filtered)} kept, "
+                f"{len(object_pc)-len(pc_filtered)} removed in red)")
+            # ────────────────────────────────────────────────────────────────
 
             # ── Transform point clouds from camera frame to robot base
             #    frame using the FULL T_cam2base (rotation + translation)
@@ -1494,7 +1585,8 @@ class GraspExecuteApp:
                       f"[{obj_centroid_base[0]*1000:.1f}, "
                       f"{obj_centroid_base[1]*1000:.1f}, "
                       f"{obj_centroid_base[2]*1000:.1f}] mm")
-            t_center = tra.translation_matrix(-obj_centroid_base)
+            t_center     = tra.translation_matrix(-obj_centroid_base)
+            t_center_inv = tra.translation_matrix(obj_centroid_base)   # inverse = +centroid
             pc_centered = tra.transform_points(pc_base, t_center)
             scene_centered = tra.transform_points(scene_base, t_center) \
                 if scene_base is not None and len(scene_base) > 0 \
@@ -1530,6 +1622,12 @@ class GraspExecuteApp:
                 visualize_pointcloud(self._vis, "pc_full", full_pc_base, full_colors,
                                      size=args.scene_point_size)
 
+            # ── Debug step 4: point cloud in robot base frame ────────────────
+            self._debug_pause(
+                f"Step 4/7 — Point cloud in robot frame  ({len(pc_filtered)} obj pts, "
+                f"{len(scene_pc) if scene_pc is not None else 0} scene pts)")
+            # ────────────────────────────────────────────────────────────────
+
             self._log("[GraspGen] Running inference…")
             t1 = time.time()
             grasps, grasp_conf = GraspGenSampler.run_inference(
@@ -1545,6 +1643,20 @@ class GraspExecuteApp:
             grasps_obj_np = grasps.cpu().numpy()   # object/centered frame
             grasp_conf_np = grasp_conf.cpu().numpy()
 
+            # ── Debug step 5: all raw GraspGen poses (work frame) ────────────
+            if self._debug_var.get() and self._vis:
+                _grasps_all_work = np.array([t_center_inv @ g for g in grasps_obj_np])
+                self._vis.delete()
+                visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
+                                     size=args.scene_point_size)
+                _gn = grasp_cfg.data.gripper_name
+                for _i, _g in enumerate(_grasps_all_work):
+                    visualize_grasp(self._vis, f"grasps_all/{_i:03d}/grasp", _g,
+                                    color=[180, 180, 255], gripper_name=_gn, linewidth=0.8)
+            self._debug_pause(
+                f"Step 5/7 — All GraspGen poses  ({len(grasps_obj_np)} raw grasps)")
+            # ────────────────────────────────────────────────────────────────
+
             # Filter: keep only grasps approaching from above (Z-axis points down)
             approach_z = np.array([g[2, 2] for g in grasps_obj_np])
             top_down = approach_z < 0  # approach Z-axis pointing downward = from above
@@ -1557,8 +1669,21 @@ class GraspExecuteApp:
                 self._log(f"[GraspGen] Top-down filter: {n_before} → "
                           f"{len(grasps_obj_np)} grasps")
 
+            # ── Debug step 6: top-down filtered grasps ───────────────────────
+            if self._debug_var.get() and self._vis:
+                _grasps_td_work = np.array([t_center_inv @ g for g in grasps_obj_np])
+                self._vis.delete()
+                visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
+                                     size=args.scene_point_size)
+                _gn = grasp_cfg.data.gripper_name
+                for _i, _g in enumerate(_grasps_td_work):
+                    visualize_grasp(self._vis, f"grasps_td/{_i:03d}/grasp", _g,
+                                    color=[180, 255, 180], gripper_name=_gn, linewidth=0.8)
+            self._debug_pause(
+                f"Step 6/7 — Top-down filtered  ({len(grasps_obj_np)} grasps)")
+            # ────────────────────────────────────────────────────────────────
+
             # Un-center: grasps go from centered → work frame (Z-up base)
-            t_center_inv = np.linalg.inv(t_center)
             grasps_work_np = np.array([t_center_inv @ g for g in grasps_obj_np])
 
             # grasps_work_np are in the Z-up "work" frame.
@@ -1574,6 +1699,50 @@ class GraspExecuteApp:
             _, grasps_centered, scores, _ = _process_point_cloud(
                 pc_base, grasps_work_np, grasp_conf_np)
 
+            # ── Collision filtering ──────────────────────────────────────────
+            if self._collision_var.get():
+                try:
+                    gripper_info = get_gripper_info(grasp_cfg.data.gripper_name)
+                    scene_col = scene_centered
+                    if scene_col is not None and len(scene_col) > args.max_scene_points:
+                        idx = np.random.choice(len(scene_col), args.max_scene_points,
+                                               replace=False)
+                        scene_col = scene_col[idx]
+                    free_mask = filter_colliding_grasps(
+                        scene_pc=scene_col,
+                        grasp_poses=grasps_centered,
+                        gripper_collision_mesh=gripper_info.collision_mesh,
+                        collision_threshold=args.collision_threshold,
+                    )
+                    # ── Debug step 6b: collision filter result ────────────────
+                    if self._debug_var.get() and self._vis:
+                        self._vis.delete()
+                        visualize_pointcloud(self._vis, "pc_obj", pc_base,
+                                             object_colors_filtered, size=args.scene_point_size)
+                        _gn = grasp_cfg.data.gripper_name
+                        for _i, _g in enumerate(grasps_work_np):
+                            _col = [50, 255, 50] if free_mask[_i] else [255, 50, 50]
+                            visualize_grasp(self._vis, f"grasps_col/{_i:03d}/grasp", _g,
+                                            color=_col, gripper_name=_gn, linewidth=0.8)
+                        self._debug_pause(
+                            f"Step 6b — Collision filter  "
+                            f"({int(free_mask.sum())} free / "
+                            f"{int((~free_mask).sum())} colliding)")
+                    # ─────────────────────────────────────────────────────────
+                    n_before = len(grasps_work_np)
+                    grasps_work_np  = grasps_work_np[free_mask]
+                    grasps_base_np  = grasps_base_np[free_mask]
+                    grasps_centered = grasps_centered[free_mask]
+                    grasp_conf_np   = grasp_conf_np[free_mask]
+                    scores          = scores[free_mask]
+                    self._log(f"[Collision] {n_before} → {free_mask.sum()} "
+                              f"collision-free grasps")
+                    if len(grasps_work_np) == 0:
+                        raise RuntimeError("All grasps filtered by collision check")
+                except Exception as ce:
+                    self._log(f"[Collision] WARNING: {ce}")
+            # ────────────────────────────────────────────────────────────────
+
             # Sort all grasps by confidence descending and store for retry loop
             sort_idx = np.argsort(grasp_conf_np.ravel())[::-1]
             self._all_grasps_base     = grasps_base_np[sort_idx]   # real base frame
@@ -1584,11 +1753,38 @@ class GraspExecuteApp:
 
             if self._vis:
                 gripper_name = grasp_cfg.data.gripper_name
+                if self._debug_var.get():
+                    # Rebuild full scene so step 7 looks identical to the normal result
+                    self._vis.delete()
+                    make_frame(self._vis, "robot_base", h=0.15, radius=0.005)
+                    _cf = np.eye(4)
+                    _cf[:3, :3] = R_flip @ T_cam2base_m[:3, :3]
+                    _cf[:3, 3]  = cam_pos_base
+                    self._vis["camera_frame"].set_transform(_cf)
+                    make_frame(self._vis["camera_frame"], "axes", h=0.08, radius=0.003)
+                    _of = np.eye(4); _of[:3, 3] = obj_centroid_base
+                    self._vis["object_frame"].set_transform(_of)
+                    make_frame(self._vis["object_frame"], "axes", h=0.06, radius=0.003)
+                    _sc = scene_colors if scene_colors is not None else \
+                        np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
+                    _fp = np.vstack([scene_base, pc_base]) \
+                        if scene_base is not None and len(scene_base) > 0 else pc_base
+                    _fc = np.vstack([_sc, object_colors_filtered]) \
+                        if scene_base is not None and len(scene_base) > 0 \
+                        else object_colors_filtered
+                    visualize_pointcloud(self._vis, "pc_full", _fp, _fc,
+                                         size=args.scene_point_size)
                 # Visualize grasps in Z-up work frame (matches point cloud)
                 for i, g in enumerate(self._all_grasps_work):
                     col = [255, 255, 0] if i == 0 else self._all_grasp_scores[i].tolist()
                     visualize_grasp(self._vis, f"grasps/{i:03d}/grasp", g,
                                     color=col, gripper_name=gripper_name, linewidth=1.2)
+
+            # ── Debug step 7: final sorted grasps ────────────────────────────
+            self._debug_pause(
+                f"Step 7/7 — Final sorted grasps  ({len(self._all_grasps_work)} poses, "
+                f"best conf {float(grasp_conf_np.max()):.3f})")
+            # ────────────────────────────────────────────────────────────────
 
             best_info = _save_best_grasp(grasps_base_np, grasp_conf_np)
             self._best_grasp_base = self._all_grasps_base[0].copy()  # robot base frame, meters
@@ -1994,10 +2190,11 @@ def main():
               f"Use '📷 Connect Camera' in the UI once the device is attached.")
 
     root = tk.Tk()
-    GraspExecuteApp(root, args, camera, config_map, sam3_proc=sam3_proc, vis=vis)
+    app_ref = [GraspExecuteApp(root, args, camera, config_map, sam3_proc=sam3_proc, vis=vis)]
 
     def _on_close():
         print("Shutting down…")
+        app_ref[0]._debug_event.set()   # unblock any waiting debug pause
         camera.stop()
         if sam3_proc:
             try:
