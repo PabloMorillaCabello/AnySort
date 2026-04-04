@@ -96,6 +96,20 @@ _SAM3_PYTHON_CANDIDATES = [
 ]
 
 # ===========================================================================
+# Meshcat label helper
+# ===========================================================================
+def _vis_label(vis_node, text, z_offset=0.06):
+    """Attach a floating text label above a meshcat visualizer node."""
+    try:
+        import meshcat.geometry as _mcg
+        T = np.eye(4)
+        T[2, 3] = z_offset
+        vis_node["label"].set_object(_mcg.SceneText(text, font_size=80))
+        vis_node["label"].set_transform(T)
+    except Exception:
+        pass  # older meshcat without SceneText — silently skip
+
+# ===========================================================================
 # SAM3 server helpers  (identical to demo script)
 # ===========================================================================
 def _find_sam3_python():
@@ -1599,17 +1613,20 @@ class GraspExecuteApp:
                 self._vis.delete()
                 # Robot base frame at origin
                 make_frame(self._vis, "robot_base", h=0.15, radius=0.005)
+                _vis_label(self._vis["robot_base"], "Robot Base")
                 # Camera frame
                 cam_frame_4x4 = np.eye(4)
                 cam_frame_4x4[:3, :3] = R_flip @ T_cam2base_m[:3, :3]
                 cam_frame_4x4[:3, 3]  = cam_pos_base
                 self._vis["camera_frame"].set_transform(cam_frame_4x4)
                 make_frame(self._vis["camera_frame"], "axes", h=0.08, radius=0.003)
+                _vis_label(self._vis["camera_frame"], "Camera")
                 # Object centroid frame
                 obj_frame = np.eye(4)
                 obj_frame[:3, 3] = obj_centroid_base
                 self._vis["object_frame"].set_transform(obj_frame)
                 make_frame(self._vis["object_frame"], "axes", h=0.06, radius=0.003)
+                _vis_label(self._vis["object_frame"], "Object")
 
                 _sc = scene_colors if scene_colors is not None else \
                     np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
@@ -1757,14 +1774,17 @@ class GraspExecuteApp:
                     # Rebuild full scene so step 7 looks identical to the normal result
                     self._vis.delete()
                     make_frame(self._vis, "robot_base", h=0.15, radius=0.005)
+                    _vis_label(self._vis["robot_base"], "Robot Base")
                     _cf = np.eye(4)
                     _cf[:3, :3] = R_flip @ T_cam2base_m[:3, :3]
                     _cf[:3, 3]  = cam_pos_base
                     self._vis["camera_frame"].set_transform(_cf)
                     make_frame(self._vis["camera_frame"], "axes", h=0.08, radius=0.003)
+                    _vis_label(self._vis["camera_frame"], "Camera")
                     _of = np.eye(4); _of[:3, 3] = obj_centroid_base
                     self._vis["object_frame"].set_transform(_of)
                     make_frame(self._vis["object_frame"], "axes", h=0.06, radius=0.003)
+                    _vis_label(self._vis["object_frame"], "Object")
                     _sc = scene_colors if scene_colors is not None else \
                         np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
                     _fp = np.vstack([scene_base, pc_base]) \
