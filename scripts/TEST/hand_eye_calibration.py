@@ -30,6 +30,11 @@ from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# Redirect OrbbecSDK C-level stderr to file — prevents timestamp-anomaly spam
+# from flooding the terminal. Full log available at /tmp/orbbec_sdk.log
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import orbbec_quiet  # noqa: E402
+
 import cv2
 import numpy as np
 import tkinter as tk
@@ -71,22 +76,46 @@ _DEFAULT_FX, _DEFAULT_FY = 905.0, 905.0
 _DEFAULT_CX, _DEFAULT_CY = 640.0, 360.0
 
 # Pre-programmed calibration poses  [X_mm, Y_mm, Z_mm, Rx_deg, Ry_deg, Rz_deg]
+#
+# Design rules for good rotation accuracy:
+#   1. Board must appear at DIFFERENT places in the camera image → vary X, Y, Z
+#   2. Rotation axes each need ≥ 45° total spread → large Rx/Rz range, Ry 0–45°
+#   3. Avoid clustering many poses at the same position with only small angle changes
+#
+# !! BEFORE RUNNING: verify poses 1–4 in manual mode to confirm the board is
+#    visible in the camera at each position, then run auto mode. !!
 CALIB_POSES = [
-    [300, -100, 400,   0,  30,   0],
-    [300, -100, 400,  20,  30,   0],
-    [300, -100, 400, -20,  30,   0],
-    [300, -100, 400,   0,  15,   0],
-    [300, -100, 400,   0,  45,   0],
-    [300, -100, 400,   0,  30,  20],
-    [300, -100, 400,   0,  30, -20],
-    [250, -150, 380,  10,  30,  10],
-    [350,  -50, 420, -10,  30, -10],
-    [280, -100, 350,  15,  25,   5],
-    [320, -100, 450, -15,  35,  -5],
-    [300, -120, 400,   5,  30,  15],
-    [300,  -80, 400,  -5,  30, -15],
-    [270, -110, 395,  10,  20,   0],
-    [330,  -90, 405, -10,  40,   0],
+    # ── Centre — sweep each rotation axis independently (big range) ──────
+    [300, -100, 400,   0,   0,   0],   # neutral: board flat facing camera
+    [300, -100, 400,  40,   0,   0],   # Rx +40
+    [300, -100, 400, -40,   0,   0],   # Rx -40
+    [300, -100, 400,   0,  40,   0],   # Ry +40 (tilt forward)
+    [300, -100, 400,   0,   0,  45],   # Rz +45
+    [300, -100, 400,   0,   0, -45],   # Rz -45
+    # ── Centre — combined / diagonal rotations ───────────────────────────
+    [300, -100, 400,  30,  20,  30],
+    [300, -100, 400, -30,  20, -30],
+    [300, -100, 400,  30,  20, -30],
+    [300, -100, 400, -30,  20,  30],
+    # ── Different XY — board at different corners of the camera FOV ──────
+    [210, -200, 390,   0,  20,   0],   # far left / back
+    [390, -200, 390,   0,  20,   0],   # far right / back
+    [210,  -20, 390,   0,  20,   0],   # far left / front
+    [390,  -20, 390,   0,  20,   0],   # far right / front
+    # ── Different XY with rotations ──────────────────────────────────────
+    [220, -190, 380,  25,  25,  25],
+    [380, -190, 380, -25,  25, -25],
+    [220,  -30, 380,  25,  25, -25],
+    [380,  -30, 380, -25,  25,  25],
+    # ── Z variation (different camera distances) ─────────────────────────
+    [300, -100, 320,   0,  15,   0],   # closer
+    [300, -100, 320,  30,  15,  30],
+    [300, -100, 480,   0,  15,   0],   # further
+    [300, -100, 480, -30,  15, -30],
+    # ── Extreme rotations — needed to break rotation degeneracy ──────────
+    [300, -100, 400,  40,   5,  40],
+    [300, -100, 400, -40,   5, -40],
+    [300, -100, 400,   0,  45,  45],
 ]
 
 # ===========================================================================
@@ -129,7 +158,7 @@ class OrbbecCamera:
         cfg.enable_stream(color_profile)
         pipeline.start(cfg)
         self._pipeline = pipeline
-        # Read intrinsics
+        # Read intrinsics from SDK
         try:
             cp = pipeline.get_camera_param()
             for attr in ("rgb_intrinsic", "color_intrinsic"):
@@ -171,7 +200,23 @@ class OrbbecCamera:
             return None if self._latest_rgb is None else self._latest_rgb.copy()
 
     def intrinsics(self) -> Tuple[np.ndarray, np.ndarray]:
-        return self._K, np.zeros((5,), np.float64)
+        # Try to load distortion from camera_calibration.py output
+        calib_file = Path("/ros2_ws/data/calibration/camera_intrinsics.npz")
+        if calib_file.exists():
+            try:
+                data = np.load(str(calib_file))
+                d = data["dist_coeffs"].ravel().astype(np.float64)
+                # Also use calibrated K if image size matches
+                sz = tuple(data["image_size"].astype(int)) if "image_size" in data else None
+                if sz is not None and self._K is not None:
+                    # Check resolution match (within 10px tolerance)
+                    cx_ok = abs(data["camera_matrix"][0, 2] - self._K[0, 2]) < 50
+                    if cx_ok:
+                        return data["camera_matrix"].astype(np.float64), d
+                return self._K, d
+            except Exception:
+                pass
+        return self._K, np.zeros(5, np.float64)
 
     def stop(self):
         self._running = False
@@ -294,6 +339,13 @@ class DobotDashboard:
     # Motion  (returns CommandID)
     # ------------------------------------------------------------------
     def _send_motion(self, resp):
+        # DobotApiDashboard methods may return None or b'' if the response
+        # wasn't read yet.  Try reading once more via wait_reply().
+        if resp is None or resp == b'' or resp == '':
+            try:
+                resp = self._dashboard.wait_reply()
+            except Exception:
+                pass
         parsed = _parse_result_id(resp)
         if len(parsed) < 2 or parsed[0] != 0:
             raise RuntimeError(f"Move rejected (ErrorID={parsed[0] if parsed else '?'}): {resp!r}")
@@ -478,13 +530,44 @@ def euler_zyx_to_rmat(rx, ry, rz):
     return Rz @ Ry @ Rx
 
 
+def _handeye_residual(R_c2b, t_c2b, R_b2g, t_b2g, R_t2c, t_t2c):
+    """
+    Consistency residual for eye-to-hand: for a perfect calibration,
+    T_gripper2base_i^-1 @ T_cam2base @ T_target2cam_i = T_target2gripper (constant).
+    Returns (rms_rotation_deg, rms_translation_mm).
+    """
+    def T4(R, t):
+        M = np.eye(4); M[:3, :3] = R; M[:3, 3] = np.asarray(t).ravel(); return M
+
+    TX = T4(R_c2b, t_c2b)
+    Ms = []
+    for i in range(len(R_b2g)):
+        # R_b2g[i] IS already T_base2gripper (FK was inverted in solve_hand_eye).
+        # Eye-to-hand constraint: T_base2gripper @ T_cam2base @ T_target2cam = constant
+        T_b2g = T4(R_b2g[i], t_b2g[i])
+        T_t2c = T4(R_t2c[i], t_t2c[i])
+        Ms.append(T_b2g @ TX @ T_t2c)
+
+    ts = np.array([M[:3, 3] for M in Ms])
+    t_rms = float(np.sqrt(np.mean(np.linalg.norm(ts - ts.mean(axis=0), axis=1) ** 2)))
+
+    R_ref = Ms[0][:3, :3]
+    rot_errs = []
+    for M in Ms:
+        cos_a = np.clip((np.trace(R_ref.T @ M[:3, :3]) - 1) / 2, -1.0, 1.0)
+        rot_errs.append(np.degrees(np.arccos(cos_a)))
+    r_rms = float(np.sqrt(np.mean(np.array(rot_errs) ** 2)))
+
+    return r_rms, t_rms
+
+
 def solve_hand_eye(robot_poses: list, board_poses: list) -> dict:
     n = len(robot_poses)
     R_b2g, t_b2g, R_t2c, t_t2c = [], [], [], []
     for (x, y, z, rx, ry, rz) in robot_poses:
         R = euler_zyx_to_rmat(rx, ry, rz)
         t = np.array([[x],[y],[z]], np.float64)
-        Ri, ti = R.T, -R.T @ t
+        Ri, ti = R.T, -R.T @ t          # eye-to-hand: invert FK → T_base2gripper
         R_b2g.append(Ri); t_b2g.append(ti)
     for (rvec, tvec) in board_poses:
         Rv, _ = cv2.Rodrigues(rvec.reshape(3,1))
@@ -499,20 +582,27 @@ def solve_hand_eye(robot_poses: list, board_poses: list) -> dict:
         "DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
     }
     results = {}
+    residuals = {}
     for name, flag in methods.items():
         try:
             R_c2b, t_c2b = cv2.calibrateHandEye(R_b2g, t_b2g, R_t2c, t_t2c, method=flag)
+            r_rms, t_rms = _handeye_residual(R_c2b, t_c2b, R_b2g, t_b2g, R_t2c, t_t2c)
             results[name] = (R_c2b, t_c2b)
-        except Exception as e:
+            residuals[name] = (r_rms, t_rms)
+        except Exception:
             results[name] = None
+            residuals[name] = (float("inf"), float("inf"))
 
-    primary = next((k for k in ("TSAI","PARK","HORAUD","ANDREFF","DANIILIDIS")
-                    if results.get(k) is not None), None)
-    if primary is None:
+    # Pick method with lowest translation residual (most reliable metric in mm space)
+    valid = [(k, residuals[k][1]) for k in results if results[k] is not None]
+    if not valid:
         raise RuntimeError("All hand-eye methods failed.")
+    primary = min(valid, key=lambda x: x[1])[0]
+
     R_c2b, t_c2b = results[primary]
     T = np.eye(4); T[:3,:3] = R_c2b; T[:3,3] = t_c2b.ravel()
-    return {"T": T, "R": R_c2b, "t": t_c2b, "primary": primary, "all": results}
+    return {"T": T, "R": R_c2b, "t": t_c2b, "primary": primary,
+            "all": results, "residuals": residuals}
 
 
 def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
@@ -561,6 +651,8 @@ class HandEyeCalibApp:
         # Data
         self._robot_poses: list = []
         self._board_poses: list = []
+        self._guide_idx: int = 0   # tracks which CALIB_POSES target to show next
+        self._goto_chaining = False  # True while stepping through poses automatically
         self._state = self.IDLE
         self._board = None
         self._aruco_dict = None
@@ -799,6 +891,23 @@ class HandEyeCalibApp:
             command=self._on_capture_manual, state="disabled")
         self._capture_btn.pack(padx=12, pady=2, fill="x", ipady=8)
 
+        # Guided pose target display (manual mode only)
+        self._guide_frame = tk.Frame(right, bg="#2a2a3a", relief="flat")
+        self._guide_frame.pack(padx=12, pady=(0, 4), fill="x")
+        tk.Label(self._guide_frame, text="Next target pose →",
+                 bg="#2a2a3a", fg="#e5c07b", font=("Helvetica", 8, "bold")
+                 ).pack(anchor="w", padx=6, pady=(4, 0))
+        self._guide_var = tk.StringVar(value="—")
+        tk.Label(self._guide_frame, textvariable=self._guide_var,
+                 bg="#2a2a3a", fg="#61afef", font=("Courier", 9),
+                 justify="left", anchor="w"
+                 ).pack(anchor="w", padx=6, pady=(0, 2))
+        self._goto_btn = tk.Button(
+            self._guide_frame, text="🤖  Send robot to this pose",
+            bg="#4a5568", fg="white", relief="flat", font=("Helvetica", 9),
+            command=self._on_goto_target)
+        self._goto_btn.pack(fill="x", padx=6, pady=(0, 6), ipady=4)
+
         self._stop_btn = tk.Button(
             right, text="■  Stop",
             bg="#e06c75", fg="white", activebackground="#c0505a",
@@ -869,7 +978,9 @@ class HandEyeCalibApp:
             self._camera = OrbbecCamera()
             self._camera.start()
             self._K, self._d = self._camera.intrinsics()
-            self._log(f"[Camera] Started  K.fx={self._K[0,0]:.1f}")
+            d_loaded = any(v != 0 for v in self._d)
+            self._log(f"[Camera] Started  K.fx={self._K[0,0]:.1f}  "
+                      f"dist={'loaded from file' if d_loaded else 'zeros (run camera_calibration.py first)'}")
         except Exception as e:
             self._log(f"[Camera] ERROR: {e}")
             self._camera = None
@@ -1237,8 +1348,11 @@ class HandEyeCalibApp:
         if mode == "auto":
             self._start_btn.config(text="▶  Start Auto Calibration", state="normal")
             self._capture_btn.config(state="disabled")
+            self._guide_frame.pack_forget()
         else:
             self._start_btn.config(text="▶  Start Manual Mode", state="normal")
+            self._guide_frame.pack(padx=12, pady=(0, 4), fill="x",
+                                   after=self._capture_btn)
             if self._state == self.MANUAL:
                 self._capture_btn.config(state="normal")
 
@@ -1264,10 +1378,95 @@ class HandEyeCalibApp:
         else:
             self._start_manual()
 
+    def _update_guide(self):
+        """Update the guided-pose target label for manual mode."""
+        targets = self._auto_poses if self._auto_poses else CALIB_POSES
+        idx = self._guide_idx
+        if idx >= len(targets):
+            self._guide_var.set(f"All {len(targets)} targets done ✓\n(keep adding for more accuracy)")
+            return
+        entry = targets[idx]
+        c = entry.get("cartesian") if isinstance(entry, dict) else list(entry)
+        if c and len(c) >= 6:
+            self._guide_var.set(
+                f"#{idx+1}/{len(targets)}  "
+                f"Rx={c[3]:+.0f}°  Ry={c[4]:+.0f}°  Rz={c[5]:+.0f}°\n"
+                f"  aim for  X≈{c[0]:.0f}  Y≈{c[1]:.0f}  Z≈{c[2]:.0f} mm")
+        else:
+            self._guide_var.set(f"#{idx+1}/{len(targets)}")
+
+    def _on_goto_target(self):
+        if self._state != self.MANUAL:
+            return
+        if not self._robot_connected or self._robot is None:
+            self._log("[Goto] Robot not connected — click ⚡ Connect Robot first")
+            return
+        targets = self._auto_poses if self._auto_poses else CALIB_POSES
+        if self._guide_idx >= len(targets):
+            self._log("[Goto] All targets done.")
+            return
+        entry = targets[self._guide_idx]
+        c = entry.get("cartesian") if isinstance(entry, dict) else list(entry)
+        joints = entry.get("joints") if isinstance(entry, dict) else None
+        if not c and joints is None:
+            self._log("[Goto] No cartesian position for this target.")
+            return
+        self._goto_btn.config(state="disabled", text="Moving…")
+        self._capture_btn.config(state="disabled")
+        threading.Thread(target=self._goto_worker,
+                         args=(c, joints), daemon=True).start()
+
+    def _goto_worker(self, cart, joints):
+        try:
+            robot = self._robot
+            if joints is not None:
+                cmd_id = robot.move_joint_angles(*joints)
+            else:
+                x, y, z, rx, ry, rz = cart
+                cmd_id = robot.move_joint(x, y, z, rx, ry, rz)
+            robot.wait_motion(cmd_id, timeout=60.0)
+            self._log(f"[Goto] Arrived at pose #{self._guide_idx + 1}. "
+                      f"Settling {SETTLE_TIME}s…")
+            time.sleep(SETTLE_TIME)
+            # Auto-capture after arriving (chaining enabled)
+            self._goto_chaining = True
+            self._ui(self._trigger_capture_from_goto)
+        except Exception as e:
+            self._log(f"[Goto] Move error: {e}")
+            self._ui(lambda: (
+                self._goto_btn.config(state="normal",
+                                      text="🤖  Send robot to this pose"),
+                self._capture_btn.config(
+                    state="normal" if self._state == self.MANUAL else "disabled")))
+
+    def _trigger_capture_from_goto(self):
+        """Called on main thread after robot arrives — captures if board detected."""
+        self._goto_btn.config(state="normal", text="🤖  Send robot to this pose")
+        if self._camera is None:
+            self._capture_btn.config(state="normal")
+            return
+        rgb = self._camera.get_latest_rgb()
+        if rgb is None:
+            self._capture_btn.config(state="normal")
+            return
+        rvec, tvec, _, num = detect_charuco(
+            rgb, self._aruco_dict, self._board, self._detector, self._K, self._d)
+        if rvec is not None:
+            # Board detected — auto-capture
+            threading.Thread(target=self._capture_manual_worker, daemon=True).start()
+        else:
+            self._log(f"[Goto] Board not detected ({num} corners) — "
+                      f"reposition if needed, then click Capture manually.")
+            self._capture_btn.config(state="normal")
+
     def _start_manual(self):
         self._state = self.MANUAL
+        self._guide_idx = 0
+        self._update_guide()
+        targets = self._auto_poses if self._auto_poses else CALIB_POSES
         self._set_status("Manual mode — move robot, click Capture Pose.")
-        self._log("[Manual] Started. Move robot to each position and click Capture Pose.")
+        self._log(f"[Manual] Started. {len(targets)} target poses to collect.")
+        self._log("[Manual] Move robot to the shown orientation and click Capture Pose.")
         self._capture_btn.config(state="normal",
                                   text=f"📷  Capture Pose  ({len(self._robot_poses)} captured)")
         self._stop_btn.config(state="normal")
@@ -1297,7 +1496,23 @@ class HandEyeCalibApp:
         try:
             if self._robot_connected and self._robot is not None:
                 robot = self._robot
-                self._log("[Auto] Using existing robot connection.")
+                # Health-check: verify the socket is still alive
+                try:
+                    robot.get_pose()
+                    self._log("[Auto] Using existing robot connection.")
+                except Exception:
+                    self._log("[Auto] Existing connection dead — reconnecting…")
+                    try:
+                        robot.close()
+                    except Exception:
+                        pass
+                    self._robot = None
+                    self._robot_connected = False
+                    robot = None
+            else:
+                robot = None
+
+            if robot is not None:
                 robot.set_speed(speed)
                 try:
                     tool_idx = int(self._tool_idx_var.get())
@@ -1336,6 +1551,9 @@ class HandEyeCalibApp:
                     tool_idx = 1
                 robot.set_tool(tool_idx)
                 self._log(f"[Auto] Tool TCP set to index {tool_idx}")
+                self._robot = robot
+                self._robot_connected = True
+                self._ui(self._on_robot_connected_ui)
             poses_to_use = self._auto_poses if self._auto_poses else CALIB_POSES
             src = "saved" if self._auto_poses else "built-in"
             self._log(f"[Auto] Robot ready. Speed={speed}%  Poses={len(poses_to_use)} ({src})")
@@ -1409,8 +1627,8 @@ class HandEyeCalibApp:
                 try:
                     pose = robot.get_pose()
                 except Exception as e:
-                    self._log(f"[Auto] GetPose error: {e} — using target pose")
-                    pose = tuple(cart)
+                    self._log(f"[Auto] GetPose error: {e} — skipping pose {idx+1}")
+                    continue
 
                 new_r.append(pose)
                 new_b.append(det)
@@ -1436,6 +1654,7 @@ class HandEyeCalibApp:
             self._ui(lambda t=total: self._post_collection(t))
 
     def _on_capture_manual(self):
+        self._goto_chaining = False  # manual click breaks auto-chain
         if self._state != self.MANUAL:
             return
         if self._camera is None:
@@ -1475,7 +1694,19 @@ class HandEyeCalibApp:
             n = len(self._robot_poses)
             self._log(f"[Manual] Capture {n}: pose=[{','.join(f'{v:.1f}' for v in pose)}]  "
                       f"t=[{tvec[0,0]:.3f},{tvec[1,0]:.3f},{tvec[2,0]:.3f}]m")
-            self._ui(lambda n=n: self._update_progress(n))
+            self._guide_idx += 1
+            chaining = self._goto_chaining
+            def _post(n=n, c=chaining):
+                self._update_progress(n)
+                self._update_guide()
+                if c:
+                    targets = self._auto_poses if self._auto_poses else CALIB_POSES
+                    if self._guide_idx < len(targets):
+                        self.root.after(1500, self._on_goto_target)
+                    else:
+                        self._goto_chaining = False
+                        self._log("[Goto] All poses captured — click Solve to calibrate.")
+            self._ui(_post)
         finally:
             n = len(self._robot_poses)
             self._ui(lambda: self._capture_btn.config(
@@ -1519,19 +1750,26 @@ class HandEyeCalibApp:
                                   self._robot_poses, self._board_poses, OUTPUT_DIR)
             T = result["T"]
             t_mm = result["t"].ravel()
-            self._log(f"\n[Result] Primary method: {result['primary']}")
+            primary_r, primary_t = result["residuals"][result["primary"]]
+            self._log(f"\n[Result] Primary method: {result['primary']}  "
+                      f"(residual: rot={primary_r:.3f}°  t={primary_t:.2f}mm)")
             self._log(f"[Result] t_cam2base = [{t_mm[0]:.1f}, {t_mm[1]:.1f}, {t_mm[2]:.1f}] mm")
             if _SCIPY_OK:
                 e = Rotation.from_matrix(result["R"]).as_euler("ZYX", degrees=True)
                 self._log(f"[Result] R ZYX = [{e[0]:.2f}, {e[1]:.2f}, {e[2]:.2f}] deg")
             self._log(f"[Result] T_cam2base:\n{np.array2string(T, precision=3, suppress_small=True)}")
             self._log(f"[Result] Saved to {OUTPUT_DIR}/hand_eye_calib.npz + .json")
-            self._set_status(f"Calibration done!  t=[{t_mm[0]:.1f},{t_mm[1]:.1f},{t_mm[2]:.1f}]mm")
-            self._log("[All methods]")
+            quality = "GOOD" if primary_t < 3.0 else ("ACCEPTABLE" if primary_t < 8.0 else "POOR — recollect poses")
+            self._set_status(f"Calibration done! [{quality}]  residual={primary_t:.2f}mm  "
+                             f"t=[{t_mm[0]:.1f},{t_mm[1]:.1f},{t_mm[2]:.1f}]mm")
+            self._log("[All methods — translation residual (lower = better)]")
             for name, val in result["all"].items():
                 if val:
                     R, t = val
-                    self._log(f"  {name:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm")
+                    r_res, t_res = result["residuals"][name]
+                    marker = " ← selected" if name == result["primary"] else ""
+                    self._log(f"  {name:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm  "
+                              f"residual={t_res:.2f}mm{marker}")
         except Exception as e:
             self._log(f"[Solve] ERROR: {e}")
             self._set_status(f"Solve failed: {e}")

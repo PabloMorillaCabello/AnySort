@@ -273,47 +273,134 @@ def _to_rgb_array(color_frame, OBFormat):
     raise RuntimeError(f"Unsupported color format: {fmt}")
 
 
-def _extract_depth_intrinsics(depth_profile, depth_frame):
-    for obj in [depth_frame, depth_profile]:
-        if obj is None:
+def _extract_intrinsics(profile_or_frame):
+    """Try to read (fx, fy, cx, cy) from a stream profile or frame object."""
+    if profile_or_frame is None:
+        raise RuntimeError("Cannot read intrinsics from None")
+    for method in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
+        if not hasattr(profile_or_frame, method):
             continue
-        for method in ["get_intrinsic", "get_camera_intrinsic", "get_intrinsics"]:
-            if not hasattr(obj, method):
-                continue
-            intr = getattr(obj, method)()
-            try:
-                fx = float(next(getattr(intr, a) for a in ["fx", "focal_x"] if hasattr(intr, a)))
-                fy = float(next(getattr(intr, a) for a in ["fy", "focal_y"] if hasattr(intr, a)))
-                cx = float(next(getattr(intr, a) for a in ["cx", "ppx", "principal_x"] if hasattr(intr, a)))
-                cy = float(next(getattr(intr, a) for a in ["cy", "ppy", "principal_y"] if hasattr(intr, a)))
-                return fx, fy, cx, cy
-            except StopIteration:
-                continue
-    raise RuntimeError("Cannot read depth intrinsics")
+        intr = getattr(profile_or_frame, method)()
+        try:
+            fx = float(next(getattr(intr, a) for a in ["fx", "focal_x"] if hasattr(intr, a)))
+            fy = float(next(getattr(intr, a) for a in ["fy", "focal_y"] if hasattr(intr, a)))
+            cx = float(next(getattr(intr, a) for a in ["cx", "ppx", "principal_x"] if hasattr(intr, a)))
+            cy = float(next(getattr(intr, a) for a in ["cy", "ppy", "principal_y"] if hasattr(intr, a)))
+            return fx, fy, cx, cy
+        except StopIteration:
+            continue
+    raise RuntimeError("Cannot read camera intrinsics")
 
 
 class OrbbecCamera:
+    """Orbbec Gemini 2 camera with HW D2C alignment and frame sync.
+
+    After start(), depth is hardware-aligned to the color sensor so every
+    depth pixel corresponds 1:1 to the same color pixel.  Intrinsics are
+    taken from the **color** profile (the alignment target).
+    """
+
     def __init__(self):
-        from pyorbbecsdk import Config, OBSensorType, Pipeline, OBFormat
+        from pyorbbecsdk import (Config, OBAlignMode, OBFormat,
+                                 OBSensorType, Pipeline)
         self._OBFormat = OBFormat
+        self._OBAlignMode = OBAlignMode
+        self._OBSensorType = OBSensorType
         self._lock     = threading.Lock()
         self._rgb      = None
         self._depth_m  = None
         self._intr     = None
         self._running  = False
-        self._depth_profile = None
+        self._color_profile = None
+        self._depth_filters = []
 
     def start(self):
-        from pyorbbecsdk import Config, OBSensorType, Pipeline
+        from pyorbbecsdk import Config, OBAlignMode, OBFormat, OBSensorType, Pipeline
         pipeline = Pipeline()
-        config   = Config()
-        depth_list  = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        depth_prof  = depth_list.get_default_video_stream_profile()
-        config.enable_stream(depth_prof)
-        self._depth_profile = depth_prof
-        color_list  = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-        config.enable_stream(color_list.get_default_video_stream_profile())
+
+        # Enable hardware frame sync
+        try:
+            pipeline.enable_frame_sync()
+            print("[Camera] Frame sync enabled")
+        except Exception as e:
+            print(f"[Camera] Frame sync failed: {e}")
+
+        config = Config()
+
+        # Find an RGB colour profile and a matching HW-D2C depth profile
+        color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        hw_d2c_ok = False
+        for i in range(len(color_profiles)):
+            cp = color_profiles[i]
+            if cp.get_format() != OBFormat.RGB:
+                continue
+            try:
+                d2c_list = pipeline.get_d2c_depth_profile_list(cp, OBAlignMode.HW_MODE)
+            except Exception:
+                continue
+            if len(d2c_list) == 0:
+                continue
+            dp = None
+            for j in range(len(d2c_list)):
+                if d2c_list[j].get_format() == OBFormat.Y16:
+                    dp = d2c_list[j]
+                    break
+            if dp is None:
+                dp = d2c_list[0]
+            config.enable_stream(dp)
+            config.enable_stream(cp)
+            config.set_align_mode(OBAlignMode.HW_MODE)
+            self._color_profile = cp
+            hw_d2c_ok = True
+            print(f"[Camera] HW D2C: color {cp.get_width()}x{cp.get_height()} "
+                  f"depth {dp.get_width()}x{dp.get_height()}")
+            break
+
+        if not hw_d2c_ok:
+            print("[Camera] WARNING: HW D2C unavailable -- falling back to defaults")
+            depth_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+            dp = None
+            for j in range(len(depth_list)):
+                if depth_list[j].get_format() == OBFormat.Y16:
+                    dp = depth_list[j]
+                    break
+            if dp is None:
+                dp = depth_list.get_default_video_stream_profile()
+            config.enable_stream(dp)
+            color_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+            cp = color_list.get_default_video_stream_profile()
+            config.enable_stream(cp)
+            self._color_profile = cp
+
         pipeline.start(config)
+
+        try:
+            import orbbec_quiet
+            orbbec_quiet.reapply()
+        except Exception:
+            pass
+
+        # Depth post-processing filters
+        try:
+            device = pipeline.get_device()
+            sensor = device.get_sensor(OBSensorType.DEPTH_SENSOR)
+            filters = sensor.get_recommended_filters()
+            for f in filters:
+                f.enable(True)
+                print(f"[Camera] Depth filter: {f.get_name()} (enabled)")
+            self._depth_filters = filters
+        except Exception as e:
+            print(f"[Camera] Depth filters unavailable: {e}")
+            self._depth_filters = []
+
+        # Let the sensor stabilise
+        print("[Camera] Stabilising sensor (15 frames)...")
+        for _ in range(15):
+            try:
+                pipeline.wait_for_frames(200)
+            except Exception:
+                pass
+
         self._pipeline = pipeline
         self._running  = True
         threading.Thread(target=self._loop, daemon=True).start()
@@ -336,21 +423,37 @@ class OrbbecCamera:
             except Exception:
                 continue
             try:
+                # Apply depth post-processing filters
+                for filt in self._depth_filters:
+                    if filt.is_enabled():
+                        try:
+                            df = filt.process(df)
+                        except Exception:
+                            pass
+                if hasattr(df, "as_depth_frame"):
+                    df = df.as_depth_frame()
                 dh, dw = df.get_height(), df.get_width()
-                raw    = np.frombuffer(df.get_data(), dtype=np.uint16).reshape(dh, dw)
-                scale  = float(df.get_depth_scale())
-                depth  = raw.astype(np.float32) * scale
-                valid  = depth[(depth > 0.05) & np.isfinite(depth)]
+                depth_raw = np.frombuffer(df.get_data(),
+                                          dtype=np.uint16).reshape(dh, dw)
+                scale = float(df.get_depth_scale())
+                depth_m = depth_raw.astype(np.float32) * scale
+                # Auto-detect mm vs m
+                valid = depth_m[(depth_m > 0.05) & np.isfinite(depth_m)]
                 if valid.size > 0 and float(np.median(valid)) > 20.0:
-                    depth /= 1000.0
+                    depth_m /= 1000.0
+
+                # With HW D2C, depth is already aligned to colour resolution
                 if rgb.shape[0] != dh or rgb.shape[1] != dw:
-                    rgb = np.array(PILImage.fromarray(rgb).resize((dw, dh), PILImage.BILINEAR))
-                intr = _extract_depth_intrinsics(self._depth_profile, df)
+                    rgb = np.array(PILImage.fromarray(rgb).resize(
+                        (dw, dh), PILImage.BILINEAR))
+
+                # Use colour intrinsics (the D2C alignment target)
+                intr = _extract_intrinsics(self._color_profile)
             except Exception:
                 continue
             with self._lock:
                 self._rgb     = rgb
-                self._depth_m = depth
+                self._depth_m = depth_m
                 self._intr    = intr
 
     def get_latest(self):
@@ -446,6 +549,11 @@ class DobotDashboard:
         raise ValueError(f"Cannot parse pose: {self._dashboard.GetPose()!r}")
 
     def _send_motion(self, resp):
+        if resp is None or resp == b'' or resp == '':
+            try:
+                resp = self._dashboard.wait_reply()
+            except Exception:
+                pass
         parsed = _parse_result_id(resp)
         if len(parsed) < 2 or parsed[0] != 0:
             raise RuntimeError(f"Move rejected (err={parsed[0] if parsed else '?'}): {resp!r}")

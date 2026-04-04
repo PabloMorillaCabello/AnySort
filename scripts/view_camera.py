@@ -57,7 +57,7 @@ _DEFAULT_CY = 400.0
 # How often (in camera frames) to rebuild the point cloud in the O3D window.
 _PCD_UPDATE_EVERY = 15
 # Maximum points sent to Open3D per update (keeps it interactive).
-_PCD_MAX_PTS = 80_000
+_PCD_MAX_PTS = 10_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +225,14 @@ def build_open3d_pcd(depth_raw: np.ndarray,
     yv = ys[valid].astype(np.float32)
     zv = z_mm[valid] / 1000.0          # mm → m
 
-    pts = np.column_stack([(xv - cx) * zv / fx,
-                            (yv - cy) * zv / fy,
-                            zv])
+    # Camera frame: X right, Y down, Z forward (depth)
+    # World frame (Z up): X right, Y forward (depth), Z up (-cam_Y)
+    X_cam = (xv - cx) * zv / fx
+    Y_cam = (yv - cy) * zv / fy
+    Z_cam = zv
+    pts = np.column_stack([X_cam,    # world X = cam X (right)
+                            Z_cam,   # world Y = cam Z (depth / forward)
+                            -Y_cam]) # world Z = -cam Y (up)
 
     # Downsample so Open3D stays interactive
     if len(pts) > max_pts:
@@ -266,7 +271,7 @@ def depth_color_to_pointcloud(depth: np.ndarray, color: np.ndarray,
     valid_mask = depth > 0
 
     Z = depth[valid_mask].astype(np.float32) / 1000.0
-    X = (x_coords[valid_mask] - cx) * Z / fx
+    X = -(x_coords[valid_mask] - cx) * Z / fx  # negate X: depth stream is horizontally mirrored
     Y = (y_coords[valid_mask] - cy) * Z / fy
     valid_colors = color[valid_mask]
 
@@ -424,6 +429,9 @@ def main():
             pcd_vis.create_window("Point Cloud 3D — Orbbec Gemini 2", width=960, height=640)
             pcd_geom = o3d.geometry.PointCloud()
             pcd_vis.add_geometry(pcd_geom)
+            # Add origin coordinate frame (X=red, Y=green, Z=blue), size 0.3 m
+            coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3, origin=[0, 0, 0])
+            pcd_vis.add_geometry(coord_frame)
             opt = pcd_vis.get_render_option()
             opt.point_size = 2.0
             opt.background_color = np.array([0.08, 0.08, 0.12])

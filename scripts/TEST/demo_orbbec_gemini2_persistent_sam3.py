@@ -32,10 +32,16 @@ import os
 import queue
 import socket as _socket
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Redirect OrbbecSDK C-level stderr to file — prevents timestamp-anomaly spam
+# from flooding the terminal. Full log available at /tmp/orbbec_sdk.log
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import orbbec_quiet  # noqa: E402
 
 import cv2
 import numpy as np
@@ -332,7 +338,14 @@ class OrbbecCamera:
         config = self._Config()
 
         depth_list = pipeline.get_stream_profile_list(self._OBSensorType.DEPTH_SENSOR)
-        depth_profile = depth_list.get_default_video_stream_profile()
+        # Prefer Y16 — RLE is not supported by post-processing filters or pixel-size API
+        depth_profile = None
+        for _j in range(len(depth_list)):
+            if depth_list[_j].get_format() == self._OBFormat.Y16:
+                depth_profile = depth_list[_j]
+                break
+        if depth_profile is None:
+            depth_profile = depth_list.get_default_video_stream_profile()
         config.enable_stream(depth_profile)
         self._depth_profile = depth_profile
 

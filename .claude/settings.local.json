@@ -4,7 +4,13 @@
       "Bash(grep -rlU $r C:UserspabloDesktopHV_THESISTryesGraspGenGraspGen_Thesis_Reposcripts/ C:UserspabloDesktopHV_THESISTryesGraspGenGraspGen_Thesis_Repodocker/)",
       "Bash(grep -E '\\\\.\\(sh|py\\)$')",
       "Bash(python -c \":*)",
-      "Bash(find /opt/Dobot_hv -name *.py)"
+      "Bash(find /opt/Dobot_hv -name *.py)",
+      "Bash(find /mnt/c/Users/pablo/Desktop/HV_THESIS/Tryes/GraspGen -name *.py)",
+      "Bash(xargs grep:*)",
+      "Bash(find /c/Users/pablo/Desktop/HV/_THESIS/Tryes/GraspGen/GraspGen_Thesis_Repo -name *point_cloud* -type f)",
+      "Bash(python3:*)",
+      "Bash(wc -l scripts/TEST/*.py)",
+      "Bash(wc -l scripts/*.py docker/Dockerfile docker/docker-compose.yml)"
     ]
   }
 }
