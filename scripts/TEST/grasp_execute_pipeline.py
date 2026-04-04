@@ -96,20 +96,6 @@ _SAM3_PYTHON_CANDIDATES = [
 ]
 
 # ===========================================================================
-# Meshcat label helper
-# ===========================================================================
-def _vis_label(vis_node, text, z_offset=0.06):
-    """Attach a floating text label above a meshcat visualizer node."""
-    try:
-        import meshcat.geometry as _mcg
-        T = np.eye(4)
-        T[2, 3] = z_offset
-        vis_node["label"].set_object(_mcg.SceneText(text, font_size=80))
-        vis_node["label"].set_transform(T)
-    except Exception:
-        pass  # older meshcat without SceneText — silently skip
-
-# ===========================================================================
 # SAM3 server helpers  (identical to demo script)
 # ===========================================================================
 def _find_sam3_python():
@@ -566,6 +552,30 @@ class DobotDashboard:
         raise ValueError(f"Cannot parse joints — raw: {resp!r}")
 
     # ------------------------------------------------------------------
+    # Reachability check (InverseKin)
+    # ------------------------------------------------------------------
+    def check_reachability(self, x, y, z, rx, ry, rz):
+        """Query InverseKin to verify (x,y,z mm, rx,ry,rz deg) is reachable.
+
+        Returns:
+            reachable (bool)
+            joints    (tuple of 6 floats in degrees, or None)
+            message   (str)
+        """
+        try:
+            resp = self._dashboard.InverseKin(x, y, z, rx, ry, rz)
+            nums = self._nums(resp)
+            if not nums:
+                return False, None, f"No response: {resp!r}"
+            err_id = int(nums[0])
+            if err_id != 0:
+                return False, None, f"Out of workspace (ErrorID={err_id})"
+            joints = tuple(nums[1:7]) if len(nums) >= 7 else None
+            return True, joints, "OK"
+        except Exception as e:
+            return False, None, f"InverseKin error: {e}"
+
+    # ------------------------------------------------------------------
     # Motion commands (return CommandID for wait_motion)
     # ------------------------------------------------------------------
     def _send_motion(self, resp):
@@ -706,7 +716,7 @@ def _process_point_cloud(pc, grasps, grasp_conf):
     grasps[:, 3, 3] = 1
     t_center = tra.translation_matrix(-pc.mean(axis=0))
     pc_centered = tra.transform_points(pc, t_center)
-    grasps_centered = np.array([t_center @ np.array(g) for g in grasps.tolist()])
+    grasps_centered = t_center @ grasps   # (4,4) @ (N,4,4) → (N,4,4) via numpy broadcast
     return pc_centered, grasps_centered, scores, t_center
 
 
@@ -778,6 +788,7 @@ class GraspExecuteApp:
 
         # Pipeline options
         self._collision_var  = tk.BooleanVar(value=False)  # enable GraspGen collision check
+        self._reach_var      = tk.BooleanVar(value=False)  # filter unreachable grasps
         self._debug_var      = tk.BooleanVar(value=False)  # step-by-step debug mode
         self._debug_event    = threading.Event()
         self._debug_event.set()  # start in "go" state
@@ -923,6 +934,11 @@ class GraspExecuteApp:
                        bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
                        selectcolor="#3a3a3a", font=("Helvetica", 8)
                        ).pack(anchor="w", padx=12, pady=(4, 2))
+        tk.Checkbutton(mid, text="Filter unreachable grasps (needs robot)",
+                       variable=self._reach_var,
+                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
+                       selectcolor="#3a3a3a", font=("Helvetica", 8)
+                       ).pack(anchor="w", padx=12, pady=(0, 2))
         tk.Checkbutton(mid, text="Process debug (step-by-step)",
                        variable=self._debug_var,
                        bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
@@ -1613,20 +1629,17 @@ class GraspExecuteApp:
                 self._vis.delete()
                 # Robot base frame at origin
                 make_frame(self._vis, "robot_base", h=0.15, radius=0.005)
-                _vis_label(self._vis["robot_base"], "Robot Base")
                 # Camera frame
                 cam_frame_4x4 = np.eye(4)
                 cam_frame_4x4[:3, :3] = R_flip @ T_cam2base_m[:3, :3]
                 cam_frame_4x4[:3, 3]  = cam_pos_base
                 self._vis["camera_frame"].set_transform(cam_frame_4x4)
                 make_frame(self._vis["camera_frame"], "axes", h=0.08, radius=0.003)
-                _vis_label(self._vis["camera_frame"], "Camera")
                 # Object centroid frame
                 obj_frame = np.eye(4)
                 obj_frame[:3, 3] = obj_centroid_base
                 self._vis["object_frame"].set_transform(obj_frame)
                 make_frame(self._vis["object_frame"], "axes", h=0.06, radius=0.003)
-                _vis_label(self._vis["object_frame"], "Object")
 
                 _sc = scene_colors if scene_colors is not None else \
                     np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
@@ -1659,10 +1672,11 @@ class GraspExecuteApp:
 
             grasps_obj_np = grasps.cpu().numpy()   # object/centered frame
             grasp_conf_np = grasp_conf.cpu().numpy()
+            n_generated = len(grasps_obj_np)
 
             # ── Debug step 5: all raw GraspGen poses (work frame) ────────────
             if self._debug_var.get() and self._vis:
-                _grasps_all_work = np.array([t_center_inv @ g for g in grasps_obj_np])
+                _grasps_all_work = t_center_inv @ grasps_obj_np
                 self._vis.delete()
                 visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
                                      size=args.scene_point_size)
@@ -1675,7 +1689,7 @@ class GraspExecuteApp:
             # ────────────────────────────────────────────────────────────────
 
             # Filter: keep only grasps approaching from above (Z-axis points down)
-            approach_z = np.array([g[2, 2] for g in grasps_obj_np])
+            approach_z = grasps_obj_np[:, 2, 2]
             top_down = approach_z < 0  # approach Z-axis pointing downward = from above
             if top_down.sum() == 0:
                 self._log("[GraspGen] WARNING: no top-down grasps — keeping all")
@@ -1683,12 +1697,13 @@ class GraspExecuteApp:
                 n_before = len(grasps_obj_np)
                 grasps_obj_np = grasps_obj_np[top_down]
                 grasp_conf_np = grasp_conf_np[top_down]
+                n_topdown_removed = n_before - len(grasps_obj_np)
                 self._log(f"[GraspGen] Top-down filter: {n_before} → "
                           f"{len(grasps_obj_np)} grasps")
 
             # ── Debug step 6: top-down filtered grasps ───────────────────────
             if self._debug_var.get() and self._vis:
-                _grasps_td_work = np.array([t_center_inv @ g for g in grasps_obj_np])
+                _grasps_td_work = t_center_inv @ grasps_obj_np
                 self._vis.delete()
                 visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
                                      size=args.scene_point_size)
@@ -1701,20 +1716,23 @@ class GraspExecuteApp:
             # ────────────────────────────────────────────────────────────────
 
             # Un-center: grasps go from centered → work frame (Z-up base)
-            grasps_work_np = np.array([t_center_inv @ g for g in grasps_obj_np])
+            grasps_work_np = t_center_inv @ grasps_obj_np   # (4,4) @ (N,4,4) → (N,4,4)
 
             # grasps_work_np are in the Z-up "work" frame.
             # Flip them back to the real robot base frame for motor commands.
             if z_needs_flip:
                 R_unflip_4x4 = np.eye(4)
                 R_unflip_4x4[:3, :3] = R_flip  # 180° around X is its own inverse
-                grasps_base_np = np.array([R_unflip_4x4 @ g for g in grasps_work_np])
+                grasps_base_np = R_unflip_4x4 @ grasps_work_np   # (4,4) @ (N,4,4) → (N,4,4)
             else:
                 grasps_base_np = grasps_work_np
 
             # Visualization uses the Z-up work frame (same as point cloud above)
             _, grasps_centered, scores, _ = _process_point_cloud(
                 pc_base, grasps_work_np, grasp_conf_np)
+
+            n_collision_removed = 0
+            n_reach_removed    = 0
 
             # ── Collision filtering ──────────────────────────────────────────
             if self._collision_var.get():
@@ -1752,12 +1770,47 @@ class GraspExecuteApp:
                     grasps_centered = grasps_centered[free_mask]
                     grasp_conf_np   = grasp_conf_np[free_mask]
                     scores          = scores[free_mask]
+                    n_collision_removed = n_before - int(free_mask.sum())
                     self._log(f"[Collision] {n_before} → {free_mask.sum()} "
                               f"collision-free grasps")
                     if len(grasps_work_np) == 0:
                         raise RuntimeError("All grasps filtered by collision check")
                 except Exception as ce:
                     self._log(f"[Collision] WARNING: {ce}")
+            # ── Reachability filtering ───────────────────────────────────────
+            if self._reach_var.get():
+                if not self._robot_connected or self._robot is None:
+                    self._log("[Reach] WARNING: robot not connected — filter skipped")
+                else:
+                    _approach_m = float(self._approach_var.get()) / 1000.0
+                    self._log(f"[Reach] Checking {len(grasps_work_np)} grasps…")
+                    reach_mask = []
+                    for _g in grasps_base_np:   # already in real robot base frame (m)
+                        try:
+                            _x, _y, _z, _rx, _ry, _rz = \
+                                self._grasp_base_to_robot_coords(_g)
+                            # pre-grasp along tool Z-axis (same logic as _on_execute)
+                            _tool_z = _g[:3, 2]
+                            _pre_mm = (_g[:3, 3] - _approach_m * _tool_z) * 1000.0
+                            ok_g, _, _ = self._robot.check_reachability(
+                                _x, _y, _z, _rx, _ry, _rz)
+                            ok_a, _, _ = self._robot.check_reachability(
+                                float(_pre_mm[0]), float(_pre_mm[1]), float(_pre_mm[2]),
+                                _rx, _ry, _rz)
+                            reach_mask.append(ok_g and ok_a)
+                        except Exception:
+                            reach_mask.append(False)
+                    reach_mask = np.array(reach_mask, dtype=bool)
+                    n_reach_removed = int((~reach_mask).sum())
+                    grasps_work_np  = grasps_work_np[reach_mask]
+                    grasps_base_np  = grasps_base_np[reach_mask]
+                    grasps_centered = grasps_centered[reach_mask]
+                    grasp_conf_np   = grasp_conf_np[reach_mask]
+                    scores          = scores[reach_mask]
+                    self._log(f"[Reach] {n_reach_removed} unreachable removed → "
+                              f"{len(grasps_work_np)} reachable grasps")
+                    if len(grasps_work_np) == 0:
+                        raise RuntimeError("All grasps filtered by reachability check")
             # ────────────────────────────────────────────────────────────────
 
             # Sort all grasps by confidence descending and store for retry loop
@@ -1774,17 +1827,14 @@ class GraspExecuteApp:
                     # Rebuild full scene so step 7 looks identical to the normal result
                     self._vis.delete()
                     make_frame(self._vis, "robot_base", h=0.15, radius=0.005)
-                    _vis_label(self._vis["robot_base"], "Robot Base")
                     _cf = np.eye(4)
                     _cf[:3, :3] = R_flip @ T_cam2base_m[:3, :3]
                     _cf[:3, 3]  = cam_pos_base
                     self._vis["camera_frame"].set_transform(_cf)
                     make_frame(self._vis["camera_frame"], "axes", h=0.08, radius=0.003)
-                    _vis_label(self._vis["camera_frame"], "Camera")
                     _of = np.eye(4); _of[:3, 3] = obj_centroid_base
                     self._vis["object_frame"].set_transform(_of)
                     make_frame(self._vis["object_frame"], "axes", h=0.06, radius=0.003)
-                    _vis_label(self._vis["object_frame"], "Object")
                     _sc = scene_colors if scene_colors is not None else \
                         np.tile([[120,120,120]], (len(scene_pc),1)).astype(np.uint8)
                     _fp = np.vstack([scene_base, pc_base]) \
@@ -1811,10 +1861,24 @@ class GraspExecuteApp:
 
             conf_min, conf_max = float(grasp_conf_np.min()), float(grasp_conf_np.max())
             best_conf = best_info.get("confidence", 0.0)
-            summary = (f"{len(grasps_base_np)} grasps [{conf_min:.3f}–{conf_max:.3f}]\n"
-                       f"Best conf: {best_conf:.4f}")
+            n_final = len(grasps_base_np)
+
+            # ── Filter summary ───────────────────────────────────────────────
             self._log("─" * 36)
-            self._log(summary)
+            self._log(f"[Summary] Generated:      {n_generated}")
+            if n_topdown_removed:
+                self._log(f"[Summary] − Top-down:     {n_topdown_removed}")
+            if n_collision_removed:
+                self._log(f"[Summary] − Collision:    {n_collision_removed}")
+            if n_reach_removed:
+                self._log(f"[Summary] − Unreachable:  {n_reach_removed}")
+            self._log(f"[Summary] = Shown:        {n_final}")
+            self._log(f"[Summary] Conf range:     [{conf_min:.3f} – {conf_max:.3f}]")
+            self._log(f"[Summary] Best conf:      {best_conf:.4f}")
+            # ────────────────────────────────────────────────────────────────
+
+            summary = (f"{n_final} grasps [{conf_min:.3f}–{conf_max:.3f}]\n"
+                       f"Best conf: {best_conf:.4f}")
             self._set_status(summary)
 
             # Transform to robot frame and update display
@@ -2004,10 +2068,35 @@ class GraspExecuteApp:
         approach_mm = float(self._approach_var.get())
         speed = int(self._speed_var.get())
 
+        # ── Tool-Z approach: offset backwards along grasp Z-axis ─────────────
+        approach_m = approach_mm / 1000.0
+        tool_z = self._best_grasp_base[:3, 2]          # unit vector (approach dir)
+        pre_pos_mm = (self._best_grasp_base[:3, 3] - approach_m * tool_z) * 1000.0
+        x_pre, y_pre, z_pre = float(pre_pos_mm[0]), float(pre_pos_mm[1]), float(pre_pos_mm[2])
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── Reachability safety check ────────────────────────────────────────
+        ok_g, joints, msg_g = self._robot.check_reachability(x, y, z, rx, ry, rz)
+        ok_a, _,      msg_a = self._robot.check_reachability(x_pre, y_pre, z_pre, rx, ry, rz)
+        self._log(f"[Reach] Grasp {'✓' if ok_g else '✗'} {msg_g}  "
+                  f"Approach {'✓' if ok_a else '✗'} {msg_a}")
+        if not ok_g or not ok_a:
+            lines = ([f"• Grasp (X={x:.1f} Y={y:.1f} Z={z:.1f} mm): {msg_g}"]
+                     if not ok_g else []) + \
+                    ([f"• Approach (X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm): {msg_a}"]
+                     if not ok_a else [])
+            messagebox.showerror("Pose unreachable",
+                                 "Robot cannot reach target:\n\n" + "\n".join(lines) +
+                                 f"\n\nRx={rx:.1f} Ry={ry:.1f} Rz={rz:.1f} °")
+            return
+        # ────────────────────────────────────────────────────────────────────
+
+        joints_str = (f"\nJoints: [{', '.join(f'{j:.1f}' for j in joints)}]°"
+                      if joints else "")
         msg = (f"Execute grasp at:\n"
                f"  X={x:.1f}  Y={y:.1f}  Z={z:.1f} mm\n"
-               f"  Rx={rx:.1f}  Ry={ry:.1f}  Rz={rz:.1f} °\n\n"
-               f"Pre-grasp approach: {approach_mm:.0f} mm above\n"
+               f"  Rx={rx:.1f}  Ry={ry:.1f}  Rz={rz:.1f} °\n"
+               f"  Approach: X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm{joints_str}\n\n"
                f"Speed: {speed}%\n\n"
                f"Make sure the workspace is clear before continuing!")
         if not messagebox.askyesno("Confirm Execute", msg):
@@ -2017,25 +2106,23 @@ class GraspExecuteApp:
         self._execute_btn.config(state="disabled", text="Executing…")
         self._set_status("Executing grasp…")
         threading.Thread(target=self._execute_worker,
-                          args=(x, y, z, rx, ry, rz, approach_mm, speed),
+                          args=(x, y, z, x_pre, y_pre, z_pre, rx, ry, rz, speed),
                           daemon=True).start()
 
-    def _execute_worker(self, x, y, z, rx, ry, rz, approach_mm, speed):
+    def _execute_worker(self, x, y, z, x_pre, y_pre, z_pre, rx, ry, rz, speed):
         robot = self._robot
         try:
             robot.set_speed(speed)
 
-            z_pre = z + approach_mm
-
-            # 1. Pre-grasp approach (above target)
-            self._log(f"[Execute] Pre-grasp  X={x:.1f} Y={y:.1f} Z={z_pre:.1f} mm")
-            self._set_status(f"MovL → pre-grasp Z={z_pre:.0f}mm…")
-            cmd_id = robot.move_linear(x, y, z_pre, rx, ry, rz)
+            # 1. Pre-grasp approach (along tool Z-axis, away from object)
+            self._log(f"[Execute] Pre-grasp  X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm")
+            self._set_status(f"MovL → pre-grasp…")
+            cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
             robot.wait_motion(cmd_id)
 
-            # 2. Descend to grasp
+            # 2. Move to grasp
             self._log(f"[Execute] Grasp      X={x:.1f} Y={y:.1f} Z={z:.1f} mm")
-            self._set_status(f"MovL → grasp Z={z:.0f}mm…")
+            self._set_status(f"MovL → grasp…")
             cmd_id = robot.move_linear(x, y, z, rx, ry, rz)
             robot.wait_motion(cmd_id)
 
@@ -2044,10 +2131,10 @@ class GraspExecuteApp:
             robot.vacuum_on()
             time.sleep(0.8)
 
-            # 4. Retreat
-            self._log(f"[Execute] Retreat    Z={z_pre:.1f} mm")
+            # 4. Retreat (back along tool Z-axis)
+            self._log(f"[Execute] Retreat    X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm")
             self._set_status("MovL → retreat…")
-            cmd_id = robot.move_linear(x, y, z_pre, rx, ry, rz)
+            cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
             robot.wait_motion(cmd_id)
 
             self._log("[Execute] Done — grasp executed successfully")
