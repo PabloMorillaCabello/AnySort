@@ -55,6 +55,7 @@ ros2_ws/.colcon/
 # --- Orbbec SDK (cloned at Docker build, not tracked) ---
 ros2_ws/src/OrbbecSDK_ROS2/
 OrbbecSDK_v2/
+orbbec_examples/
 
 # --- Docker ---
 docker/.env
