@@ -19,7 +19,8 @@
       "Bash(grep -r make_frame . --include=*.py -n)",
       "Bash(grep -r visualize_pointcloud . --include=*.py -n)",
       "Bash(grep -r meshcat . --include=*.py -A 3 -B 1)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python:*)"
     ]
   }
 }
