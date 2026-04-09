@@ -42,11 +42,14 @@ def load_model(device: str, use_transformers: bool, fp16: bool):
     dtype = torch.float16 if fp16 else torch.float32
 
     if use_transformers:
+        import os
         from transformers import Sam3Processor, Sam3Model
-        print("[sam3_server] Loading Sam3Processor...", file=sys.stderr, flush=True)
-        processor = Sam3Processor.from_pretrained("facebook/sam3")
-        print("[sam3_server] Loading Sam3Model (this loads model.safetensors)...", file=sys.stderr, flush=True)
-        model = Sam3Model.from_pretrained("facebook/sam3", torch_dtype=dtype).to(device)
+        _local = "/opt/models/sam3"
+        _model_id = _local if os.path.isdir(_local) else "facebook/sam3"
+        print(f"[sam3_server] Loading Sam3Processor from {_model_id}...", file=sys.stderr, flush=True)
+        processor = Sam3Processor.from_pretrained(_model_id, local_files_only=os.path.isdir(_local))
+        print(f"[sam3_server] Loading Sam3Model from {_model_id}...", file=sys.stderr, flush=True)
+        model = Sam3Model.from_pretrained(_model_id, torch_dtype=dtype, local_files_only=os.path.isdir(_local)).to(device)
         model.eval()
         print(f"[sam3_server] Model loaded on {device} dtype={dtype}", file=sys.stderr, flush=True)
         return model, processor, "transformers"

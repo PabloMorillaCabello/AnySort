@@ -1,0 +1,4 @@
+blue circle
+red circle
+green circle
+black square

@@ -74,6 +74,8 @@ SAM3_SERVER_SCRIPT = "/ros2_ws/scripts/sam3_server.py"
 CALIB_FILE       = "/ros2_ws/data/calibration/hand_eye_calib.npz"
 RESULTS_DIR      = Path("/ros2_ws/results")
 ROI_SAVE_PATH    = Path(__file__).parent / "pipeline_roi.json"
+POSITIONS_SAVE_PATH  = Path(__file__).parent / "pipeline_positions.json"
+OBJECT_LISTS_DIR     = Path(__file__).parent.parent.parent / "data" / "object_lists"
 
 ROBOT_IP_DEFAULT = "192.168.5.1"
 ROBOT_PORT       = 29999
@@ -871,9 +873,19 @@ class GraspExecuteApp:
         self._retry_grasps_var = tk.BooleanVar(value=False)
         self._retry_stop_event = threading.Event()
 
+        # Sort / drop position for object placement
+        self._sort_joints = None
+        self._home_joints = None
+
+        # Batch word-list mode
+        self._batch_running    = False
+        self._batch_stop_event = threading.Event()
+        self._last_list_path   = None
+
         self._build_ui()
         self._load_calibration()
         self._load_roi()
+        self._load_positions()
         self._start_config_if_available()
         self._schedule_flush()
 
@@ -916,6 +928,71 @@ class GraspExecuteApp:
         if self.camera._started and self._current_frame is None:
             self._log("[Camera] Auto-capturing startup frame…")
             threading.Thread(target=self._capture_frame_worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Position persistence (home + sort joint angles)
+    # ------------------------------------------------------------------
+    def _save_positions(self):
+        """Persist home/sort joints, word list, and last list path to disk."""
+        try:
+            data = {}
+            if self._home_joints:
+                data["home_joints"] = self._home_joints
+            if self._sort_joints:
+                data["sort_joints"] = self._sort_joints
+            if self._last_list_path:
+                data["last_list_path"] = self._last_list_path
+            try:
+                words = list(self._batch_listbox.get(0, "end"))
+                if words:
+                    data["word_list"] = words
+            except Exception:
+                pass
+            POSITIONS_SAVE_PATH.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            self._log(f"[Positions] Could not save: {e}")
+
+    def _load_positions(self):
+        """Restore saved joint positions, word list, and last list path from disk."""
+        try:
+            if not POSITIONS_SAVE_PATH.exists():
+                return
+            data = json.loads(POSITIONS_SAVE_PATH.read_text())
+            if "home_joints" in data:
+                self._home_joints = data["home_joints"]
+                self._log(f"[Positions] Restored home: "
+                          f"[{', '.join(f'{v:.1f}' for v in self._home_joints)}]")
+            if "sort_joints" in data:
+                self._sort_joints = data["sort_joints"]
+                self._log(f"[Positions] Restored sort: "
+                          f"[{', '.join(f'{v:.1f}' for v in self._sort_joints)}]")
+                try:
+                    self._sort_status.config(
+                        text=f"Sort: [{', '.join(f'{v:.0f}' for v in self._sort_joints)}]",
+                        fg="#98c379")
+                except Exception:
+                    pass
+            # Restore word list: prefer last saved file, fall back to embedded list
+            last_path = data.get("last_list_path")
+            if last_path and Path(last_path).exists():
+                try:
+                    words = [w.strip() for w in
+                             Path(last_path).read_text().splitlines() if w.strip()]
+                    for w in words:
+                        self._batch_listbox.insert("end", w)
+                    self._last_list_path = last_path
+                    self._list_file_label.config(
+                        text=Path(last_path).name, fg="#98c379")
+                    self._log(f"[Positions] Restored list from {Path(last_path).name}"
+                              f" ({len(words)} word(s))")
+                except Exception as _le:
+                    self._log(f"[Positions] Could not reload list file: {_le}")
+            elif "word_list" in data:
+                for w in data["word_list"]:
+                    self._batch_listbox.insert("end", w)
+                self._log(f"[Positions] Restored {len(data['word_list'])} word(s) from cache")
+        except Exception as e:
+            self._log(f"[Positions] Could not load: {e}")
 
     def _on_stop_retry(self):
         self._retry_stop_event.set()
@@ -960,355 +1037,470 @@ class GraspExecuteApp:
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
+    # ==================================================================
+    # UI — top-level builder (delegates to per-panel helpers)
+    # ==================================================================
     def _build_ui(self):
-        self.root.title("Grasp Execute Pipeline  —  SAM3 + GraspGen + Dobot")
-        self.root.configure(bg="#1e1e1e")
+        self.root.title("AnySort")
+        self.root.configure(bg="#181818")
         self.root.resizable(True, True)
-        self.root.minsize(1050, 720)
-        self.root.geometry("1250x800")
+        self.root.minsize(1280, 720)
+        self.root.geometry("1700x960")
 
-        # ---- Left: camera preview ----
-        left = tk.Frame(self.root, bg="#1e1e1e")
-        left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
+        # 5 content columns + 1 log row
+        self.root.columnconfigure(0, weight=3, minsize=660)  # camera
+        self.root.columnconfigure(1, weight=2, minsize=230)  # grasp
+        self.root.columnconfigure(2, weight=2, minsize=230)  # robot
+        self.root.columnconfigure(3, weight=2, minsize=230)  # word list
+        self.root.columnconfigure(4, weight=2, minsize=230)  # execution
+        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=0, minsize=118)
 
-        self._canvas = tk.Canvas(left, width=_PREVIEW_W, height=_PREVIEW_H,
-                                  bg="#111", highlightthickness=1, highlightbackground="#444")
-        self._canvas.pack()
+        _BG = ["#1e1e1e", "#252525", "#2a2a2a", "#252525", "#2a2a2a"]
+        _PAD = [(6,2), (2,2), (2,2), (2,2), (2,6)]
+        _panels = []
+        for c, (bg, px) in enumerate(zip(_BG, _PAD)):
+            f = tk.Frame(self.root, bg=bg)
+            f.grid(row=0, column=c, sticky="nsew", padx=px, pady=(6,2))
+            _panels.append(f)
+
+        self._build_camera_panel(_panels[0])
+        self._build_grasp_panel(_panels[1])
+        self._build_robot_panel(_panels[2])
+        self._build_list_panel(_panels[3])
+        self._build_exec_panel(_panels[4])
+
+        # ── Log bar (spans all columns) ──────────────────────────────────
+        _log_bar = tk.Frame(self.root, bg="#161616")
+        _log_bar.grid(row=1, column=0, columnspan=5, sticky="nsew",
+                      padx=6, pady=(0,6))
+        tk.Label(_log_bar, text="LOG", bg="#161616", fg="#444",
+                 font=("Helvetica", 7, "bold")
+                 ).pack(side="left", padx=(6,2), anchor="n", pady=4)
+        self._log_text = scrolledtext.ScrolledText(
+            _log_bar, bg="#161616", fg="#6b737f",
+            font=("Courier", 9), state="disabled",
+            relief="flat", height=6, wrap="word")
+        self._log_text.pack(side="left", fill="both", expand=True,
+                            padx=(0,4), pady=2)
+
+    # ------------------------------------------------------------------
+    # Panel builders
+    # ------------------------------------------------------------------
+    def _build_camera_panel(self, p):
+        bg = p["bg"]
+
+        def _section(parent, title, fg="#abb2bf"):
+            """Labelled sub-group frame with a thin top border."""
+            outer = tk.Frame(parent, bg=bg)
+            outer.pack(fill="x", padx=8, pady=(4, 2))
+            hdr = tk.Frame(outer, bg=bg)
+            hdr.pack(fill="x")
+            tk.Label(hdr, text=title, bg=bg, fg=fg,
+                     font=("Helvetica", 8, "bold")).pack(side="left")
+            ttk.Separator(hdr, orient="horizontal").pack(side="left", fill="x",
+                                                          expand=True, padx=(4, 0))
+            inner = tk.Frame(outer, bg=bg)
+            inner.pack(fill="x", pady=(3, 0))
+            return inner
+
+        # ── Panel title ─────────────────────────────────────────────────
+        tk.Label(p, text="Camera & Scene", bg=bg, fg="#61afef",
+                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+
+        # ── Live preview canvas ─────────────────────────────────────────
+        self._canvas = tk.Canvas(p, width=_PREVIEW_W, height=_PREVIEW_H,
+                                  bg="#111", highlightthickness=1,
+                                  highlightbackground="#333")
+        self._canvas.pack(padx=8, pady=(0, 4))
         self._canvas_img_id = self._canvas.create_image(0, 0, anchor="nw")
         self._no_cam_txt = self._canvas.create_text(
-            _PREVIEW_W//2, _PREVIEW_H//2, text="Waiting for camera…",
-            fill="#555", font=("Helvetica", 14))
-        # 4 dots + 4 edges + 1 preview line for polygon ROI selection
+            _PREVIEW_W//2, _PREVIEW_H//2,
+            text="No camera  ·  connect or load a scene",
+            fill="#444", font=("Helvetica", 13))
         self._roi_dot_ids = [
-            self._canvas.create_oval(-6,-6,-6,-6, outline="#FFD700",
+            self._canvas.create_oval(-6, -6, -6, -6, outline="#FFD700",
                                      fill="#FFD700", state="hidden")
             for _ in range(4)]
         self._roi_edge_ids = [
-            self._canvas.create_line(0,0,0,0, fill="#FFD700",
+            self._canvas.create_line(0, 0, 0, 0, fill="#FFD700",
                                      width=2, state="hidden")
             for _ in range(4)]
         self._roi_preview_id = self._canvas.create_line(
-            0,0,0,0, fill="#FFD700", width=1, dash=(4,2), state="hidden")
+            0, 0, 0, 0, fill="#FFD700", width=1, dash=(4, 2), state="hidden")
         self._canvas.bind("<ButtonPress-1>", self._on_roi_click)
         self._canvas.bind("<Motion>",        self._on_roi_hover)
 
-        tk.Checkbutton(left, text="Show mask overlay", variable=self._show_mask,
-                       bg="#1e1e1e", fg="#aaa", activebackground="#1e1e1e",
-                       selectcolor="#2d2d2d").pack(anchor="w", padx=4, pady=(4,0))
+        # ── Sub-group: Camera ───────────────────────────────────────────
+        cam = _section(p, "Camera", fg="#61afef")
 
-        # ── Camera connect / disconnect ──
-        cam_row = tk.Frame(left, bg="#1e1e1e")
-        cam_row.pack(fill="x", padx=4, pady=(8, 0))
+        r_cam = tk.Frame(cam, bg=bg); r_cam.pack(fill="x", pady=(0, 3))
         self._cam_connect_btn = tk.Button(
-            cam_row, text="📷  Connect Camera",
+            r_cam, text="📷  Connect",
             bg="#3a3a3a", fg="#61afef", activebackground="#4a4a4a",
-            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
             command=self._on_camera_connect)
-        self._cam_connect_btn.pack(side="left", ipady=4)
-        tk.Button(cam_row, text="📸  Capture Frame",
+        self._cam_connect_btn.pack(side="left", ipady=4, ipadx=6)
+        tk.Button(r_cam, text="📸  Capture",
                   bg="#3a3a3a", fg="#98c379", activebackground="#4a4a4a",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
-                  command=self._on_capture_frame).pack(side="left", ipady=4, padx=(6, 0))
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=self._on_capture_frame
+                  ).pack(side="left", ipady=4, ipadx=6, padx=(4, 0))
         self._cam_status_var = tk.StringVar(
             value="● Connected" if self.camera._started else "● No camera")
         self._cam_status_lbl = tk.Label(
-            cam_row, textvariable=self._cam_status_var, bg="#1e1e1e",
+            r_cam, textvariable=self._cam_status_var, bg=bg,
             fg="#98c379" if self.camera._started else "#e06c75",
             font=("Helvetica", 8))
         self._cam_status_lbl.pack(side="left", padx=(8, 0))
 
-        # ── Replay mode controls ──
-        replay_row = tk.Frame(left, bg="#1e1e1e")
-        replay_row.pack(fill="x", padx=4, pady=(6, 0))
-        tk.Button(replay_row, text="💾  Save Scene",
-                  bg="#3a3a3a", fg="#98c379", activebackground="#4a4a4a",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
-                  command=self._on_save_scene).pack(side="left", ipady=4, padx=(0, 6))
-        tk.Button(replay_row, text="📂  Load Scene",
-                  bg="#3a3a3a", fg="#e5c07b", activebackground="#4a4a4a",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
-                  command=self._on_load_replay).pack(side="left", ipady=4, padx=(0, 6))
-        tk.Button(replay_row, text="✕ Clear",
-                  bg="#3a3a3a", fg="#aaa", activebackground="#4a4a4a",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
-                  command=self._on_clear_replay).pack(side="left", ipady=4)
-        self._replay_info = tk.Label(left, textvariable=self._replay_label_var,
-                                     bg="#1e1e1e", fg="#c678dd",
-                                     font=("Courier", 7), wraplength=_PREVIEW_W - 8,
-                                     justify="left", anchor="w")
-        self._replay_info.pack(fill="x", padx=4, pady=(2, 0))
+        # ── Sub-group: Scene ────────────────────────────────────────────
+        scn = _section(p, "Scene", fg="#e5c07b")
 
-        # ── ROI controls ──
-        roi_row = tk.Frame(left, bg="#1e1e1e")
-        roi_row.pack(fill="x", padx=4, pady=(6, 0))
+        r_scn = tk.Frame(scn, bg=bg); r_scn.pack(fill="x", pady=(0, 2))
+        for txt, fg_c, cmd in [
+                ("💾  Save", "#98c379", self._on_save_scene),
+                ("📂  Load", "#e5c07b", self._on_load_replay),
+                ("✕ Clear",  "#aaa",    self._on_clear_replay)]:
+            tk.Button(r_scn, text=txt, bg="#3a3a3a", fg=fg_c,
+                      activebackground="#4a4a4a", relief="flat",
+                      cursor="hand2", bd=0, font=("Helvetica", 8),
+                      command=cmd
+                      ).pack(side="left", ipady=3, ipadx=6, padx=(0, 4))
+        self._replay_info = tk.Label(scn, textvariable=self._replay_label_var,
+                                      bg=bg, fg="#c678dd",
+                                      font=("Courier", 7), anchor="w")
+        self._replay_info.pack(fill="x", pady=(1, 0))
+
+        # ── Sub-group: Mask & ROI ───────────────────────────────────────
+        roi = _section(p, "Mask & ROI", fg="#FFD700")
+
+        r_mask = tk.Frame(roi, bg=bg); r_mask.pack(fill="x", pady=(0, 2))
+        tk.Checkbutton(r_mask, text="Show mask overlay", variable=self._show_mask,
+                       bg=bg, fg="#aaa", activebackground=bg,
+                       selectcolor="#2d2d2d", font=("Helvetica", 8)
+                       ).pack(side="left")
+
+        r_roi = tk.Frame(roi, bg=bg); r_roi.pack(fill="x", pady=(0, 2))
         self._roi_btn = tk.Button(
-            roi_row, text="🔲  Select ROI",
+            r_roi, text="🔲  Select ROI",
             bg="#3a3a3a", fg="#FFD700", activebackground="#4a4a4a",
-            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
             command=self._on_roi_select)
-        self._roi_btn.pack(side="left", ipady=4)
-        tk.Button(roi_row, text="✕ Clear ROI",
+        self._roi_btn.pack(side="left", ipady=3, ipadx=6)
+        tk.Button(r_roi, text="✕ Clear ROI",
                   bg="#3a3a3a", fg="#aaa", activebackground="#4a4a4a",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
-                  command=self._on_roi_clear).pack(side="left", ipady=4, padx=(6, 0))
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=self._on_roi_clear
+                  ).pack(side="left", ipady=3, ipadx=6, padx=(4, 0))
         self._roi_info_var = tk.StringVar(value="")
-        tk.Label(roi_row, textvariable=self._roi_info_var,
-                 bg="#1e1e1e", fg="#aaa", font=("Courier", 7)
-                 ).pack(side="left", padx=(8, 0))
+        tk.Label(r_roi, textvariable=self._roi_info_var,
+                 bg=bg, fg="#888", font=("Courier", 7)
+                 ).pack(side="left", padx=(6, 0))
 
-        # ---- Middle: GraspGen controls ----
-        mid = tk.Frame(self.root, bg="#2d2d2d", width=310)
-        mid.grid(row=0, column=1, sticky="nsew", padx=4, pady=8)
-        mid.grid_propagate(False)
+    def _build_grasp_panel(self, p):
+        bg = p["bg"]
+        def _sep(): ttk.Separator(p, orient="horizontal").pack(fill="x", padx=8, pady=4)
+        def _lbl(t, fg="#e5c07b"):
+            tk.Label(p, text=t, bg=bg, fg=fg,
+                     font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(4,1))
 
-        tk.Label(mid, text="GraspGen", bg="#2d2d2d", fg="#61afef",
-                 font=("Helvetica", 15, "bold")).pack(pady=(14,0))
-        tk.Label(mid, text="SAM3  ·  Orbbec Gemini 2  ·  GraspGen",
-                 bg="#2d2d2d", fg="#555", font=("Helvetica", 8)).pack(pady=(0,6))
+        tk.Label(p, text="⚡  GraspGen", bg=bg, fg="#98c379",
+                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(8,0))
+        _sep()
 
-        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=2)
+        self._calib_status = tk.Label(p, text="Loading calibration…",
+                                       bg=bg, fg="#888",
+                                       font=("Courier", 7), wraplength=220, anchor="w")
+        self._calib_status.pack(anchor="w", padx=10, pady=(0,4))
+        _sep()
 
-        # Calibration status
-        self._calib_status = tk.Label(mid, text="Loading calibration…",
-                                       bg="#2d2d2d", fg="#888",
-                                       font=("Courier", 8), wraplength=280)
-        self._calib_status.pack(anchor="w", padx=12, pady=(4,2))
-
-        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
-
-        # ── Pipeline options ──
-        tk.Checkbutton(mid, text="Check collisions (filter colliding grasps)",
-                       variable=self._collision_var,
-                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
-                       selectcolor="#3a3a3a", font=("Helvetica", 8)
-                       ).pack(anchor="w", padx=12, pady=(4, 2))
-        tk.Checkbutton(mid, text="Filter unreachable grasps (needs robot)",
-                       variable=self._reach_var,
-                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
-                       selectcolor="#3a3a3a", font=("Helvetica", 8)
-                       ).pack(anchor="w", padx=12, pady=(0, 2))
-        tk.Checkbutton(mid, text="Process debug (step-by-step)",
-                       variable=self._debug_var,
-                       bg="#2d2d2d", fg="#aaa", activebackground="#2d2d2d",
-                       selectcolor="#3a3a3a", font=("Helvetica", 8)
-                       ).pack(anchor="w", padx=12, pady=(0, 4))
-
-        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
-
-        # Gripper config
-        tk.Label(mid, text="Gripper / Tool:", bg="#2d2d2d", fg="#e5c07b",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
+        _lbl("Gripper / Tool:")
         names = list(self.config_map.keys())
-        self._config_combo = ttk.Combobox(mid, values=names, state="readonly",
-                                           font=("Helvetica", 9), width=34)
-        self._config_combo.pack(padx=12, fill="x")
+        self._config_combo = ttk.Combobox(p, values=names, state="readonly",
+                                           font=("Helvetica", 8))
+        self._config_combo.pack(padx=10, fill="x")
         if not names:
             self._config_combo.set("(no configs found)")
             self._config_combo.configure(state="disabled")
         self._config_combo.bind("<<ComboboxSelected>>", self._on_config_change)
-        self._config_hint = tk.Label(mid, text="", bg="#2d2d2d", fg="#555",
-                                      font=("Courier", 7), wraplength=280, justify="left")
-        self._config_hint.pack(anchor="w", padx=12)
+        self._config_hint = tk.Label(p, text="", bg=bg, fg="#555",
+                                      font=("Courier", 7), wraplength=210, justify="left")
+        self._config_hint.pack(anchor="w", padx=10)
+        _sep()
 
-        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=4)
-
-        # Object prompt
-        tk.Label(mid, text="Object prompt:", bg="#2d2d2d", fg="#e5c07b",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
+        _lbl("Object Prompt:")
         self._prompt_var = tk.StringVar(value="")
-        self._prompt_entry = tk.Entry(mid, textvariable=self._prompt_var,
-                                       bg="#3a3a3a", fg="white", insertbackground="white",
-                                       relief="flat", font=("Helvetica", 11), bd=4)
-        self._prompt_entry.pack(padx=12, pady=(0,8), fill="x")
+        self._prompt_entry = tk.Entry(p, textvariable=self._prompt_var,
+                                       bg="#3a3a3a", fg="white",
+                                       insertbackground="white",
+                                       relief="flat", font=("Helvetica", 10), bd=4)
+        self._prompt_entry.pack(padx=10, fill="x", pady=(0,4))
         self._prompt_entry.bind("<Return>", lambda _: self._on_run())
+        _sep()
 
-        self._run_btn = tk.Button(mid, text="▶  Capture & Run GraspGen",
-                                   bg="#61afef", fg="#1e1e1e", activebackground="#4d9bd6",
-                                   font=("Helvetica", 11, "bold"), relief="flat",
-                                   cursor="hand2", bd=0, command=self._on_run)
-        self._run_btn.pack(padx=12, pady=2, fill="x", ipady=10)
+        _lbl("Options:")
+        for var, txt in [(self._collision_var, "Check collisions"),
+                         (self._reach_var,    "Filter unreachable (needs robot)"),
+                         (self._debug_var,    "Step-by-step debug")]:
+            tk.Checkbutton(p, text=txt, variable=var,
+                           bg=bg, fg="#aaa", activebackground=bg,
+                           selectcolor="#3a3a3a", font=("Helvetica", 8)
+                           ).pack(anchor="w", padx=10, pady=1)
+        _sep()
 
-        self._continue_btn = tk.Button(
-            mid, text="▶  Continue to next step",
-            bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a44e",
-            font=("Helvetica", 10, "bold"), relief="flat", cursor="hand2", bd=0,
-            state="disabled", command=self._on_debug_continue)
-        self._continue_btn.pack(padx=12, pady=(2, 2), fill="x", ipady=8)
+        _lbl("Inference Parameters:")
+        for label, attr, default in [
+                ("Num grasps", "_num_grasps_var",  str(self.args.num_grasps)),
+                ("Top-K",      "_topk_grasps_var", str(self.args.topk_num_grasps))]:
+            r = tk.Frame(p, bg=bg); r.pack(fill="x", padx=10, pady=1)
+            tk.Label(r, text=label+":", bg=bg, fg="#ccc",
+                     font=("Helvetica", 8), anchor="w", width=13).pack(side="left")
+            v = tk.StringVar(value=default); setattr(self, attr, v)
+            tk.Entry(r, textvariable=v, width=6, bg="#3a3a3a", fg="white",
+                     insertbackground="white", relief="flat",
+                     font=("Helvetica", 8)).pack(side="right")
+        _sep()
 
-        tk.Button(mid, text="✕  Clear mask", bg="#3a3a3a", fg="#aaa",
-                  activebackground="#444", font=("Helvetica", 9), relief="flat",
-                  cursor="hand2", bd=0, command=lambda: setattr(self, "_last_mask", None)
-                  ).pack(padx=12, pady=(2,6), fill="x", ipady=4)
-
-        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=2)
-
-        tk.Label(mid, text="Status:", bg="#2d2d2d", fg="#666",
-                 font=("Helvetica", 9)).pack(anchor="w", padx=12)
-        self._status_var = tk.StringVar(value="Waiting for camera…")
-        tk.Label(mid, textvariable=self._status_var, bg="#2d2d2d", fg="#98c379",
-                 font=("Helvetica", 9), wraplength=280, justify="left"
-                 ).pack(anchor="w", padx=12, pady=(2,6))
-
-        ttk.Separator(mid, orient="horizontal").pack(fill="x", padx=8, pady=2)
-        tk.Label(mid, text="Log:", bg="#2d2d2d", fg="#666",
-                 font=("Helvetica", 9)).pack(anchor="w", padx=12)
-        self._log_text = scrolledtext.ScrolledText(
-            mid, width=34, height=12, bg="#1e1e1e", fg="#abb2bf",
-            font=("Courier", 8), state="disabled", relief="flat")
-        self._log_text.pack(padx=12, pady=(2,8), fill="both", expand=True)
-
-        # ---- Right: Robot execution ----
-        right = tk.Frame(self.root, bg="#252525", width=290)
-        right.grid(row=0, column=2, sticky="nsew", padx=(4,8), pady=8)
-
-        tk.Label(right, text="Robot Execution", bg="#252525", fg="#c678dd",
-                 font=("Helvetica", 14, "bold")).pack(pady=(14,0))
-        tk.Label(right, text="Dobot CR  ·  Vacuum Tool",
-                 bg="#252525", fg="#555", font=("Helvetica", 8)).pack(pady=(0,8))
-
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
-
-        # Connection
-        tk.Label(right, text="Connection", bg="#252525", fg="#e5c07b",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(6,2))
-
-        row = tk.Frame(right, bg="#252525"); row.pack(fill="x", padx=12, pady=2)
-        tk.Label(row, text="IP:", bg="#252525", fg="#ccc",
-                 font=("Helvetica", 9), width=4, anchor="w").pack(side="left")
-        self._ip_var = tk.StringVar(value=self.args.robot_ip)
-        tk.Entry(row, textvariable=self._ip_var, width=15, bg="#3a3a3a",
-                 fg="white", insertbackground="white", relief="flat",
-                 font=("Helvetica", 9)).pack(side="left", padx=(0,6))
-
-        self._connect_btn = tk.Button(right, text="⚡  Connect Robot",
-                                       bg="#4a5568", fg="white", activebackground="#5a6578",
-                                       relief="flat", cursor="hand2", bd=0,
-                                       font=("Helvetica", 9), command=self._on_connect)
-        self._connect_btn.pack(padx=12, pady=4, fill="x", ipady=5)
-
-        self._robot_status = tk.Label(right, text="● Disconnected",
-                                       bg="#252525", fg="#e06c75",
-                                       font=("Courier", 9))
-        self._robot_status.pack(anchor="w", padx=12, pady=(0,4))
-
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
-
-        # Motion settings
-        tk.Label(right, text="Motion Settings", bg="#252525", fg="#e5c07b",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
-
-        row2 = tk.Frame(right, bg="#252525"); row2.pack(fill="x", padx=12, pady=2)
-        tk.Label(row2, text="Speed %:", bg="#252525", fg="#ccc",
-                 font=("Helvetica", 9), width=9, anchor="w").pack(side="left")
-        self._speed_var = tk.StringVar(value="15")
-        tk.Entry(row2, textvariable=self._speed_var, width=5, bg="#3a3a3a",
-                 fg="white", insertbackground="white", relief="flat",
-                 font=("Helvetica", 9)).pack(side="left")
-
-        row3 = tk.Frame(right, bg="#252525"); row3.pack(fill="x", padx=12, pady=2)
-        tk.Label(row3, text="Approach mm:", bg="#252525", fg="#ccc",
-                 font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
-        self._approach_var = tk.StringVar(value=str(APPROACH_OFFSET))
-        tk.Entry(row3, textvariable=self._approach_var, width=5, bg="#3a3a3a",
-                 fg="white", insertbackground="white", relief="flat",
-                 font=("Helvetica", 9)).pack(side="left")
-
-        row4 = tk.Frame(right, bg="#252525"); row4.pack(fill="x", padx=12, pady=2)
-        tk.Label(row4, text="Num grasps:", bg="#252525", fg="#ccc",
-                 font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
-        self._num_grasps_var = tk.StringVar(value=str(self.args.num_grasps))
-        tk.Entry(row4, textvariable=self._num_grasps_var, width=5, bg="#3a3a3a",
-                 fg="white", insertbackground="white", relief="flat",
-                 font=("Helvetica", 9)).pack(side="left")
-
-        row5 = tk.Frame(right, bg="#252525"); row5.pack(fill="x", padx=12, pady=2)
-        tk.Label(row5, text="Top-K grasps:", bg="#252525", fg="#ccc",
-                 font=("Helvetica", 9), width=12, anchor="w").pack(side="left")
-        self._topk_grasps_var = tk.StringVar(value=str(self.args.topk_num_grasps))
-        tk.Entry(row5, textvariable=self._topk_grasps_var, width=5, bg="#3a3a3a",
-                 fg="white", insertbackground="white", relief="flat",
-                 font=("Helvetica", 9)).pack(side="left")
-
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
-
-        # Grasp target display
-        tk.Label(right, text="Selected Grasp  (Robot Frame)", bg="#252525", fg="#e5c07b",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
-        self._grasp_display = tk.Label(right, text="—  run GraspGen first",
-                                        bg="#252525", fg="#666",
-                                        font=("Courier", 8), wraplength=260, justify="left")
-        self._grasp_display.pack(anchor="w", padx=12, pady=(0,4))
-
-        # Grasp navigation (prev / index label / next)
-        nav_row = tk.Frame(right, bg="#252525")
-        nav_row.pack(fill="x", padx=12, pady=(0, 6))
+        _lbl("Selected Grasp  (Robot Frame):")
+        self._grasp_display = tk.Label(p, text="—  run GraspGen first",
+                                        bg=bg, fg="#555",
+                                        font=("Courier", 8), justify="left",
+                                        wraplength=210, anchor="w")
+        self._grasp_display.pack(anchor="w", padx=10, pady=(0,4))
+        nav = tk.Frame(p, bg=bg); nav.pack(fill="x", padx=10)
         self._prev_grasp_btn = tk.Button(
-            nav_row, text="◀  Prev", width=8,
+            nav, text="◀  Prev", width=7,
             bg="#3a3a3a", fg="#ccc", activebackground="#444",
             relief="flat", cursor="hand2", bd=0,
-            font=("Helvetica", 9), state="disabled",
+            font=("Helvetica", 8), state="disabled",
             command=self._on_prev_grasp)
         self._prev_grasp_btn.pack(side="left")
-        self._grasp_idx_label = tk.Label(
-            nav_row, text="— / —", bg="#252525", fg="#abb2bf",
-            font=("Courier", 9, "bold"))
+        self._grasp_idx_label = tk.Label(nav, text="— / —", bg=bg, fg="#abb2bf",
+                                          font=("Courier", 9, "bold"))
         self._grasp_idx_label.pack(side="left", expand=True)
         self._next_grasp_btn = tk.Button(
-            nav_row, text="Next  ▶", width=8,
+            nav, text="Next  ▶", width=7,
             bg="#3a3a3a", fg="#ccc", activebackground="#444",
             relief="flat", cursor="hand2", bd=0,
-            font=("Helvetica", 9), state="disabled",
+            font=("Helvetica", 8), state="disabled",
             command=self._on_next_grasp)
         self._next_grasp_btn.pack(side="right")
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=4)
+    def _build_robot_panel(self, p):
+        bg = p["bg"]
+        def _sep(): ttk.Separator(p, orient="horizontal").pack(fill="x", padx=8, pady=4)
+        def _lbl(t): tk.Label(p, text=t, bg=bg, fg="#e5c07b",
+                               font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(4,1))
+        def _btn(text, fg_c, cmd, state="disabled"):
+            b = tk.Button(p, text=text, bg="#3a3a3a", fg=fg_c,
+                          activebackground="#444", relief="flat",
+                          cursor="hand2", bd=0, font=("Helvetica", 8),
+                          state=state, command=cmd)
+            b.pack(padx=10, pady=2, fill="x", ipady=5)
+            return b
 
-        # Execute
-        tk.Label(right, text="Execute", bg="#252525", fg="#e5c07b",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(4,2))
+        tk.Label(p, text="🤖  Robot", bg=bg, fg="#c678dd",
+                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(8,0))
+        _sep()
+
+        r = tk.Frame(p, bg=bg); r.pack(fill="x", padx=10, pady=(0,4))
+        tk.Label(r, text="IP:", bg=bg, fg="#ccc",
+                 font=("Helvetica", 8), width=3, anchor="w").pack(side="left")
+        self._ip_var = tk.StringVar(value=self.args.robot_ip)
+        tk.Entry(r, textvariable=self._ip_var, bg="#3a3a3a", fg="white",
+                 insertbackground="white", relief="flat",
+                 font=("Helvetica", 8)).pack(side="left", fill="x", expand=True)
+        self._connect_btn = tk.Button(p, text="⚡  Connect Robot",
+                                       bg="#4a5568", fg="white",
+                                       activebackground="#5a6578",
+                                       relief="flat", cursor="hand2", bd=0,
+                                       font=("Helvetica", 9),
+                                       command=self._on_connect)
+        self._connect_btn.pack(padx=10, pady=(0,4), fill="x", ipady=5)
+        self._robot_status = tk.Label(p, text="● Disconnected",
+                                       bg=bg, fg="#e06c75", font=("Courier", 8))
+        self._robot_status.pack(anchor="w", padx=10, pady=(0,4))
+        _sep()
+
+        _lbl("Motion")
+        for label, attr, default in [
+                ("Speed %",     "_speed_var",    "15"),
+                ("Approach mm", "_approach_var", str(APPROACH_OFFSET))]:
+            r2 = tk.Frame(p, bg=bg); r2.pack(fill="x", padx=10, pady=1)
+            tk.Label(r2, text=label+":", bg=bg, fg="#ccc",
+                     font=("Helvetica", 8), anchor="w", width=13).pack(side="left")
+            v = tk.StringVar(value=default); setattr(self, attr, v)
+            tk.Entry(r2, textvariable=v, width=6, bg="#3a3a3a", fg="white",
+                     insertbackground="white", relief="flat",
+                     font=("Helvetica", 8)).pack(side="right")
+        _sep()
+
+        _lbl("Actions")
+        self._recover_btn = tk.Button(
+            p, text="⚠  Recover Robot",
+            bg="#d19a66", fg="#1e1e1e", activebackground="#b8844a",
+            relief="flat", cursor="hand2", bd=0,
+            font=("Helvetica", 8, "bold"), state="disabled",
+            command=self._on_recover_robot)
+        self._recover_btn.pack(padx=10, pady=2, fill="x", ipady=5)
+        self._home_btn = _btn("🏠  Move to Home", "#ccc", self._on_home)
+        _sep()
+
+        _lbl("Positions")
+        self._save_home_btn = _btn("📌  Save as Home", "#e5c07b", self._on_save_home)
+        self._save_sort_btn = _btn("📌  Save as Sort", "#56b6c2", self._on_save_sort)
+        self._go_sort_btn   = _btn("↓  Go to Sort",    "#56b6c2", self._on_go_sort)
+        self._sort_status = tk.Label(p, text="No sort position saved",
+                                      bg=bg, fg="#555", font=("Courier", 7))
+        self._sort_status.pack(anchor="w", padx=10, pady=(0,4))
+
+    def _build_list_panel(self, p):
+        bg = p["bg"]
+        def _sep(): ttk.Separator(p, orient="horizontal").pack(fill="x", padx=8, pady=4)
+
+        tk.Label(p, text="📋  Word List", bg=bg, fg="#e5c07b",
+                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(8,0))
+        tk.Label(p, text="top→bottom  ·  3 tries/word  ·  loops forever",
+                 bg=bg, fg="#555", font=("Helvetica", 7)
+                 ).pack(anchor="w", padx=10, pady=(0,2))
+        _sep()
+
+        lf = tk.Frame(p, bg=bg)
+        lf.pack(fill="both", expand=True, padx=10, pady=(0,4))
+        self._batch_listbox = tk.Listbox(
+            lf, bg="#1a1a1a", fg="#abb2bf",
+            selectbackground="#3a3a3a", selectforeground="#61afef",
+            font=("Courier", 10), relief="flat", bd=0,
+            highlightthickness=1, highlightbackground="#333",
+            activestyle="none")
+        self._batch_listbox.pack(side="left", fill="both", expand=True)
+        _sb = tk.Scrollbar(lf, orient="vertical", command=self._batch_listbox.yview)
+        _sb.pack(side="right", fill="y")
+        self._batch_listbox.config(yscrollcommand=_sb.set)
+
+        ar = tk.Frame(p, bg=bg); ar.pack(fill="x", padx=10, pady=(0,3))
+        self._batch_word_var = tk.StringVar()
+        self._batch_entry = tk.Entry(
+            ar, textvariable=self._batch_word_var,
+            bg="#3a3a3a", fg="white", insertbackground="white",
+            relief="flat", font=("Helvetica", 9), bd=3)
+        self._batch_entry.pack(side="left", fill="x", expand=True, padx=(0,4))
+        self._batch_entry.bind("<Return>", lambda _: self._on_add_batch_word())
+        tk.Button(ar, text="Add",
+                  bg="#3a3a3a", fg="#98c379", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=self._on_add_batch_word
+                  ).pack(side="right", ipady=4, ipadx=6)
+
+        rr = tk.Frame(p, bg=bg); rr.pack(fill="x", padx=10, pady=(0,4))
+        tk.Button(rr, text="Remove",
+                  bg="#3a3a3a", fg="#e06c75", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=self._on_remove_batch_word
+                  ).pack(side="left", ipady=3, ipadx=4)
+        tk.Button(rr, text="Clear All",
+                  bg="#3a3a3a", fg="#aaa", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=lambda: self._batch_listbox.delete(0, "end")
+                  ).pack(side="left", ipady=3, ipadx=4, padx=(4,0))
+        _sep()
+
+        tk.Label(p, text="List Files", bg=bg, fg="#e5c07b",
+                 font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(0,2))
+        fr = tk.Frame(p, bg=bg); fr.pack(fill="x", padx=10, pady=(0,3))
+        tk.Button(fr, text="📂  Load List",
+                  bg="#3a3a3a", fg="#e5c07b", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=self._on_load_list
+                  ).pack(side="left", ipady=4, ipadx=6)
+        tk.Button(fr, text="💾  Save List",
+                  bg="#3a3a3a", fg="#98c379", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=self._on_save_list
+                  ).pack(side="left", ipady=4, ipadx=6, padx=(4,0))
+        self._list_file_label = tk.Label(p, text="No file loaded",
+                                          bg=bg, fg="#555",
+                                          font=("Courier", 7), anchor="w",
+                                          wraplength=210)
+        self._list_file_label.pack(anchor="w", padx=10, pady=(2,4))
+
+    def _build_exec_panel(self, p):
+        bg = p["bg"]
+        def _sep(): ttk.Separator(p, orient="horizontal").pack(fill="x", padx=8, pady=4)
+        def _lbl(t): tk.Label(p, text=t, bg=bg, fg="#e5c07b",
+                               font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(4,1))
+
+        tk.Label(p, text="▶  Execution", bg=bg, fg="#56b6c2",
+                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(8,0))
+        _sep()
+
+        _lbl("Status")
+        self._status_var = tk.StringVar(value="Waiting for camera…")
+        tk.Label(p, textvariable=self._status_var, bg=bg, fg="#98c379",
+                 font=("Helvetica", 8), wraplength=210, justify="left", anchor="w"
+                 ).pack(anchor="w", padx=10, pady=(0,4))
+        _sep()
+
+        _lbl("Single Run")
+        self._run_btn = tk.Button(
+            p, text="▶  Capture & Run GraspGen",
+            bg="#61afef", fg="#1e1e1e", activebackground="#4d9bd6",
+            font=("Helvetica", 9, "bold"), relief="flat",
+            cursor="hand2", bd=0, command=self._on_run)
+        self._run_btn.pack(padx=10, pady=2, fill="x", ipady=8)
+
+        self._continue_btn = tk.Button(
+            p, text="▶  Continue (debug step)",
+            bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a44e",
+            font=("Helvetica", 8, "bold"), relief="flat",
+            cursor="hand2", bd=0, state="disabled",
+            command=self._on_debug_continue)
+        self._continue_btn.pack(padx=10, pady=2, fill="x", ipady=5)
 
         self._execute_btn = tk.Button(
-            right, text="🤖  Execute Selected Grasp",
+            p, text="🤖  Execute Selected Grasp",
             bg="#c678dd", fg="white", activebackground="#a85dc0",
             relief="flat", cursor="hand2", bd=0,
-            font=("Helvetica", 11, "bold"), state="disabled",
+            font=("Helvetica", 9, "bold"), state="disabled",
             command=self._on_execute)
-        self._execute_btn.pack(padx=12, pady=2, fill="x", ipady=10)
+        self._execute_btn.pack(padx=10, pady=2, fill="x", ipady=8)
 
-        tk.Checkbutton(right, text="Auto-retry next grasp on robot error",
+        tk.Checkbutton(p, text="Auto-retry next grasp on error",
                        variable=self._retry_grasps_var,
-                       bg="#252525", fg="#aaa", activebackground="#252525",
+                       bg=bg, fg="#aaa", activebackground=bg,
                        selectcolor="#3a3a3a", font=("Helvetica", 8)
-                       ).pack(anchor="w", padx=12, pady=(2, 2))
-
+                       ).pack(anchor="w", padx=10, pady=(2,1))
         self._stop_retry_btn = tk.Button(
-            right, text="⏹  Stop Retry",
+            p, text="⏹  Stop Retry",
             bg="#e06c75", fg="white", activebackground="#c0545e",
             relief="flat", cursor="hand2", bd=0,
-            font=("Helvetica", 9, "bold"), state="disabled",
+            font=("Helvetica", 8, "bold"), state="disabled",
             command=self._on_stop_retry)
-        self._stop_retry_btn.pack(padx=12, pady=(0, 4), fill="x", ipady=4)
+        self._stop_retry_btn.pack(padx=10, pady=(0,2), fill="x", ipady=4)
+        tk.Button(p, text="✕  Clear Mask",
+                  bg="#3a3a3a", fg="#aaa", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
+                  command=lambda: setattr(self, "_last_mask", None)
+                  ).pack(padx=10, pady=2, fill="x", ipady=4)
+        _sep()
 
-        self._home_btn = tk.Button(
-            right, text="🏠  Move to Home",
-            bg="#3a3a3a", fg="#ccc", activebackground="#444",
+        _lbl("Batch  (continuous loop)")
+        self._batch_run_btn = tk.Button(
+            p, text="▶  Run Batch",
+            bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a44e",
             relief="flat", cursor="hand2", bd=0,
-            font=("Helvetica", 9), state="disabled",
-            command=self._on_home)
-        self._home_btn.pack(padx=12, pady=2, fill="x", ipady=5)
+            font=("Helvetica", 10, "bold"),
+            command=self._on_run_batch)
+        self._batch_run_btn.pack(padx=10, pady=2, fill="x", ipady=8)
 
-        self._save_home_btn = tk.Button(
-            right, text="📌  Save Current Pos as Home",
-            bg="#3a3a3a", fg="#e5c07b", activebackground="#444",
+        self._batch_stop_btn = tk.Button(
+            p, text="⏹  Stop Batch",
+            bg="#e06c75", fg="white", activebackground="#c0545e",
             relief="flat", cursor="hand2", bd=0,
-            font=("Helvetica", 9), state="disabled",
-            command=self._on_save_home)
-        self._save_home_btn.pack(padx=12, pady=(0,2), fill="x", ipady=5)
-
-        self.root.columnconfigure(0, weight=1)
-        self.root.columnconfigure(1, weight=0)
-        self.root.columnconfigure(2, weight=0)
-        self.root.rowconfigure(0, weight=1)
+            font=("Helvetica", 8, "bold"), state="disabled",
+            command=self._on_stop_batch)
+        self._batch_stop_btn.pack(padx=10, pady=(0,4), fill="x", ipady=5)
 
     # ------------------------------------------------------------------
     # ROI selection
@@ -1550,11 +1742,13 @@ class GraspExecuteApp:
 
     def _on_clear_replay(self):
         self._replay_frame = None
+        self._current_frame = None
         self._replay_label_var.set("")
         self._last_mask = None
-        if not self.camera._started:
-            self._canvas.itemconfig(self._no_cam_txt, state="normal")
-        self._log("[Replay] Cleared — back to live camera")
+        # Blank the canvas and show the placeholder text
+        self._canvas.itemconfig(self._canvas_img_id, image="")
+        self._canvas.itemconfig(self._no_cam_txt, state="normal")
+        self._log("[Scene] Cleared.")
 
     def _show_replay_in_canvas(self, rgb):
         """Show a replay frame — delegates to _refresh_canvas (called on main thread)."""
@@ -2394,7 +2588,8 @@ class GraspExecuteApp:
             self._robot_connected = False
             self._robot_status.config(text="● Disconnected", fg="#e06c75")
             self._connect_btn.config(text="⚡  Connect Robot")
-            for btn in (self._execute_btn, self._home_btn, self._save_home_btn):
+            for btn in (self._execute_btn, self._home_btn, self._save_home_btn,
+                        self._save_sort_btn, self._go_sort_btn, self._recover_btn):
                 btn.config(state="disabled")
             return
         ip = self._ip_var.get().strip()
@@ -2438,7 +2633,11 @@ class GraspExecuteApp:
         self._robot_status.config(text=f"● Connected  {self._ip_var.get()}", fg="#98c379")
         self._connect_btn.config(state="normal", text="⏏  Disconnect")
         self._home_btn.config(state="normal")
+        self._recover_btn.config(state="normal")
         self._save_home_btn.config(state="normal")
+        self._save_sort_btn.config(state="normal")
+        if self._sort_joints is not None:
+            self._go_sort_btn.config(state="normal")
         # Enable execute only if we already have a grasp
         if self._best_grasp_base is not None:
             self._execute_btn.config(state="normal")
@@ -2548,46 +2747,98 @@ class GraspExecuteApp:
         cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
         robot.wait_motion(cmd_id)
 
-        joints = getattr(self, "_home_joints", None)
-        if joints:
-            self._log("[Execute] Going home (saved joints)")
-            self._set_status("MovJ → home…")
-            cmd_id = robot.move_joint_angles(*joints)
-        else:
-            hx, hy, hz, hrx, hry, hrz = HOME_POSE
-            self._log("[Execute] Going home (default pose)")
-            self._set_status("MovL → home…")
-            cmd_id = robot.move_linear(hx, hy, hz, hrx, hry, hrz)
-        robot.wait_motion(cmd_id)
-
-        self._log("[Execute] Vacuum OFF — releasing object")
-        self._set_status("Releasing object…")
-        robot.vacuum_off()
-        time.sleep(0.5)
-
-    def _recover_robot(self, robot):
-        """After a failed grasp attempt: vacuum off, clear error, re-enable, go home."""
-        try:
+        sort_joints = self._sort_joints
+        if sort_joints:
+            self._log("[Execute] Going to sort position — dropping object")
+            self._set_status("MovJ → sort…")
+            cmd_id = robot.move_joint_angles(*sort_joints)
+            robot.wait_motion(cmd_id)
+            self._log("[Execute] Vacuum OFF — releasing at sort position")
+            self._set_status("Releasing at sort…")
             robot.vacuum_off()
-        except Exception:
-            pass
-        try:
-            robot.clear_error()
             time.sleep(0.5)
-            robot.enable()
-            time.sleep(1.5)
-        except Exception:
-            pass
-        try:
-            joints = getattr(self, "_home_joints", None)
-            if joints:
-                cmd_id = robot.move_joint_angles(*joints)
+            # Return to home after drop
+            home_joints = self._home_joints
+            if home_joints:
+                self._log("[Execute] Returning home (saved joints)")
+                self._set_status("MovJ → home…")
+                cmd_id = robot.move_joint_angles(*home_joints)
             else:
                 hx, hy, hz, hrx, hry, hrz = HOME_POSE
+                self._log("[Execute] Returning home (default)")
+                self._set_status("MovL → home…")
                 cmd_id = robot.move_linear(hx, hy, hz, hrx, hry, hrz)
-            robot.wait_motion(cmd_id, timeout=30.0)
+            robot.wait_motion(cmd_id)
+        else:
+            home_joints = self._home_joints
+            if home_joints:
+                self._log("[Execute] Going home (saved joints)")
+                self._set_status("MovJ → home…")
+                cmd_id = robot.move_joint_angles(*home_joints)
+            else:
+                hx, hy, hz, hrx, hry, hrz = HOME_POSE
+                self._log("[Execute] Going home (default pose)")
+                self._set_status("MovL → home…")
+                cmd_id = robot.move_linear(hx, hy, hz, hrx, hry, hrz)
+            robot.wait_motion(cmd_id)
+            self._log("[Execute] Vacuum OFF — releasing object")
+            self._set_status("Releasing object…")
+            robot.vacuum_off()
+            time.sleep(0.5)
+
+    def _recover_robot(self, robot):
+        """Vacuum off → clear alarm → re-enable (up to 3 retries) → go home.
+        Returns True if robot reached an enabled/running state."""
+        self._log("[Recover] Starting recovery sequence…")
+        self._set_status("Recovering robot…")
+
+        # 1. Vacuum off — always safe
+        try:
+            robot.vacuum_off()
+            self._log("[Recover] Vacuum OFF")
         except Exception as e:
-            self._log(f"[Retry] WARNING: could not return to home after recovery: {e}")
+            self._log(f"[Recover] vacuum_off error (ignored): {e}")
+
+        # 2. Clear alarm + re-enable, up to 3 attempts
+        recovered = False
+        for attempt in range(1, 4):
+            try:
+                self._log(f"[Recover] Clear alarm + enable (attempt {attempt}/3)…")
+                robot.clear_error()
+                time.sleep(0.5)
+                robot.enable()
+                time.sleep(2.0)
+                mode = robot.get_mode()
+                self._log(f"[Recover] Robot mode after enable: {mode}")
+                if mode in (DobotDashboard.MODE_ENABLED, DobotDashboard.MODE_RUNNING):
+                    self._log("[Recover] Robot enabled successfully.")
+                    recovered = True
+                    break
+                self._log(f"[Recover] Not yet enabled (mode={mode}), retrying…")
+                time.sleep(1.5)
+            except Exception as e:
+                self._log(f"[Recover] Enable attempt {attempt} failed: {e}")
+                time.sleep(1.5)
+
+        if not recovered:
+            self._log("[Recover] WARNING: robot did not reach enabled state after 3 attempts")
+
+        # 3. Go home
+        try:
+            home_joints = self._home_joints
+            if home_joints:
+                self._log("[Recover] Returning home (saved joints)")
+                cmd_id = robot.move_joint_angles(*home_joints)
+            else:
+                hx, hy, hz, hrx, hry, hrz = HOME_POSE
+                self._log("[Recover] Returning home (default pose)")
+                cmd_id = robot.move_linear(hx, hy, hz, hrx, hry, hrz)
+            robot.wait_motion(cmd_id, timeout=45.0)
+            self._log("[Recover] Back at home position.")
+        except Exception as e:
+            self._log(f"[Recover] WARNING: could not go home: {e}")
+
+        return recovered
 
     def _execute_worker(self, x, y, z, x_pre, y_pre, z_pre, rx, ry, rz, speed):
         robot = self._robot
@@ -2661,6 +2912,331 @@ class GraspExecuteApp:
                 state="normal", text="🤖  Execute Selected Grasp"))
 
     # ------------------------------------------------------------------
+    # Sort position
+    # ------------------------------------------------------------------
+    def _on_save_sort(self):
+        if not self._robot_connected:
+            return
+        threading.Thread(target=self._save_sort_worker, daemon=True).start()
+
+    def _save_sort_worker(self):
+        try:
+            mode = self._robot.get_mode()
+            if mode == DobotDashboard.MODE_ERROR:
+                self._robot.clear_error(); time.sleep(1.0)
+                self._robot.enable();      time.sleep(1.5)
+            joints = self._robot.get_angle()
+            self._sort_joints = list(joints)
+            self._save_positions()
+            self._log(f"[Sort] Saved: "
+                      f"J1={joints[0]:.2f} J2={joints[1]:.2f} J3={joints[2]:.2f} "
+                      f"J4={joints[3]:.2f} J5={joints[4]:.2f} J6={joints[5]:.2f}")
+            self._set_status(f"Sort saved: [{', '.join(f'{v:.1f}' for v in joints)}]")
+            self._cb_queue.put(lambda j=list(joints): (
+                self._sort_status.config(
+                    text=f"Sort: [{', '.join(f'{v:.0f}' for v in j)}]",
+                    fg="#98c379"),
+                self._go_sort_btn.config(state="normal")))
+        except Exception as e:
+            self._log(f"[Sort] Could not save: {e}")
+
+    def _on_go_sort(self):
+        if not self._robot_connected or self._executing:
+            return
+        if self._sort_joints is None:
+            from tkinter import messagebox as _mb
+            _mb.showwarning("No sort position", "Save a sort position first.")
+            return
+        speed = int(self._speed_var.get())
+        threading.Thread(target=self._go_sort_worker, args=(speed,), daemon=True).start()
+
+    def _go_sort_worker(self, speed):
+        try:
+            self._ensure_enabled()
+            self._robot.set_speed(speed)
+            self._log(f"[Sort] Moving to sort: {[round(v,2) for v in self._sort_joints]}")
+            self._set_status("Moving to sort position…")
+            cmd_id = self._robot.move_joint_angles(*self._sort_joints)
+            self._robot.wait_motion(cmd_id)
+            self._log("[Sort] Done.")
+            self._set_status("At sort position.")
+        except Exception as e:
+            self._log(f"[Sort] ERROR: {e}")
+
+    # ------------------------------------------------------------------
+    # Batch word-list execution
+    # ------------------------------------------------------------------
+    def _on_add_batch_word(self):
+        word = self._batch_word_var.get().strip()
+        if word:
+            self._batch_listbox.insert("end", word)
+            self._batch_word_var.set("")
+
+    def _on_remove_batch_word(self):
+        sel = self._batch_listbox.curselection()
+        for i in reversed(sel):
+            self._batch_listbox.delete(i)
+
+    def _on_run_batch(self):
+        if self._batch_running:
+            return
+        if self._inference_running:
+            self._log("[Batch] Pipeline is busy — wait for it to finish.")
+            return
+        words = list(self._batch_listbox.get(0, "end"))
+        if not words:
+            self._log("[Batch] Word list is empty.")
+            return
+        if self._sampler is None:
+            self._log("[Batch] No gripper config loaded.")
+            return
+        if not self._robot_connected or self._robot is None:
+            self._log("[Batch] Robot not connected.")
+            return
+        if self._replay_frame is None and not self.camera._started \
+                and self._current_frame is None:
+            self._log("[Batch] No camera/frame available.")
+            return
+        speed = int(self._speed_var.get())
+        self._batch_running = True
+        self._batch_stop_event.clear()
+        self._batch_run_btn.config(state="disabled", text="Running…")
+        self._batch_stop_btn.config(state="normal")
+        threading.Thread(target=self._batch_worker, args=(words, speed),
+                         daemon=True).start()
+
+    def _on_stop_batch(self):
+        self._batch_stop_event.set()
+        self._log("[Batch] Stop requested — will halt after current step.")
+        self._batch_stop_btn.config(state="disabled")
+
+    def _batch_worker(self, words, speed):
+        """Loop through words top→bottom continuously until stopped.
+        Each word: up to 3 attempts (capture → SAM3 → GraspGen → execute).
+        On success or 3 failures, advance to next word.
+        When the last word is reached, wrap back to the first."""
+        self._log(f"[Batch] Starting continuous loop — {len(words)} word(s)")
+        self._set_status("[Batch] Starting…")
+
+        cycle = 0
+        word_idx = 0
+        while not self._batch_stop_event.is_set():
+            word = words[word_idx]
+
+            self._log(f"[Batch] ── cycle {cycle+1}  {word_idx+1}/{len(words)}: '{word}' ──")
+            self._set_status(f"[Batch] cycle {cycle+1} · '{word}' ({word_idx+1}/{len(words)})")
+
+            # Pre-check: recover if robot is in error state before attempting
+            if self._robot_connected and self._robot is not None:
+                try:
+                    mode = self._robot.get_mode()
+                    if mode == DobotDashboard.MODE_ERROR:
+                        self._log(f"[Batch] Robot in error state — recovering before '{word}'…")
+                        self._recover_robot(self._robot)
+                except Exception as _me:
+                    self._log(f"[Batch] Could not check robot mode: {_me}")
+
+            # Highlight current word in listbox
+            self._cb_queue.put(lambda i=word_idx: (
+                self._batch_listbox.selection_clear(0, "end"),
+                self._batch_listbox.selection_set(i),
+                self._batch_listbox.see(i)))
+
+            success = False
+            for attempt in range(1, 4):
+                if self._batch_stop_event.is_set():
+                    break
+
+                self._log(f"[Batch]   Attempt {attempt}/3 — running pipeline…")
+                self._set_status(
+                    f"[Batch] '{word}' attempt {attempt}/3 — pipeline…")
+
+                # Set prompt display
+                self._cb_queue.put(lambda w=word: self._prompt_var.set(w))
+
+                # Determine frame source
+                if self._replay_frame is not None:
+                    source = "replay"
+                elif self.camera._started:
+                    source = "camera"
+                elif self._current_frame is not None:
+                    source = "cached"
+                else:
+                    self._log("[Batch] No camera/frame — aborting.")
+                    self._batch_running = False
+                    self._cb_queue.put(lambda: self._batch_run_btn.config(
+                        state="normal", text="▶  Run Batch"))
+                    self._cb_queue.put(lambda: self._batch_stop_btn.config(
+                        state="disabled"))
+                    return
+
+                # Run the pipeline in a sub-thread, wait for completion
+                pipeline_done = threading.Event()
+                self._inference_running = True
+                self._all_grasps_base = None
+                self._best_grasp_base = None
+
+                def _run_pipeline(src=source, prm=word):
+                    try:
+                        self._pipeline_worker(
+                            src, prm, self._sampler, self._grasp_cfg)
+                    except Exception as _pe:
+                        self._log(f"[Batch] Pipeline exception: {_pe}")
+                    finally:
+                        pipeline_done.set()
+
+                threading.Thread(target=_run_pipeline, daemon=True).start()
+                if not pipeline_done.wait(timeout=300):
+                    self._log(
+                        f"[Batch]   Pipeline timed out — skipping attempt")
+                    continue
+
+                if self._all_grasps_base is None or \
+                        len(self._all_grasps_base) == 0:
+                    self._log(f"[Batch]   No grasps found — retrying")
+                    continue
+
+                # Execute the best grasp
+                self._log(f"[Batch]   {len(self._all_grasps_base)} grasp(s) "
+                          f"found — executing…")
+                self._set_status(
+                    f"[Batch] '{word}' attempt {attempt}/3 — executing…")
+
+                approach_m = float(self._approach_var.get()) / 1000.0
+                grasp = self._all_grasps_base[0]
+                try:
+                    gx, gy, gz, grx, gry, grz = \
+                        self._grasp_base_to_robot_coords(grasp)
+                    tool_z = grasp[:3, 2]
+                    pre_mm = (grasp[:3, 3] - approach_m * tool_z) * 1000.0
+                    gx_pre = float(pre_mm[0])
+                    gy_pre = float(pre_mm[1])
+                    gz_pre = float(pre_mm[2])
+
+                    ok_g, _, _ = self._check_pose_valid(
+                        gx, gy, gz, grx, gry, grz)
+                    ok_a, _, _ = self._check_pose_valid(
+                        gx_pre, gy_pre, gz_pre, grx, gry, grz)
+                    if not ok_g or not ok_a:
+                        self._log(
+                            f"[Batch]   Grasp pose unreachable — recovering and retrying")
+                        try:
+                            if self._robot.get_mode() == DobotDashboard.MODE_ERROR:
+                                self._recover_robot(self._robot)
+                        except Exception:
+                            pass
+                        continue
+
+                    self._executing = True
+                    self._try_single_grasp(
+                        self._robot, gx, gy, gz,
+                        gx_pre, gy_pre, gz_pre,
+                        grx, gry, grz, speed)
+                    self._executing = False
+                    self._log(
+                        f"[Batch]   SUCCESS — '{word}' picked and placed!")
+                    success = True
+                    break
+
+                except Exception as exec_e:
+                    self._executing = False
+                    self._log(
+                        f"[Batch]   Execute failed: {exec_e}")
+                    self._recover_robot(self._robot)
+
+            if not success and not self._batch_stop_event.is_set():
+                self._log(
+                    f"[Batch] '{word}' — all 3 attempts exhausted, "
+                    f"moving to next word.")
+
+            # Advance to next word; wrap around at end of list
+            word_idx += 1
+            if word_idx >= len(words):
+                word_idx = 0
+                cycle += 1
+                if not self._batch_stop_event.is_set():
+                    self._log(f"[Batch] ── end of list — restarting cycle {cycle+1} ──")
+
+        self._set_status("[Batch] Stopped.")
+
+        self._batch_running = False
+        self._cb_queue.put(lambda: self._batch_run_btn.config(
+            state="normal", text="▶  Run Batch"))
+        self._cb_queue.put(lambda: self._batch_stop_btn.config(state="disabled"))
+
+    # ------------------------------------------------------------------
+    # Manual robot recovery
+    # ------------------------------------------------------------------
+    def _on_load_list(self):
+        from tkinter import filedialog
+        OBJECT_LISTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = filedialog.askopenfilename(
+            title="Load word list",
+            initialdir=str(OBJECT_LISTS_DIR),
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            words = Path(path).read_text(encoding="utf-8").splitlines()
+            words = [w.strip() for w in words if w.strip()]
+        except Exception as e:
+            self._log(f"[List] Failed to load '{path}': {e}")
+            return
+        self._batch_listbox.delete(0, "end")
+        for w in words:
+            self._batch_listbox.insert("end", w)
+        self._last_list_path = path
+        self._list_file_label.config(text=Path(path).name)
+        self._save_positions()
+        self._log(f"[List] Loaded {len(words)} word(s) from {Path(path).name}")
+
+    def _on_save_list(self):
+        from tkinter import filedialog
+        words = list(self._batch_listbox.get(0, "end"))
+        if not words:
+            self._log("[List] Nothing to save — list is empty.")
+            return
+        OBJECT_LISTS_DIR.mkdir(parents=True, exist_ok=True)
+        initial = Path(self._last_list_path).name if self._last_list_path else "word_list.txt"
+        path = filedialog.asksaveasfilename(
+            title="Save word list",
+            initialdir=str(OBJECT_LISTS_DIR),
+            initialfile=initial,
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text("\n".join(words) + "\n", encoding="utf-8")
+        except Exception as e:
+            self._log(f"[List] Failed to save '{path}': {e}")
+            return
+        self._last_list_path = path
+        self._list_file_label.config(text=Path(path).name)
+        self._save_positions()
+        self._log(f"[List] Saved {len(words)} word(s) to {Path(path).name}")
+
+    # ------------------------------------------------------------------
+    def _on_recover_robot(self):
+        if not self._robot_connected or self._executing or self._batch_running:
+            return
+        self._recover_btn.config(state="disabled", text="Recovering…")
+        threading.Thread(target=self._recover_robot_worker, daemon=True).start()
+
+    def _recover_robot_worker(self):
+        try:
+            ok = self._recover_robot(self._robot)
+            self._set_status("Recovery done — robot enabled." if ok
+                             else "Recovery attempted — check robot state.")
+        except Exception as e:
+            self._log(f"[Recover] Unexpected error: {e}")
+        finally:
+            self._cb_queue.put(lambda: self._recover_btn.config(
+                state="normal", text="⚠  Recover Robot"))
+
+    # ------------------------------------------------------------------
     # Utility buttons
     # ------------------------------------------------------------------
     def _on_save_home(self):
@@ -2677,6 +3253,7 @@ class GraspExecuteApp:
                 self._robot.enable();      time.sleep(1.5)
             joints = self._robot.get_angle()
             self._home_joints = list(joints)
+            self._save_positions()
             self._log(f"[Home] Saved: "
                       f"J1={joints[0]:.2f} J2={joints[1]:.2f} J3={joints[2]:.2f} "
                       f"J4={joints[3]:.2f} J5={joints[4]:.2f} J6={joints[5]:.2f}")
