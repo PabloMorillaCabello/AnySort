@@ -73,6 +73,7 @@ CHECKPOINTS_DIR  = "/opt/GraspGen/GraspGenModels/checkpoints"
 SAM3_SERVER_SCRIPT = "/ros2_ws/scripts/sam3_server.py"
 CALIB_FILE       = "/ros2_ws/data/calibration/hand_eye_calib.npz"
 RESULTS_DIR      = Path("/ros2_ws/results")
+ROI_SAVE_PATH    = Path(__file__).parent / "pipeline_roi.json"
 
 ROBOT_IP_DEFAULT = "192.168.5.1"
 ROBOT_PORT       = 29999
@@ -350,14 +351,34 @@ class OrbbecCamera:
         # The pipeline is only running during capture_frame() calls.
         pipeline.start(config)
 
-        # ── Depth post-processing: enable device-recommended filters ──
+        # ── Depth post-processing: selective filter enable ──
+        #
+        # DISABLED — HoleFilling: interpolates across invalid pixels → creates
+        #   smooth gradients on flat surfaces ("hill" artefact).
+        #
+        # DISABLED — Temporal: averages depth across consecutive frames.
+        #   Fine for a live stream, but this camera runs start-stop per capture.
+        #   On restart the filter retains stale state from the previous scene,
+        #   so a newly placed object appears at a blended intermediate depth
+        #   until the filter accumulates enough frames to converge.
+        #
+        # KEPT — Spatial (bilateral-style): reduces per-frame sensor noise
+        #   within a single frame without blending across time or bridging
+        #   depth discontinuities.
         try:
             device = pipeline.get_device()
             sensor = device.get_sensor(OBSensorType.DEPTH_SENSOR)
             filters = sensor.get_recommended_filters()
             for f in filters:
-                f.enable(True)
-                print(f"[Camera] Depth filter: {f.get_name()} (enabled)")
+                fname = f.get_name().lower()
+                skip = any(kw in fname for kw in
+                           ("hole", "fill", "inpaint", "temporal", "time"))
+                if skip:
+                    f.enable(False)
+                    print(f"[Camera] Depth filter: {f.get_name()} (DISABLED)")
+                else:
+                    f.enable(True)
+                    print(f"[Camera] Depth filter: {f.get_name()} (enabled)")
             self._depth_filters = filters
         except Exception as e:
             print(f"[Camera] Depth filters unavailable: {e}")
@@ -390,8 +411,11 @@ class OrbbecCamera:
 
         # Re-start the pipeline for this capture
         self._pipeline.start(self._config)
-        # Brief warm-up (less than initial — sensor is already calibrated)
-        for _ in range(5):
+        # Warm-up: discard frames while AE / depth processor settles.
+        # 10 frames at ~30 fps ≈ 330 ms — fast enough to be unnoticeable but
+        # sufficient for exposure and the spatial filter to converge on the
+        # current scene without temporal filter interference.
+        for _ in range(10):
             try:
                 self._pipeline.wait_for_frames(200)
             except Exception:
@@ -546,10 +570,14 @@ class DobotDashboard:
         return self._dashboard.SpeedFactor(self._speed)
 
     def vacuum_on(self, port=VACUUM_DO_PORT):
-        return self._dashboard.ToolDO(port, 1)
+        resp = self._dashboard.ToolDO(port, 1)
+        print(f"[DobotDashboard] vacuum_on  ToolDO({port},1) → {resp!r}", flush=True)
+        return resp
 
     def vacuum_off(self, port=VACUUM_DO_PORT):
-        return self._dashboard.ToolDO(port, 0)
+        resp = self._dashboard.ToolDO(port, 0)
+        print(f"[DobotDashboard] vacuum_off ToolDO({port},0) → {resp!r}", flush=True)
+        return resp
 
     # ------------------------------------------------------------------
     # Position getters (parse numeric response)
@@ -827,14 +855,73 @@ class GraspExecuteApp:
         self._log_queue = queue.Queue()
         self._cb_queue  = queue.Queue()
 
+        # ROI selection (4-point polygon)
+        self._roi_poly_img: list = None  # [(x,y),...] image coords, 4 pts when complete
+        self._roi_selecting: bool = False
+        self._roi_canvas_pts: list = []  # canvas (cx,cy) accumulated during selection
+
+        self._canvas_scale: float = 1.0
+        self._canvas_xo: int = 0
+        self._canvas_yo: int = 0
+
+        # Orientation flip for vacuum gripper — set automatically when config is loaded
+        self._flip_orient: bool = False
+
+        # Retry on robot error — iterate through next best grasps
+        self._retry_grasps_var = tk.BooleanVar(value=False)
+        self._retry_stop_event = threading.Event()
+
         self._build_ui()
         self._load_calibration()
+        self._load_roi()
         self._start_config_if_available()
         self._schedule_flush()
+
+        # Auto-capture first frame if camera is already live
+        if self.camera._started:
+            self.root.after(800, self._auto_capture_on_startup)
 
     # ------------------------------------------------------------------
     # Startup helpers
     # ------------------------------------------------------------------
+    def _save_roi(self):
+        """Persist the current ROI polygon to disk."""
+        try:
+            if self._roi_poly_img:
+                ROI_SAVE_PATH.write_text(json.dumps({"poly": self._roi_poly_img}))
+            else:
+                ROI_SAVE_PATH.write_text(json.dumps({"poly": None}))
+        except Exception as e:
+            self._log(f"[ROI] Could not save ROI: {e}")
+
+    def _load_roi(self):
+        """Restore a previously saved ROI polygon."""
+        try:
+            if not ROI_SAVE_PATH.exists():
+                return
+            data = json.loads(ROI_SAVE_PATH.read_text())
+            poly = data.get("poly")
+            if poly and len(poly) == 4:
+                self._roi_poly_img = [tuple(p) for p in poly]
+                xs = [p[0] for p in self._roi_poly_img]
+                ys = [p[1] for p in self._roi_poly_img]
+                self._roi_info_var.set(
+                    f"ROI poly  bbox ({min(xs)},{min(ys)})→({max(xs)},{max(ys)})  [restored]")
+                self._log(f"[ROI] Restored saved polygon: {self._roi_poly_img}")
+        except Exception as e:
+            self._log(f"[ROI] Could not load saved ROI: {e}")
+
+    def _auto_capture_on_startup(self):
+        """Capture one frame automatically when the camera is already live at startup."""
+        if self.camera._started and self._current_frame is None:
+            self._log("[Camera] Auto-capturing startup frame…")
+            threading.Thread(target=self._capture_frame_worker, daemon=True).start()
+
+    def _on_stop_retry(self):
+        self._retry_stop_event.set()
+        self._log("[Retry] Stop requested — will halt after current attempt.")
+        self._stop_retry_btn.config(state="disabled")
+
     def _load_calibration(self):
         path = self.args.calib_file
         try:
@@ -876,7 +963,9 @@ class GraspExecuteApp:
     def _build_ui(self):
         self.root.title("Grasp Execute Pipeline  —  SAM3 + GraspGen + Dobot")
         self.root.configure(bg="#1e1e1e")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.minsize(1050, 720)
+        self.root.geometry("1250x800")
 
         # ---- Left: camera preview ----
         left = tk.Frame(self.root, bg="#1e1e1e")
@@ -889,6 +978,19 @@ class GraspExecuteApp:
         self._no_cam_txt = self._canvas.create_text(
             _PREVIEW_W//2, _PREVIEW_H//2, text="Waiting for camera…",
             fill="#555", font=("Helvetica", 14))
+        # 4 dots + 4 edges + 1 preview line for polygon ROI selection
+        self._roi_dot_ids = [
+            self._canvas.create_oval(-6,-6,-6,-6, outline="#FFD700",
+                                     fill="#FFD700", state="hidden")
+            for _ in range(4)]
+        self._roi_edge_ids = [
+            self._canvas.create_line(0,0,0,0, fill="#FFD700",
+                                     width=2, state="hidden")
+            for _ in range(4)]
+        self._roi_preview_id = self._canvas.create_line(
+            0,0,0,0, fill="#FFD700", width=1, dash=(4,2), state="hidden")
+        self._canvas.bind("<ButtonPress-1>", self._on_roi_click)
+        self._canvas.bind("<Motion>",        self._on_roi_hover)
 
         tk.Checkbutton(left, text="Show mask overlay", variable=self._show_mask,
                        bg="#1e1e1e", fg="#aaa", activebackground="#1e1e1e",
@@ -918,7 +1020,11 @@ class GraspExecuteApp:
         # ── Replay mode controls ──
         replay_row = tk.Frame(left, bg="#1e1e1e")
         replay_row.pack(fill="x", padx=4, pady=(6, 0))
-        tk.Button(replay_row, text="📂  Load Saved Frame",
+        tk.Button(replay_row, text="💾  Save Scene",
+                  bg="#3a3a3a", fg="#98c379", activebackground="#4a4a4a",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+                  command=self._on_save_scene).pack(side="left", ipady=4, padx=(0, 6))
+        tk.Button(replay_row, text="📂  Load Scene",
                   bg="#3a3a3a", fg="#e5c07b", activebackground="#4a4a4a",
                   relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
                   command=self._on_load_replay).pack(side="left", ipady=4, padx=(0, 6))
@@ -931,6 +1037,24 @@ class GraspExecuteApp:
                                      font=("Courier", 7), wraplength=_PREVIEW_W - 8,
                                      justify="left", anchor="w")
         self._replay_info.pack(fill="x", padx=4, pady=(2, 0))
+
+        # ── ROI controls ──
+        roi_row = tk.Frame(left, bg="#1e1e1e")
+        roi_row.pack(fill="x", padx=4, pady=(6, 0))
+        self._roi_btn = tk.Button(
+            roi_row, text="🔲  Select ROI",
+            bg="#3a3a3a", fg="#FFD700", activebackground="#4a4a4a",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+            command=self._on_roi_select)
+        self._roi_btn.pack(side="left", ipady=4)
+        tk.Button(roi_row, text="✕ Clear ROI",
+                  bg="#3a3a3a", fg="#aaa", activebackground="#4a4a4a",
+                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+                  command=self._on_roi_clear).pack(side="left", ipady=4, padx=(6, 0))
+        self._roi_info_var = tk.StringVar(value="")
+        tk.Label(roi_row, textvariable=self._roi_info_var,
+                 bg="#1e1e1e", fg="#aaa", font=("Courier", 7)
+                 ).pack(side="left", padx=(8, 0))
 
         # ---- Middle: GraspGen controls ----
         mid = tk.Frame(self.root, bg="#2d2d2d", width=310)
@@ -1036,7 +1160,6 @@ class GraspExecuteApp:
         # ---- Right: Robot execution ----
         right = tk.Frame(self.root, bg="#252525", width=290)
         right.grid(row=0, column=2, sticky="nsew", padx=(4,8), pady=8)
-        right.grid_propagate(False)
 
         tk.Label(right, text="Robot Execution", bg="#252525", fg="#c678dd",
                  font=("Helvetica", 14, "bold")).pack(pady=(14,0))
@@ -1152,6 +1275,20 @@ class GraspExecuteApp:
             command=self._on_execute)
         self._execute_btn.pack(padx=12, pady=2, fill="x", ipady=10)
 
+        tk.Checkbutton(right, text="Auto-retry next grasp on robot error",
+                       variable=self._retry_grasps_var,
+                       bg="#252525", fg="#aaa", activebackground="#252525",
+                       selectcolor="#3a3a3a", font=("Helvetica", 8)
+                       ).pack(anchor="w", padx=12, pady=(2, 2))
+
+        self._stop_retry_btn = tk.Button(
+            right, text="⏹  Stop Retry",
+            bg="#e06c75", fg="white", activebackground="#c0545e",
+            relief="flat", cursor="hand2", bd=0,
+            font=("Helvetica", 9, "bold"), state="disabled",
+            command=self._on_stop_retry)
+        self._stop_retry_btn.pack(padx=12, pady=(0, 4), fill="x", ipady=4)
+
         self._home_btn = tk.Button(
             right, text="🏠  Move to Home",
             bg="#3a3a3a", fg="#ccc", activebackground="#444",
@@ -1172,6 +1309,92 @@ class GraspExecuteApp:
         self.root.columnconfigure(1, weight=0)
         self.root.columnconfigure(2, weight=0)
         self.root.rowconfigure(0, weight=1)
+
+    # ------------------------------------------------------------------
+    # ROI selection
+    # ------------------------------------------------------------------
+    def _on_roi_select(self):
+        """Start 4-point polygon ROI selection."""
+        self._roi_poly_img = None
+        self._roi_canvas_pts = []
+        self._roi_selecting = True
+        for _id in self._roi_dot_ids + self._roi_edge_ids:
+            self._canvas.itemconfig(_id, state="hidden")
+        self._canvas.itemconfig(self._roi_preview_id, state="hidden")
+        self._roi_btn.config(text="Click point 1 / 4")
+        self._canvas.config(cursor="crosshair")
+        self._cb_queue.put(self._refresh_canvas)
+
+    def _on_roi_clear(self):
+        self._roi_poly_img = None
+        self._roi_selecting = False
+        self._roi_canvas_pts = []
+        for _id in self._roi_dot_ids + self._roi_edge_ids:
+            self._canvas.itemconfig(_id, state="hidden")
+        self._canvas.itemconfig(self._roi_preview_id, state="hidden")
+        self._roi_info_var.set("")
+        self._roi_btn.config(text="🔲  Select ROI")
+        self._canvas.config(cursor="")
+        self._save_roi()
+        self._cb_queue.put(self._refresh_canvas)
+
+    def _on_roi_click(self, event):
+        if not self._roi_selecting:
+            return
+        cx, cy = event.x, event.y
+        self._roi_canvas_pts.append((cx, cy))
+        n = len(self._roi_canvas_pts)
+
+        # Place dot for this point
+        r = 5
+        self._canvas.coords(self._roi_dot_ids[n - 1],
+                            cx - r, cy - r, cx + r, cy + r)
+        self._canvas.itemconfig(self._roi_dot_ids[n - 1], state="normal")
+
+        # Edge from previous point to this one
+        if n > 1:
+            px, py = self._roi_canvas_pts[n - 2]
+            self._canvas.coords(self._roi_edge_ids[n - 2], px, py, cx, cy)
+            self._canvas.itemconfig(self._roi_edge_ids[n - 2], state="normal")
+
+        if n < 4:
+            self._roi_btn.config(text=f"Click point {n + 1} / 4")
+        else:
+            # Close the polygon (edge from point 4 back to point 1)
+            p0x, p0y = self._roi_canvas_pts[0]
+            self._canvas.coords(self._roi_edge_ids[3], cx, cy, p0x, p0y)
+            self._canvas.itemconfig(self._roi_edge_ids[3], state="normal")
+            self._canvas.itemconfig(self._roi_preview_id, state="hidden")
+
+            # Convert all 4 canvas pts → image coords
+            scale = self._canvas_scale
+            xo, yo = self._canvas_xo, self._canvas_yo
+            frame = self._current_frame or self._replay_frame
+            fh, fw = (frame[0].shape[:2] if frame is not None else (99999, 99999))
+            img_pts = []
+            for ccx, ccy in self._roi_canvas_pts:
+                ix = int(max(0, min((ccx - xo) / scale, fw - 1)))
+                iy = int(max(0, min((ccy - yo) / scale, fh - 1)))
+                img_pts.append((ix, iy))
+
+            self._roi_poly_img = img_pts
+            self._roi_selecting = False
+            self._roi_canvas_pts = []
+            self._roi_btn.config(text="🔲  Select ROI")
+            self._canvas.config(cursor="")
+            xs = [p[0] for p in img_pts]
+            ys = [p[1] for p in img_pts]
+            self._roi_info_var.set(
+                f"ROI poly  bbox ({min(xs)},{min(ys)})→({max(xs)},{max(ys)})")
+            self._log(f"[ROI] 4-pt polygon (image coords): {img_pts}")
+            self._save_roi()
+
+    def _on_roi_hover(self, event):
+        if not self._roi_selecting or not self._roi_canvas_pts:
+            return
+        px, py = self._roi_canvas_pts[-1]
+        self._canvas.coords(self._roi_preview_id, px, py, event.x, event.y)
+        self._canvas.itemconfig(self._roi_preview_id, state="normal")
 
     # ------------------------------------------------------------------
     # Camera connect / disconnect
@@ -1211,12 +1434,68 @@ class GraspExecuteApp:
     # ------------------------------------------------------------------
     # Replay mode
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Save scene (all data needed for offline pipeline replay)
+    # ------------------------------------------------------------------
+    def _on_save_scene(self):
+        """Save current frame + calibration + prompt + ROI to a single .npz."""
+        frame = self._current_frame or self._replay_frame
+        if frame is None:
+            self._log("[Save] No frame captured yet — capture first.")
+            return
+        rgb, depth_m, intrinsics = frame
+
+        from tkinter import filedialog
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"scene_{ts}.npz"
+        save_path = filedialog.asksaveasfilename(
+            title="Save scene as…",
+            initialdir=str(RESULTS_DIR),
+            initialfile=default_name,
+            defaultextension=".npz",
+            filetypes=[("NumPy scene", "*.npz"), ("All files", "*.*")])
+        if not save_path:
+            return
+
+        # Calibration
+        T_cam2base = self._T_cam2base if self._T_cam2base is not None else np.eye(4)
+        K = self._calib_K if self._calib_K is not None \
+            else np.array([[intrinsics[0], 0, intrinsics[2]],
+                           [0, intrinsics[1], intrinsics[3]],
+                           [0, 0, 1]], dtype=np.float64)
+        dist = getattr(self, '_calib_dist', None)
+        dist_arr = dist if dist is not None else np.zeros(5)
+
+        # ROI polygon
+        roi = np.array(self._roi_poly_img, dtype=np.float32) \
+            if self._roi_poly_img else np.zeros((0, 2), dtype=np.float32)
+
+        # Prompt
+        prompt = self._prompt_var.get().strip()
+
+        np.savez_compressed(
+            save_path,
+            rgb=rgb,                        # uint8 (H, W, 3)
+            depth_m=depth_m,                # float32 (H, W) metres
+            intrinsics=np.array(intrinsics, dtype=np.float64),  # [fx, fy, cx, cy]
+            K=K,                            # 3×3 calibrated camera matrix
+            dist=dist_arr,                  # distortion coefficients
+            T_cam2base=T_cam2base,          # 4×4 mm, camera → robot base
+            roi_poly=roi,                   # (4, 2) image-coord polygon or (0,2)
+            prompt=np.array([prompt]),      # SAM3 text prompt
+        )
+        self._log(f"[Save] Scene saved → {Path(save_path).name}  "
+                  f"rgb={rgb.shape}  depth={depth_m.shape}  "
+                  f"prompt='{prompt}'  roi={len(roi)} pts")
+
     def _on_load_replay(self):
         from tkinter import filedialog
         rgb_path = filedialog.askopenfilename(
-            title="Select RGB image",
+            title="Select RGB image or .npz scene",
             initialdir=str(Path(self.args.calib_file).parent.parent / "rgb"),
-            filetypes=[("PNG images", "*.png"), ("All files", "*.*")])
+            filetypes=[("Scene / PNG", "*.npz *.png"), ("NumPy scene", "*.npz"),
+                       ("PNG images", "*.png"), ("All files", "*.*")])
         if not rgb_path:
             return
         try:
@@ -1334,6 +1613,20 @@ class GraspExecuteApp:
         yo, xo = (_PREVIEW_H - nh) // 2, (_PREVIEW_W - nw) // 2
         padded[yo:yo+nh, xo:xo+nw] = resized
 
+        # Store for ROI coord mapping
+        self._canvas_scale = scale
+        self._canvas_xo    = xo
+        self._canvas_yo    = yo
+
+        # Draw completed ROI polygon overlay
+        if self._roi_poly_img is not None:
+            _pts = np.array(
+                [[int(p[0] * scale + xo), int(p[1] * scale + yo)]
+                 for p in self._roi_poly_img], dtype=np.int32)
+            cv2.polylines(padded, [_pts], isClosed=True, color=(255, 215, 0), thickness=2)
+            for _pt in _pts:
+                cv2.circle(padded, tuple(_pt), 5, (255, 215, 0), -1)
+
         pil = PILImage.fromarray(padded)
         tk_img = ImageTk.PhotoImage(pil)
         self._canvas.itemconfig(self._canvas_img_id, image=tk_img)
@@ -1404,8 +1697,12 @@ class GraspExecuteApp:
             self._grasp_cfg = cfg
             self._sampler = sampler
             self._loaded_config_name = name
+            # Auto-detect vacuum/suction gripper → enable orientation flip
+            _gname = cfg.data.gripper_name.lower()
+            self._flip_orient = any(kw in _gname for kw in ("vacuum", "suction", "cup"))
             self._cb_queue.put(lambda p=path: self._config_hint.configure(text=p))
-            self._log(f"[Config] Ready: {cfg.data.gripper_name}")
+            self._log(f"[Config] Ready: {cfg.data.gripper_name}  "
+                      f"(orientation flip {'ON — vacuum/suction detected' if self._flip_orient else 'OFF'})")
             self._set_status(f"Ready — {name}")
         except Exception as e:
             self._log(f"[Config] ERROR: {e}")
@@ -1497,7 +1794,43 @@ class GraspExecuteApp:
             # ─────────────────────────────────────────────────────────────────
             self._log(f"[SAM3] prompt='{prompt}'")
             t0 = time.time()
-            mask = segment_with_sam3(rgb, prompt, args.sam3_socket)
+            _roi_poly = self._roi_poly_img
+            if _roi_poly is not None:
+                fH, fW = rgb.shape[:2]
+                _xs = [p[0] for p in _roi_poly]
+                _ys = [p[1] for p in _roi_poly]
+                _rx1, _ry1 = max(0, min(_xs)), max(0, min(_ys))
+                _rx2, _ry2 = min(fW, max(_xs)), min(fH, max(_ys))
+                if _rx2 > _rx1 + 10 and _ry2 > _ry1 + 10:
+                    rgb_crop = rgb[_ry1:_ry2, _rx1:_rx2].copy()
+                    # Mask out pixels outside the polygon within the crop
+                    _poly_in_crop = np.array(
+                        [[(p[0] - _rx1), (p[1] - _ry1)] for p in _roi_poly],
+                        dtype=np.int32)
+                    _poly_mask = np.zeros(rgb_crop.shape[:2], dtype=np.uint8)
+                    cv2.fillPoly(_poly_mask, [_poly_in_crop], 1)
+                    rgb_sam = rgb_crop.copy()
+                    rgb_sam[_poly_mask == 0] = 0
+                    self._log(f"[SAM3] ROI 4-pt polygon, bbox "
+                              f"({_rx1},{_ry1})→({_rx2},{_ry2}) "
+                              f"{_rx2-_rx1}×{_ry2-_ry1} px")
+                else:
+                    rgb_sam, _roi_poly = rgb, None
+            else:
+                rgb_sam = rgb
+            mask_crop = segment_with_sam3(rgb_sam, prompt, args.sam3_socket)
+            if _roi_poly is not None:
+                mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+                crop_h, crop_w = _ry2 - _ry1, _rx2 - _rx1
+                if mask_crop.shape != (crop_h, crop_w):
+                    mask_crop = cv2.resize(mask_crop.astype(np.float32),
+                                           (crop_w, crop_h),
+                                           interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+                # Only keep mask pixels that are inside the polygon
+                mask_crop = mask_crop & _poly_mask
+                mask[_ry1:_ry2, _rx1:_rx2] = mask_crop
+            else:
+                mask = mask_crop
             self._log(f"[SAM3] {time.time()-t0:.2f}s — {int(mask.sum())} px")
 
             if mask.shape != depth_m.shape:
@@ -1542,9 +1875,25 @@ class GraspExecuteApp:
                 self._log("[PC] Applied lens distortion correction (RGB only)")
 
 
+            # Erode the mask by 4 pixels to strip the depth-edge border.
+            # At the boundary between object and background the Orbbec D2C
+            # alignment produces "flying pixels" — depth values that are a blend
+            # of foreground and background.  These project to 3-D positions that
+            # float between the two surfaces and distort the object shape (the
+            # classic "hill on a flat face" artefact).  A small erosion removes
+            # only the outermost ring of pixels where flying pixels live.
+            _ero_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            mask_pc = cv2.erode(mask, _ero_k, iterations=1)
+            n_lost  = int(mask.sum()) - int(mask_pc.sum())
+            if n_lost > 0:
+                self._log(f"[PC] Edge erosion removed {n_lost} border px (flying-pixel guard)")
+            if mask_pc.sum() < 30:
+                self._log("[PC] Mask too small after erosion — using original mask")
+                mask_pc = mask
+
             scene_pc, object_pc, scene_colors, object_colors = \
                 depth_and_segmentation_to_point_clouds(
-                    depth_image=depth_m, segmentation_mask=mask,
+                    depth_image=depth_m, segmentation_mask=mask_pc,
                     fx=fx, fy=fy, cx=cx, cy=cy,
                     rgb_image=rgb, target_object_id=args.target_object_id,
                     remove_object_from_scene=True)
@@ -1711,17 +2060,27 @@ class GraspExecuteApp:
                 f"Step 5/7 — All GraspGen poses  ({len(grasps_obj_np)} raw grasps)")
             # ────────────────────────────────────────────────────────────────
 
-            # Filter: keep only grasps approaching from above (Z-axis points down)
+            # Filter: keep only grasps approaching from above.
+            # When the orientation flip is enabled (GraspGen outputs reversed
+            # orientations for this tool), the grasps that are visually correct
+            # top-down have approach_z > 0 in GraspGen's frame — after the 180°
+            # flip applied later they become approach_z < 0 (downward) for
+            # execution.  Without the flip, the standard convention applies.
             approach_z = grasps_obj_np[:, 2, 2]
-            top_down = approach_z < 0  # approach Z-axis pointing downward = from above
+            if self._flip_orient:
+                top_down = approach_z > 0   # inverted: GraspGen orientation is reversed
+                filter_label = "top-down (inverted — flip enabled)"
+            else:
+                top_down = approach_z < 0   # standard: approach Z points down
+                filter_label = "top-down"
             if top_down.sum() == 0:
-                self._log("[GraspGen] WARNING: no top-down grasps — keeping all")
+                self._log(f"[GraspGen] WARNING: no {filter_label} grasps — keeping all")
             else:
                 n_before = len(grasps_obj_np)
                 grasps_obj_np = grasps_obj_np[top_down]
                 grasp_conf_np = grasp_conf_np[top_down]
                 n_topdown_removed = n_before - len(grasps_obj_np)
-                self._log(f"[GraspGen] Top-down filter: {n_before} → "
+                self._log(f"[GraspGen] {filter_label.capitalize()} filter: {n_before} → "
                           f"{len(grasps_obj_np)} grasps")
 
             # ── Debug step 6: top-down filtered grasps ───────────────────────
@@ -1754,6 +2113,7 @@ class GraspExecuteApp:
             _, grasps_centered, scores, _ = _process_point_cloud(
                 pc_base, grasps_work_np, grasp_conf_np)
 
+            n_topdown_removed  = 0
             n_collision_removed = 0
             n_reach_removed    = 0
 
@@ -1815,9 +2175,9 @@ class GraspExecuteApp:
                             # pre-grasp along tool Z-axis (same logic as _on_execute)
                             _tool_z = _g[:3, 2]
                             _pre_mm = (_g[:3, 3] - _approach_m * _tool_z) * 1000.0
-                            ok_g, _, _ = self._robot.check_reachability(
+                            ok_g, _, _ = self._check_pose_valid(
                                 _x, _y, _z, _rx, _ry, _rz)
-                            ok_a, _, _ = self._robot.check_reachability(
+                            ok_a, _, _ = self._check_pose_valid(
                                 float(_pre_mm[0]), float(_pre_mm[1]), float(_pre_mm[2]),
                                 _rx, _ry, _rz)
                             reach_mask.append(ok_g and ok_a)
@@ -1834,6 +2194,20 @@ class GraspExecuteApp:
                               f"{len(grasps_work_np)} reachable grasps")
                     if len(grasps_work_np) == 0:
                         raise RuntimeError("All grasps filtered by reachability check")
+            # ────────────────────────────────────────────────────────────────
+
+            # ── Orientation flip for vacuum gripper (execution only) ─────────
+            # Visualization stays unchanged.  For the execution poses we flip the
+            # approach direction (tool Z) so it always points downward in the robot
+            # base frame (negative Z component), meaning the robot descends from
+            # above rather than coming up from below.
+            if self._flip_orient:
+                _R_flip = np.eye(4)
+                _R_flip[:3, :3] = np.array([[1., 0., 0.],
+                                             [0., -1., 0.],
+                                             [0., 0., -1.]])   # 180° around X
+                grasps_base_np = np.array([g @ _R_flip for g in grasps_base_np])
+                self._log("[GraspGen] Approach Z flipped for execution (tool approaches from above)")
             # ────────────────────────────────────────────────────────────────
 
             # Sort all grasps by confidence descending and store for retry loop
@@ -1931,6 +2305,23 @@ class GraspExecuteApp:
             rx, ry, rz = 0.0, 0.0, 0.0
         return float(pos_mm[0]), float(pos_mm[1]), float(pos_mm[2]), \
                float(rx), float(ry), float(rz)
+
+    def _check_pose_valid(self, x, y, z, rx, ry, rz):
+        """Workspace radius bounds check.
+
+        The Dobot InverseKin API returns ErrorID=-1 for negative Z values even
+        when the pose is physically valid (robot mounted above the working
+        surface).  We therefore only validate the XY reach radius and skip the
+        IK call entirely to avoid false negatives.
+        """
+        if not self._robot_connected or self._robot is None:
+            return False, None, "Robot not connected"
+        r = float((x ** 2 + y ** 2) ** 0.5)
+        if r < 100.0:
+            return False, None, f"Too close to base (r={r:.1f} < 100 mm)"
+        if r > 820.0:
+            return False, None, f"Beyond max reach (r={r:.1f} > 820 mm)"
+        return True, None, "OK"
 
     def _update_grasp_display(self):
         """Read robot-frame pose directly and update the display label + nav buttons."""
@@ -2094,8 +2485,8 @@ class GraspExecuteApp:
         # ─────────────────────────────────────────────────────────────────────
 
         # ── Reachability safety check ────────────────────────────────────────
-        ok_g, joints, msg_g = self._robot.check_reachability(x, y, z, rx, ry, rz)
-        ok_a, _,      msg_a = self._robot.check_reachability(x_pre, y_pre, z_pre, rx, ry, rz)
+        ok_g, joints, msg_g = self._check_pose_valid(x, y, z, rx, ry, rz)
+        ok_a, _,      msg_a = self._check_pose_valid(x_pre, y_pre, z_pre, rx, ry, rz)
         self._log(f"[Reach] Grasp {'✓' if ok_g else '✗'} {msg_g}  "
                   f"Approach {'✓' if ok_a else '✗'} {msg_a}")
         if not ok_g or not ok_a:
@@ -2127,62 +2518,139 @@ class GraspExecuteApp:
                           args=(x, y, z, x_pre, y_pre, z_pre, rx, ry, rz, speed),
                           daemon=True).start()
 
-    def _execute_worker(self, x, y, z, x_pre, y_pre, z_pre, rx, ry, rz, speed):
-        robot = self._robot
+    def _try_single_grasp(self, robot, x, y, z, x_pre, y_pre, z_pre,
+                           rx, ry, rz, speed):
+        """Execute one full grasp sequence.  Raises on any robot error."""
+        robot.set_speed(speed)
+
+        self._log("[Execute] Vacuum OFF (open gripper)")
+        self._set_status("Opening gripper…")
+        robot.vacuum_off()
+        time.sleep(0.3)
+
+        self._log(f"[Execute] Pre-grasp  X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm")
+        self._set_status("MovL → pre-grasp…")
+        cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
+        robot.wait_motion(cmd_id)
+
+        self._log(f"[Execute] Grasp      X={x:.1f} Y={y:.1f} Z={z:.1f} mm")
+        self._set_status("MovL → grasp…")
+        cmd_id = robot.move_linear(x, y, z, rx, ry, rz)
+        robot.wait_motion(cmd_id)
+
+        self._log("[Execute] Vacuum ON — picking object")
+        self._set_status("Vacuum ON…")
+        robot.vacuum_on()
+        time.sleep(0.8)
+
+        self._log(f"[Execute] Retreat    X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm")
+        self._set_status("MovL → retreat…")
+        cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
+        robot.wait_motion(cmd_id)
+
+        joints = getattr(self, "_home_joints", None)
+        if joints:
+            self._log("[Execute] Going home (saved joints)")
+            self._set_status("MovJ → home…")
+            cmd_id = robot.move_joint_angles(*joints)
+        else:
+            hx, hy, hz, hrx, hry, hrz = HOME_POSE
+            self._log("[Execute] Going home (default pose)")
+            self._set_status("MovL → home…")
+            cmd_id = robot.move_linear(hx, hy, hz, hrx, hry, hrz)
+        robot.wait_motion(cmd_id)
+
+        self._log("[Execute] Vacuum OFF — releasing object")
+        self._set_status("Releasing object…")
+        robot.vacuum_off()
+        time.sleep(0.5)
+
+    def _recover_robot(self, robot):
+        """After a failed grasp attempt: vacuum off, clear error, re-enable, go home."""
         try:
-            robot.set_speed(speed)
-
-            # 1. Open gripper (ensure vacuum is off before approaching)
-            self._log("[Execute] Vacuum OFF (open gripper)")
-            self._set_status("Opening gripper…")
             robot.vacuum_off()
-            time.sleep(0.3)
-
-            # 2. Pre-grasp approach (along tool Z-axis, away from object)
-            self._log(f"[Execute] Pre-grasp  X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm")
-            self._set_status("MovL → pre-grasp…")
-            cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
-            robot.wait_motion(cmd_id)
-
-            # 3. Move to grasp
-            self._log(f"[Execute] Grasp      X={x:.1f} Y={y:.1f} Z={z:.1f} mm")
-            self._set_status("MovL → grasp…")
-            cmd_id = robot.move_linear(x, y, z, rx, ry, rz)
-            robot.wait_motion(cmd_id)
-
-            # 4. Vacuum ON (pick object)
-            self._log("[Execute] Vacuum ON — picking object")
-            self._set_status("Vacuum ON…")
-            robot.vacuum_on()
-            time.sleep(0.8)
-
-            # 5. Retreat (back along tool Z-axis)
-            self._log(f"[Execute] Retreat    X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm")
-            self._set_status("MovL → retreat…")
-            cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
-            robot.wait_motion(cmd_id)
-
-            # 6. Go home
+        except Exception:
+            pass
+        try:
+            robot.clear_error()
+            time.sleep(0.5)
+            robot.enable()
+            time.sleep(1.5)
+        except Exception:
+            pass
+        try:
             joints = getattr(self, "_home_joints", None)
             if joints:
-                self._log(f"[Execute] Going home (saved joints)")
-                self._set_status("MovJ → home…")
                 cmd_id = robot.move_joint_angles(*joints)
             else:
                 hx, hy, hz, hrx, hry, hrz = HOME_POSE
-                self._log(f"[Execute] Going home (default pose)")
-                self._set_status("MovL → home…")
                 cmd_id = robot.move_linear(hx, hy, hz, hrx, hry, hrz)
-            robot.wait_motion(cmd_id)
+            robot.wait_motion(cmd_id, timeout=30.0)
+        except Exception as e:
+            self._log(f"[Retry] WARNING: could not return to home after recovery: {e}")
 
-            # 7. Open gripper at home (release object)
-            self._log("[Execute] Vacuum OFF — releasing object")
-            self._set_status("Releasing object…")
-            robot.vacuum_off()
-            time.sleep(0.5)
+    def _execute_worker(self, x, y, z, x_pre, y_pre, z_pre, rx, ry, rz, speed):
+        robot = self._robot
+        try:
+            if self._retry_grasps_var.get() and self._all_grasps_base is not None:
+                # ── Auto-retry loop ────────────────────────────────────────────
+                self._retry_stop_event.clear()
+                self._cb_queue.put(
+                    lambda: self._stop_retry_btn.config(state="normal"))
 
-            self._log("[Execute] Done — object delivered to home position")
-            self._set_status("Done!")
+                start_idx = self._current_grasp_idx
+                total = len(self._all_grasps_base)
+                approach_m = float(self._approach_var.get()) / 1000.0
+                succeeded = False
+
+                for idx in range(start_idx, total):
+                    if self._retry_stop_event.is_set():
+                        self._log("[Retry] Stopped by user.")
+                        self._set_status("Retry stopped.")
+                        break
+
+                    grasp = self._all_grasps_base[idx]
+                    try:
+                        gx, gy, gz, grx, gry, grz = \
+                            self._grasp_base_to_robot_coords(grasp)
+                        tool_z = grasp[:3, 2]
+                        pre_mm = (grasp[:3, 3] - approach_m * tool_z) * 1000.0
+                        gx_pre = float(pre_mm[0])
+                        gy_pre = float(pre_mm[1])
+                        gz_pre = float(pre_mm[2])
+
+                        self._log(f"[Retry] Trying grasp {idx + 1}/{total}  "
+                                  f"X={gx:.1f} Y={gy:.1f} Z={gz:.1f} mm")
+                        self._set_status(f"Retry {idx + 1}/{total}…")
+                        self._cb_queue.put(lambda i=idx: self._select_grasp(i))
+
+                        self._try_single_grasp(robot, gx, gy, gz,
+                                               gx_pre, gy_pre, gz_pre,
+                                               grx, gry, grz, speed)
+                        self._log(f"[Retry] Grasp {idx + 1} succeeded!")
+                        self._set_status("Done!")
+                        succeeded = True
+                        break
+
+                    except Exception as e:
+                        self._log(f"[Retry] Grasp {idx + 1} failed: {e}")
+                        if idx + 1 < total and not self._retry_stop_event.is_set():
+                            self._log("[Retry] Recovering and trying next grasp…")
+                            self._recover_robot(robot)
+                        # ──────────────────────────────────────────────────────
+
+                self._cb_queue.put(
+                    lambda: self._stop_retry_btn.config(state="disabled"))
+                if not succeeded and not self._retry_stop_event.is_set():
+                    self._log("[Retry] All grasps exhausted — none succeeded.")
+                    self._set_status("All grasps tried — none succeeded.")
+
+            else:
+                # ── Single attempt (original behaviour) ───────────────────────
+                self._try_single_grasp(robot, x, y, z, x_pre, y_pre, z_pre,
+                                       rx, ry, rz, speed)
+                self._log("[Execute] Done — object delivered to home position")
+                self._set_status("Done!")
 
         except Exception as e:
             self._log(f"[Execute] ERROR: {e}")
@@ -2190,7 +2658,7 @@ class GraspExecuteApp:
         finally:
             self._executing = False
             self._cb_queue.put(lambda: self._execute_btn.configure(
-                state="normal", text="🤖  Execute Best Grasp"))
+                state="normal", text="🤖  Execute Selected Grasp"))
 
     # ------------------------------------------------------------------
     # Utility buttons
