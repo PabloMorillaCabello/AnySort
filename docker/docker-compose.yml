@@ -46,8 +46,10 @@ services:
       - ../results:/ros2_ws/results
       # Config files
       - ../config:/ros2_ws/config
-      # Scripts
+      # Scripts (utilities and tests)
       - ../scripts:/ros2_ws/scripts
+      # App — final solution (AnySort pipeline)
+      - ../app:/ros2_ws/app
       # Camera device access (Orbbec USB)
       - /dev:/dev
       - /dev/bus/usb:/dev/bus/usb

@@ -23,7 +23,8 @@
       "Bash(python:*)",
       "Bash(find /opt/GraspGen -name *.py)",
       "Bash(cmd /c AnySort.cmd)",
-      "Bash(docker compose:*)"
+      "Bash(docker compose:*)",
+      "Bash(cd:*)"
     ]
   }
 }

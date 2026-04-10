@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-Grasp Execute Pipeline
-======================
+AnySort — Grasp Execute Pipeline
+=================================
 Full pipeline: Camera → SAM3 → GraspGen → hand-eye transform → Dobot execution.
 
-Extends demo_orbbec_gemini2_persistent_sam3.py with:
-  - Loads hand-eye calibration (T_cam2base) from hand_eye_calibration.py output
-  - Transforms the best GraspGen pose from camera frame → robot base frame
-  - Sends the robot to the grasp position (pre-grasp → grasp → retreat)
-  - Approach along tool Z-axis; reachability and collision filters
+Single-command launch (SAM3 + Meshcat auto-start):
+  cd /ros2_ws/app && python grasp_execute_pipeline.py
 
-Usage — two-terminal workflow:
-  # Terminal 1: start SAM3 server (sam3 Python env)
-  /opt/sam3env/bin/python /ros2_ws/scripts/sam3_server.py
-
-  # Terminal 2: run this UI (GraspGen Python env)
-  python3 /ros2_ws/scripts/TEST/grasp_execute_pipeline.py
-
-Meshcat visualisation: http://127.0.0.1:7000
+Or from Windows: double-click AnySort.vbs at repo root.
 """
 
 import gc
@@ -71,7 +61,7 @@ from grasp_gen.utils.point_cloud_utils import (
 # Constants
 # ===========================================================================
 CHECKPOINTS_DIR  = "/opt/GraspGen/GraspGenModels/checkpoints"
-SAM3_SERVER_SCRIPT = "/ros2_ws/scripts/sam3_server.py"
+SAM3_SERVER_SCRIPT = "/ros2_ws/app/sam3_server.py"
 CALIB_FILE       = "/ros2_ws/data/calibration/hand_eye_calib.npz"
 RESULTS_DIR      = Path("/ros2_ws/results")
 ROI_SAVE_PATH    = Path(__file__).parent / "pipeline_roi.json"

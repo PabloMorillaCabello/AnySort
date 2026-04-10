@@ -29,28 +29,24 @@ GraspGen_Thesis_Repo/
 │   ├── depth/, depth_aligned/              # Depth captures
 │   ├── rgb/                                # RGB captures
 │   └── pointcloud/                         # .npy and .ply point clouds
+├── app/                        # *** FINAL SOLUTION (AnySort pipeline) ***
+│   ├── grasp_execute_pipeline.py  # AnySort: full pipeline + robot execution (Tkinter UI)
+│   ├── hand_eye_calibration.py    # ChArUco hand-eye calibration UI
+│   ├── calibration_tester.py      # Calibration validator + 6-DOF correction
+│   ├── camera_calibration.py      # Camera intrinsics calibration
+│   ├── sam3_server.py             # Persistent SAM3 Unix socket server (auto-started by AnySort)
+│   └── orbbec_quiet.py            # Suppresses OrbbecSDK C-level stderr spam
 ├── scripts/
-│   ├── view_camera.py          # Pure Python real-time RGB+Depth+IR+PointCloud viewer (669 lines)
-│   ├── demo_orbbec_gemini2.py  # Legacy Orbbec demo (725 lines)
-│   ├── sam3_server.py          # SAM3 Unix socket server (root-level version)
-│   ├── sam3_segment_once.py    # Single-frame segmentation test
+│   ├── view_camera.py          # Pure Python real-time RGB+Depth+IR+PointCloud viewer
 │   ├── reattach.ps1            # Windows USB passthrough via usbipd-win (run as admin)
-│   ├── test_full_pipeline.py   # End-to-end pipeline test (159 lines)
-│   ├── test_graspgen.py        # GraspGen loading/inference test (308 lines)
-│   ├── test_sam3.py            # SAM3 loading test (294 lines)
+│   ├── test_full_pipeline.py   # End-to-end pipeline test
+│   ├── test_graspgen.py        # GraspGen loading/inference test
+│   ├── test_sam3.py            # SAM3 loading test
 │   ├── test_environment.sh     # Environment validation
 │   ├── test_camera.sh          # ROS2 camera connectivity test
 │   ├── build_workspace.sh      # colcon build helper
 │   ├── download_models.sh      # Model weight downloader
-│   ├── setup_orbbec.sh         # Orbbec SDK host setup
-│   └── TEST/                   # *** PRIMARY WORKFLOW SCRIPTS (Tkinter UIs) ***
-│       ├── demo_orbbec_gemini2_persistent_sam3.py  # Main UI: camera+SAM3+GraspGen+Meshcat (1102 lines)
-│       ├── grasp_execute_pipeline.py               # Full pipeline + robot execution (1836 lines)
-│       ├── hand_eye_calibration.py                 # ChArUco hand-eye calibration UI (1822 lines)
-│       ├── calibration_tester.py                   # Calibration validator + 6-DOF correction (1335 lines)
-│       ├── camera_calibration.py                   # Camera intrinsics calibration (656 lines)
-│       ├── sam3_server.py                          # Persistent SAM3 Unix socket server (181 lines)
-│       └── orbbec_quiet.py                         # Suppresses OrbbecSDK C-level stderr spam (86 lines)
+│   └── setup_orbbec.sh         # Orbbec SDK host setup
 ├── ros2_ws/
 │   └── src/
 │       ├── graspgen_pipeline/
@@ -69,35 +65,42 @@ GraspGen_Thesis_Repo/
 ├── models/                                 # Model weights (not in git, populated at runtime)
 ├── config/                                 # Global config overrides
 ├── docs/                                   # Documentation
+├── AnySort.cmd                 # Windows one-click launcher (cmd version)
+├── AnySort.vbs                 # Windows one-click launcher (no terminal window)
 ├── CLAUDE.md                               # This file
 ├── README.md                               # Project documentation
 └── USB_WSL_Docker_Guide.md                # WSL2 USB passthrough setup guide
 ```
 
-## Primary Workflow (scripts/TEST/)
+## Primary Workflow (app/)
 
-**Tkinter UIs in `scripts/TEST/`** are primary — not ROS2 launch files.
+**AnySort** (`app/grasp_execute_pipeline.py`) is the single entry point — starts SAM3 server, Meshcat, camera, and loads GraspGen weights automatically via a splash screen.
 
-### Typical session:
+### Launch options:
 ```bash
-# Terminal 1 — SAM3 server (must start first, loads model once)
-/opt/sam3env/bin/python /ros2_ws/scripts/TEST/sam3_server.py
+# From Windows (no terminal window):
+AnySort.vbs   # double-click
 
-# Terminal 2 — Main UI (camera + SAM3 + GraspGen + Meshcat viz)
-python /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py
+# From Windows (cmd):
+AnySort.cmd
 
-# Terminal 2 alt — Full pipeline with robot execution
-python /ros2_ws/scripts/TEST/grasp_execute_pipeline.py --robot-ip 192.168.5.1
+# From inside container:
+cd /ros2_ws/app && python grasp_execute_pipeline.py
 
-# Meshcat visualization
-# http://127.0.0.1:7000
+# Calibration tools (from inside container):
+python /ros2_ws/app/hand_eye_calibration.py --robot-ip 192.168.5.1
+python /ros2_ws/app/calibration_tester.py
+python /ros2_ws/app/camera_calibration.py
+
+# Meshcat visualization (URL shown in AnySort UI):
+# http://127.0.0.1:<port>   (self-hosted, port printed at startup)
 ```
 
 ### Suppressing OrbbecSDK stderr spam:
 ```python
 # Import orbbec_quiet BEFORE pyorbbecsdk in any script
 import sys, os
-sys.path.insert(0, "/ros2_ws/scripts/TEST")
+sys.path.insert(0, "/ros2_ws/app")
 import orbbec_quiet  # redirects C-level stderr to /tmp/orbbec_sdk.log
 ```
 
@@ -143,7 +146,7 @@ Container aliases: `graspgen_activate`, `sam3_activate`.
 
 - No `privileged: true` — uses `device_cgroup_rules`:
   - `c 189:* rwm` (USB), `c 180:* rwm` (USB serial), `c 81:* rwm` (Video)
-- Volumes: `/dev:/dev`, `/dev/bus/usb:/dev/bus/usb`, live-linked scripts + ROS2 packages
+- Volumes: `/dev:/dev`, `/dev/bus/usb:/dev/bus/usb`, live-linked `app/` + `scripts/` + ROS2 packages
 - Ports: `29999` (Dobot dashboard), `30004` (Dobot feedback), `7860`/`8080` (Viser), `7000`/`6000` (Meshcat)
 - Env: `DISPLAY=host.docker.internal:0.0`, `PYTHONPATH=/opt/GraspGen:/opt/Dobot_hv`, `ROS_DOMAIN_ID=42`
 
@@ -192,11 +195,13 @@ Use `scripts/reattach.ps1` (PowerShell, admin) to bind/attach Orbbec device.
 python3 /ros2_ws/scripts/view_camera.py
 python3 /ros2_ws/scripts/view_camera.py --ir --align --pointcloud
 
-# Inside container — primary pipeline UIs
-python /ros2_ws/scripts/TEST/demo_orbbec_gemini2_persistent_sam3.py
-python /ros2_ws/scripts/TEST/grasp_execute_pipeline.py --robot-ip 192.168.5.1
-python /ros2_ws/scripts/TEST/hand_eye_calibration.py --robot-ip 192.168.5.1
-python /ros2_ws/scripts/TEST/calibration_tester.py
+# Inside container — AnySort (primary app, single command)
+cd /ros2_ws/app && python grasp_execute_pipeline.py
+
+# Inside container — calibration tools
+python /ros2_ws/app/hand_eye_calibration.py --robot-ip 192.168.5.1
+python /ros2_ws/app/calibration_tester.py
+python /ros2_ws/app/camera_calibration.py
 
 # Inside container — ROS2 camera node
 ros2 launch orbbec_camera gemini2.launch.py color_format:=RGB
@@ -217,7 +222,7 @@ python3 /ros2_ws/scripts/test_sam3.py
 - **TCP packet accumulation** — Dobot feedback socket needs exactly 1440 bytes before `np.frombuffer(data, dtype=MyType)`.
 - **No `privileged: true`** — use `device_cgroup_rules` for USB/video access.
 - **Build context is repo root** — all Dockerfile `COPY` paths must use `docker/`, `data/` prefixes.
-- **SAM3 server must run first** — `demo_orbbec_gemini2_persistent_sam3.py` and `grasp_execute_pipeline.py` need SAM3 Unix socket server running before launch.
+- **SAM3 server auto-starts** — `grasp_execute_pipeline.py` (AnySort) launches `app/sam3_server.py` automatically during splash loading. No manual pre-start needed.
 
 ## Dobot Feedback Fix Details
 
@@ -261,9 +266,10 @@ def _update_feed_ui(self, a):
 - **OrbbecSDK_ROS2**: Orbbec official ROS2 driver
 - **SAM3**: Segment Anything 3
 
-## Current Status (as of 2026-04-04)
+## Current Status (as of 2026-04-10)
 
-- Hand-eye calibration done + validated (branch: FxingCenteredObject)
-- First grasping attempts in progress — centering/alignment being refined
-- Camera intrinsics calibrated 1280×720, RMS 0.20 px
-- All primary Tkinter UIs functional
+- AnySort UI fully functional: splash loading, batch word-list mode, robot error recovery
+- Hand-eye calibration done + validated (RMS 0.20 px)
+- Active grasping tests in progress
+- Repo reorganized: final scripts moved from `scripts/TEST/` to `app/`
+- Single-command Windows launch: `AnySort.vbs` (no terminal window)
