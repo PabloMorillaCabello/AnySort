@@ -3454,8 +3454,8 @@ def main():
              font=("Courier", 8)).pack()
 
     _terminal_var = tk.StringVar(value="")
-    tk.Label(splash, textvariable=_terminal_var, bg="#1e1e1e", fg="#3a3a5a",
-             font=("Courier", 7), wraplength=400, justify="left").pack(pady=(4, 0))
+    tk.Label(splash, textvariable=_terminal_var, bg="#1e1e1e", fg="#22d0fc",
+             font=("Courier", 8), wraplength=400, justify="left").pack(pady=(4, 0))
 
     splash.update()
 
