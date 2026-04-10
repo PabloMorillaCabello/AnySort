@@ -1,55 +1,67 @@
 #!/usr/bin/env python3
 """
-SAM3 Persistent Server — runs under Python 3.12 SAM3 venv.
+SAM3 Persistent Unix-Socket Server — runs under Python 3.12 SAM3 venv.
 
-Loads model.safetensors ONCE at startup, then handles repeated inference
-requests via stdin/stdout JSON protocol.
+Loads model weights ONCE at startup, then handles repeated inference
+requests over a Unix domain socket.
 
-Protocol:
-  Request  (stdin,  one JSON line):  {"image": "/path/img.png", "prompt": "red mug", "mask_out": "/path/mask.npy"}
-  Response (stdout, one JSON line):  {"status": "ok",    "mask": "/path/mask.npy"}
-                                 or  {"status": "error", "error": "message"}
+Protocol (per connection):
+  Client → Server:
+    1. JSON header line:  {"width": W, "height": H, "prompt": "text", "size": N}\n
+    2. N bytes of raw RGB24 pixel data (H×W×3, uint8, row-major)
 
-After model is loaded, prints:  {"status": "ready"}
+  Server → Client:
+    1. JSON response line: {"ok": true, "size": M, "num_masks": K}\n   (M = K*H*W bytes)
+                       or: {"ok": false, "error": "message"}\n
+    2. M bytes of mask data (K×H×W uint8, concatenated)
+
+After model is loaded, the socket file appears at --socket path.
 This signals the parent process it can start sending requests.
 
 Usage:
-  /opt/sam3env/bin/python3 scripts/TEST/sam3_server.py [--device cuda:0] [--no-fp16] [--no-transformers]
+  /opt/sam3env/bin/python3.12 app/sam3_server.py [--socket /tmp/sam3_server.sock]
+                                                  [--device cuda:0]
+                                                  [--no-fp16]
+                                                  [--no-transformers]
+                                                  [--confidence 0.5]
 """
 
 import argparse
 import json
+import os
+import socket
 import sys
-
-import numpy as np
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="SAM3 persistent inference server")
+    parser = argparse.ArgumentParser(description="SAM3 persistent Unix-socket inference server")
+    parser.add_argument("--socket", default="/tmp/sam3_server.sock",
+                        help="Unix socket path (default: /tmp/sam3_server.sock)")
     parser.add_argument("--device", default="cuda:0", help="Torch device (default: cuda:0)")
     parser.add_argument("--no-transformers", dest="use_transformers", action="store_false",
                         default=True, help="Use native SAM3 API instead of HuggingFace Transformers")
     parser.add_argument("--no-fp16", dest="fp16", action="store_false", default=True,
                         help="Use FP32 instead of FP16")
     parser.add_argument("--confidence", type=float, default=0.5,
-                        help="Confidence threshold for detections")
+                        help="Confidence threshold for detections (default: 0.5)")
     return parser.parse_args()
 
 
 def load_model(device: str, use_transformers: bool, fp16: bool):
-    """Load SAM3 model and return (model, processor) tuple. Called once at startup."""
+    """Load SAM3 model once at startup. Returns (model, processor, backend_str)."""
     import torch
     dtype = torch.float16 if fp16 else torch.float32
 
     if use_transformers:
-        import os
         from transformers import Sam3Processor, Sam3Model
         _local = "/opt/models/sam3"
         _model_id = _local if os.path.isdir(_local) else "facebook/sam3"
         print(f"[sam3_server] Loading Sam3Processor from {_model_id}...", file=sys.stderr, flush=True)
         processor = Sam3Processor.from_pretrained(_model_id, local_files_only=os.path.isdir(_local))
         print(f"[sam3_server] Loading Sam3Model from {_model_id}...", file=sys.stderr, flush=True)
-        model = Sam3Model.from_pretrained(_model_id, torch_dtype=dtype, local_files_only=os.path.isdir(_local)).to(device)
+        model = Sam3Model.from_pretrained(
+            _model_id, torch_dtype=dtype, local_files_only=os.path.isdir(_local)
+        ).to(device)
         model.eval()
         print(f"[sam3_server] Model loaded on {device} dtype={dtype}", file=sys.stderr, flush=True)
         return model, processor, "transformers"
@@ -66,9 +78,10 @@ def load_model(device: str, use_transformers: bool, fp16: bool):
         return model, processor, "native"
 
 
-def run_inference(model, processor, backend: str, rgb: np.ndarray,
-                  prompt: str, device: str, confidence: float) -> np.ndarray:
-    """Run inference with the already-loaded model. Returns binary mask (H,W) uint8."""
+def run_inference(model, processor, backend: str, rgb, prompt: str,
+                  device: str, confidence: float):
+    """Run segmentation. Returns list of (H,W) uint8 mask arrays."""
+    import numpy as np
     import torch
     from PIL import Image as PILImage
 
@@ -86,98 +99,123 @@ def run_inference(model, processor, backend: str, rgb: np.ndarray,
             target_sizes=[(h, w)],
         )[0]
 
-        masks = results.get("masks", None)
-        scores = results.get("scores", None)
+        masks_t = results.get("masks", None)
+        scores   = results.get("scores", None)
 
-        combined = np.zeros((h, w), dtype=np.uint8)
-        if masks is not None and len(masks) > 0:
-            for i, mask in enumerate(masks):
+        out = []
+        if masks_t is not None and len(masks_t) > 0:
+            for i, m in enumerate(masks_t):
                 score = float(scores[i]) if scores is not None and i < len(scores) else 1.0
                 if score >= confidence:
-                    combined[mask.cpu().numpy().astype(bool)] = 1
-        return combined
+                    out.append(m.cpu().numpy().astype(np.uint8))
+        return out
 
     else:  # native
         state = processor.set_image(pil_image)
         processor.set_text_prompt(state=state, prompt=prompt)
         masks = state.get("masks", None)
+        if masks is None:
+            return []
+        return [(m > 0).astype(np.uint8) for m in masks]
 
-        combined = np.zeros((h, w), dtype=np.uint8)
-        if masks is not None and len(masks) > 0:
-            for m in masks:
-                combined = np.maximum(combined, (m > 0).astype(np.uint8))
-        return combined
+
+def _recv_exactly(conn, n):
+    """Read exactly n bytes from a socket connection."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(min(n - len(buf), 65536))
+        if not chunk:
+            raise ConnectionError("Client disconnected mid-stream")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _recv_line(conn):
+    """Read one newline-terminated line from socket."""
+    buf = bytearray()
+    while True:
+        b = conn.recv(1)
+        if not b:
+            raise ConnectionError("Client disconnected")
+        if b == b"\n":
+            break
+        buf.extend(b)
+    return buf.decode()
+
+
+def handle_client(conn, model, processor, backend, device, confidence):
+    """Handle one client connection: read request, run inference, send masks."""
+    import numpy as np
+
+    try:
+        line = _recv_line(conn)
+        req = json.loads(line)
+        w, h = req["width"], req["height"]
+        prompt = req["prompt"]
+        size = req["size"]
+
+        rgb_bytes = _recv_exactly(conn, size)
+        rgb = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(h, w, 3)
+
+        print(f"[sam3_server] Request: prompt='{prompt}' size=({w}x{h})", file=sys.stderr, flush=True)
+
+        masks = run_inference(model, processor, backend, rgb, prompt, device, confidence)
+
+        if not masks:
+            resp = json.dumps({"ok": True, "size": 0, "num_masks": 0}) + "\n"
+            conn.sendall(resp.encode())
+            print(f"[sam3_server] No masks found for prompt='{prompt}'", file=sys.stderr, flush=True)
+            return
+
+        mask_data = np.concatenate([m.reshape(1, h, w) for m in masks], axis=0).astype(np.uint8)
+        flat = mask_data.tobytes()
+        resp = json.dumps({"ok": True, "size": len(flat), "num_masks": len(masks)}) + "\n"
+        conn.sendall(resp.encode())
+        conn.sendall(flat)
+        print(f"[sam3_server] Sent {len(masks)} mask(s), {len(flat)} bytes", file=sys.stderr, flush=True)
+
+    except Exception as e:
+        print(f"[sam3_server] Error handling client: {e}", file=sys.stderr, flush=True)
+        try:
+            err = json.dumps({"ok": False, "error": str(e)}) + "\n"
+            conn.sendall(err.encode())
+        except Exception:
+            pass
+    finally:
+        conn.close()
 
 
 def main():
     args = parse_args()
 
-    # Load model once — this is the slow part
+    # Load model — slow on first run
     try:
         model, processor, backend = load_model(args.device, args.use_transformers, args.fp16)
     except Exception as e:
-        # Signal failure so parent doesn't hang waiting for "ready"
-        sys.stdout.write(json.dumps({"status": "load_error", "error": str(e)}) + "\n")
-        sys.stdout.flush()
+        print(f"[sam3_server] FATAL: model load failed: {e}", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    # Signal parent: ready to receive requests
-    sys.stdout.write(json.dumps({"status": "ready"}) + "\n")
-    sys.stdout.flush()
-    print("[sam3_server] Ready. Waiting for requests on stdin...", file=sys.stderr, flush=True)
+    # Remove stale socket file if it exists
+    sock_path = args.socket
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
 
-    # Main request loop
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    # Create Unix socket server — socket file appearing signals "ready" to parent
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sock_path)
+    server.listen(5)
+    print(f"[sam3_server] Ready. Listening on {sock_path}", file=sys.stderr, flush=True)
 
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as e:
-            sys.stdout.write(json.dumps({"status": "error", "error": f"JSON decode: {e}"}) + "\n")
-            sys.stdout.flush()
-            continue
-
-        image_path = req.get("image", "")
-        prompt = req.get("prompt", "")
-        mask_out = req.get("mask_out", "")
-
-        if not image_path or not prompt or not mask_out:
-            sys.stdout.write(json.dumps({"status": "error", "error": "Missing image/prompt/mask_out"}) + "\n")
-            sys.stdout.flush()
-            continue
-
-        print(f"[sam3_server] Request: prompt='{prompt}' image={image_path}", file=sys.stderr, flush=True)
-
-        try:
-            from PIL import Image as PILImage
-            rgb = np.array(PILImage.open(image_path).convert("RGB"), dtype=np.uint8)
-        except Exception as e:
-            sys.stdout.write(json.dumps({"status": "error", "error": f"Image load: {e}"}) + "\n")
-            sys.stdout.flush()
-            continue
-
-        try:
-            mask = run_inference(model, processor, backend, rgb, prompt, args.device, args.confidence)
-        except Exception as e:
-            sys.stdout.write(json.dumps({"status": "error", "error": f"Inference: {e}"}) + "\n")
-            sys.stdout.flush()
-            continue
-
-        try:
-            np.save(mask_out, mask)
-        except Exception as e:
-            sys.stdout.write(json.dumps({"status": "error", "error": f"Mask save: {e}"}) + "\n")
-            sys.stdout.flush()
-            continue
-
-        n_pixels = int(np.sum(mask > 0))
-        print(f"[sam3_server] Mask saved: {mask.shape}, {n_pixels} pixels", file=sys.stderr, flush=True)
-        sys.stdout.write(json.dumps({"status": "ok", "mask": mask_out, "pixels": n_pixels}) + "\n")
-        sys.stdout.flush()
-
-    print("[sam3_server] stdin closed, exiting.", file=sys.stderr, flush=True)
+    try:
+        while True:
+            conn, _ = server.accept()
+            handle_client(conn, model, processor, backend, args.device, args.confidence)
+    except KeyboardInterrupt:
+        print("[sam3_server] Interrupted, shutting down.", file=sys.stderr, flush=True)
+    finally:
+        server.close()
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
 
 
 if __name__ == "__main__":
