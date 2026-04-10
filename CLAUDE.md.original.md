@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-Master Thesis robotic grasping pipeline integrating **GraspGen** (NVIDIA grasp generation), **SAM3** (Segment Anything 3), **Dobot CR series robot arm** (TCP/IP), **Orbbec Gemini 2** depth camera — Docker, ROS2 Humble, WSL2.
+Master Thesis robotic grasping pipeline that integrates **GraspGen** (NVIDIA grasp generation), **SAM3** (Segment Anything 3), a **Dobot CR series robot arm** (TCP/IP control), and an **Orbbec Gemini 2** depth camera — all running inside a Docker container on ROS2 Humble over WSL2.
 
-Pipeline: Orbbec RGB-D → SAM3 segment → GraspGen poses → Dobot execute.
+The pipeline captures RGB-D frames from the Orbbec camera, segments objects with SAM3, generates grasp poses with GraspGen, and executes them on the Dobot arm.
 
 ## Repository Structure
 
@@ -76,7 +76,7 @@ GraspGen_Thesis_Repo/
 
 ## Primary Workflow (scripts/TEST/)
 
-**Tkinter UIs in `scripts/TEST/`** are primary — not ROS2 launch files.
+The **Tkinter UIs in `scripts/TEST/`** are the primary way to use this system — not the ROS2 launch files.
 
 ### Typical session:
 ```bash
@@ -105,7 +105,7 @@ import orbbec_quiet  # redirects C-level stderr to /tmp/orbbec_sdk.log
 
 ### Build Context
 
-Build context: **repo root** (not `docker/`). All `COPY` paths use `docker/` or `data/` prefixes.
+Build context is the **repo root** (not `docker/`). All `COPY` paths in the Dockerfile use `docker/` or `data/` prefixes accordingly.
 
 ```bash
 # Build
@@ -137,27 +137,27 @@ docker compose -f docker/docker-compose.yml exec graspgen /bin/bash
 | SAM3 | `/opt/sam3env/` | 3.12 (pip) | Segmentation model (isolated deps) |
 | System | `/usr/bin/python3` | 3.10 | ROS2 packages, build tools |
 
-Container aliases: `graspgen_activate`, `sam3_activate`.
+Aliases in container: `graspgen_activate`, `sam3_activate`.
 
 ### Container Runtime (docker-compose.yml)
 
-- No `privileged: true` — uses `device_cgroup_rules`:
+- **No `privileged: true`** — uses `device_cgroup_rules` instead:
   - `c 189:* rwm` (USB), `c 180:* rwm` (USB serial), `c 81:* rwm` (Video)
-- Volumes: `/dev:/dev`, `/dev/bus/usb:/dev/bus/usb`, live-linked scripts + ROS2 packages
+- Volumes: `/dev:/dev`, `/dev/bus/usb:/dev/bus/usb`, live-linked scripts and ROS2 packages
 - Ports: `29999` (Dobot dashboard), `30004` (Dobot feedback), `7860`/`8080` (Viser), `7000`/`6000` (Meshcat)
-- Env: `DISPLAY=host.docker.internal:0.0`, `PYTHONPATH=/opt/GraspGen:/opt/Dobot_hv`, `ROS_DOMAIN_ID=42`
+- Environment: `DISPLAY=host.docker.internal:0.0`, `PYTHONPATH=/opt/GraspGen:/opt/Dobot_hv`, `ROS_DOMAIN_ID=42`
 
 ## Key Components
 
 ### Dobot Robot Arm
 
-- Protocol: TCP/IP ports 29999 (commands), 30004 (real-time feedback, 1440-byte packets)
+- Protocol: TCP/IP on ports 29999 (commands) and 30004 (real-time feedback at 1440-byte packets)
 - API: `/opt/Dobot_hv/` — `dobot_api.py` (DobotApiDashboard, DobotApiFeedBack), `ui.py` (Tkinter GUI)
 - Network: `192.168.5.1` (typical), robot on `192.168.X.X` subnet
 - Tool: vacuum gripper
 - Home pose: `[300, 0, 450, 0, 0, 0]` (X, Y, Z, Rx, Ry, Rz in mm/deg)
 - Approach offset: 80 mm above grasp target
-- **Known bugs fixed** (via `docker/patches/fix_dobot_feedback.py`):
+- **Known bugs fixed** (applied via `docker/patches/fix_dobot_feedback.py`):
   1. **TCP partial read** — `socket.recv()` doesn't guarantee full 1440-byte packet; fixed with byte accumulation loop
   2. **Tkinter thread-safety** — background feedback thread updating widgets causes segfault on Linux; fixed with `self.root.after(0, callback)`
 
@@ -166,7 +166,7 @@ Container aliases: `graspgen_activate`, `sam3_activate`.
 - VID: `2bc5`, PID: `0670`, USB 3.0
 - SDK: OrbbecSDK v2.7.6 (native `.deb`) + `pyorbbecsdk` built from source
 - ROS2: OrbbecSDK_ROS2 driver, topics: `/camera/color/image_raw`, `/camera/depth/image_raw`, `/camera/ir/image_raw`
-- **Pure Python viewer**: `scripts/view_camera.py` (no ROS2 dep) — supports `--align`, `--ir`, `--pointcloud`
+- **Pure Python viewer**: `scripts/view_camera.py` (no ROS2 dependency) — supports `--align`, `--ir`, `--pointcloud`
 - **Known issue**: Default MJPG color format unsupported in ROS2 callback — use `color_format:=RGB`
 - **Known issue**: `pyorbbecsdk` 1.3.2 PyPI wheel has packaging bug (installs darwin `.so` on Linux) — built from source in Dockerfile
 
@@ -177,13 +177,13 @@ Container aliases: `graspgen_activate`, `sam3_activate`.
 - Output: `T_cam2base` (4×4 homogeneous transform) + Z-correction offset
 - Best calibration: `data/calibration/hand_eye_calib_corrected_20260403_150244.npz`
 - Camera intrinsics: 1280×720, fx=684.7, fy=685.9, cx=655.3, cy=357.0 (RMS 0.20 px)
-- Z-correction: −25 mm after initial solve (stored as `T_correction` in JSON)
-- Pre-programmed poses: `data/calibration/auto_calib_poses.json` (26 poses, full rotation space)
+- Z-correction: −25 mm applied after initial solve (stored as `T_correction` in JSON)
+- Pre-programmed poses: `data/calibration/auto_calib_poses.json` (26 poses covering full rotation space)
 
 ### USB Passthrough (WSL2)
 
-Windows → WSL2 via `usbipd-win` → Docker via device mounts + cgroup rules.
-Use `scripts/reattach.ps1` (PowerShell, admin) to bind/attach Orbbec device.
+Windows host → WSL2 via `usbipd-win` → Docker via device mounts + cgroup rules.
+Use `scripts/reattach.ps1` (PowerShell, admin) to bind and attach the Orbbec device.
 
 ## Common Commands
 
@@ -212,12 +212,12 @@ python3 /ros2_ws/scripts/test_sam3.py
 
 ## Critical Constraints
 
-- **numpy must stay <2** — PyTorch compiled against numpy 1.x; numpy 2.x breaks it. Install `numpy<2` LAST.
-- **Tkinter updates from main thread only** — background thread touching widgets segfaults on Linux. Use `widget.after(0, callback)`.
-- **TCP packet accumulation** — Dobot feedback socket needs exactly 1440 bytes before `np.frombuffer(data, dtype=MyType)`.
+- **numpy must stay <2** — PyTorch is compiled against numpy 1.x; any numpy 2.x breaks it. Always install `numpy<2` as the LAST pip command.
+- **Tkinter updates from main thread only** — any background thread touching Tkinter widgets will segfault on Linux. Use `widget.after(0, callback)`.
+- **TCP packet accumulation** — Dobot feedback socket requires collecting exactly 1440 bytes before parsing with `np.frombuffer(data, dtype=MyType)`.
 - **No `privileged: true`** — use `device_cgroup_rules` for USB/video access.
-- **Build context is repo root** — all Dockerfile `COPY` paths must use `docker/`, `data/` prefixes.
-- **SAM3 server must run first** — `demo_orbbec_gemini2_persistent_sam3.py` and `grasp_execute_pipeline.py` need SAM3 Unix socket server running before launch.
+- **Build context is repo root** — all Dockerfile `COPY` paths must account for this (`docker/`, `data/` prefixes).
+- **SAM3 server must run first** — `demo_orbbec_gemini2_persistent_sam3.py` and `grasp_execute_pipeline.py` require the SAM3 Unix socket server running before launching.
 
 ## Dobot Feedback Fix Details
 
@@ -263,7 +263,7 @@ def _update_feed_ui(self, a):
 
 ## Current Status (as of 2026-04-04)
 
-- Hand-eye calibration done + validated (branch: FxingCenteredObject)
+- Hand-eye calibration completed and validated (branch: FxingCenteredObject)
 - First grasping attempts in progress — centering/alignment being refined
-- Camera intrinsics calibrated 1280×720, RMS 0.20 px
+- Camera intrinsics calibrated at 1280×720 with RMS 0.20 px
 - All primary Tkinter UIs functional

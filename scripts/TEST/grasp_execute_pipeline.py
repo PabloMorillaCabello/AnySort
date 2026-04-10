@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -807,7 +808,8 @@ def _save_best_grasp(grasps_cam, conf) -> dict:
 class GraspExecuteApp:
 
     def __init__(self, root: tk.Tk, args, camera: OrbbecCamera,
-                 config_map: dict, sam3_proc=None, vis=None):
+                 config_map: dict, sam3_proc=None, vis=None,
+                 preloaded_config=None):
         self.root       = root
         self.args       = args
         self.camera     = camera
@@ -819,10 +821,15 @@ class GraspExecuteApp:
         self._replay_frame = None
         self._replay_label_var = tk.StringVar(value="")
 
-        # GraspGen state
-        self._loaded_config_name = None
-        self._grasp_cfg  = None
-        self._sampler    = None
+        # GraspGen state — may be pre-populated from splash loader
+        if preloaded_config:
+            self._loaded_config_name = preloaded_config["name"]
+            self._grasp_cfg  = preloaded_config["cfg"]
+            self._sampler    = preloaded_config["sampler"]
+        else:
+            self._loaded_config_name = None
+            self._grasp_cfg  = None
+            self._sampler    = None
         self._last_mask  = None
         self._best_grasp_base: np.ndarray = None  # 4×4, robot base frame, meters
         self._best_grasp_info: dict = {}
@@ -852,6 +859,7 @@ class GraspExecuteApp:
         self._config_loading    = False
         self._executing         = False
         self._show_mask         = tk.BooleanVar(value=True)
+        self._show_mask.trace_add("write", lambda *_: self._refresh_canvas())
         self._current_frame     = None   # (rgb, depth_m, intrinsics) from last capture
 
         self._log_queue = queue.Queue()
@@ -1029,6 +1037,17 @@ class GraspExecuteApp:
             self._log(f"[Calib] camera_intrinsics.npz not found — using SDK intrinsics (no distortion correction)")
 
     def _start_config_if_available(self):
+        if self._loaded_config_name and self._sampler:
+            # Already pre-loaded from splash — just update combo + hints
+            self._config_combo.set(self._loaded_config_name)
+            path = self.config_map.get(self._loaded_config_name, "")
+            self._config_hint.configure(text=str(path))
+            _gname = self._grasp_cfg.data.gripper_name if self._grasp_cfg else ""
+            self._flip_orient = any(kw in _gname.lower()
+                                    for kw in ("vacuum", "suction", "cup"))
+            self._log(f"[Config] Pre-loaded: {self._loaded_config_name}")
+            self._set_status(f"Ready — {self._loaded_config_name}")
+            return
         if self.config_map:
             first = next(iter(self.config_map))
             self._config_combo.set(first)
@@ -1136,12 +1155,12 @@ class GraspExecuteApp:
 
         r_cam = tk.Frame(cam, bg=bg); r_cam.pack(fill="x", pady=(0, 3))
         self._cam_connect_btn = tk.Button(
-            r_cam, text="📷  Connect",
+            r_cam, text="Connect Camera",
             bg="#3a3a3a", fg="#61afef", activebackground="#4a4a4a",
             relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
             command=self._on_camera_connect)
         self._cam_connect_btn.pack(side="left", ipady=4, ipadx=6)
-        tk.Button(r_cam, text="📸  Capture",
+        tk.Button(r_cam, text="Capture",
                   bg="#3a3a3a", fg="#98c379", activebackground="#4a4a4a",
                   relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
                   command=self._on_capture_frame
@@ -1159,8 +1178,8 @@ class GraspExecuteApp:
 
         r_scn = tk.Frame(scn, bg=bg); r_scn.pack(fill="x", pady=(0, 2))
         for txt, fg_c, cmd in [
-                ("💾  Save", "#98c379", self._on_save_scene),
-                ("📂  Load", "#e5c07b", self._on_load_replay),
+                ("Save Scene", "#98c379", self._on_save_scene),
+                ("Load Scene", "#e5c07b", self._on_load_replay),
                 ("✕ Clear",  "#aaa",    self._on_clear_replay)]:
             tk.Button(r_scn, text=txt, bg="#3a3a3a", fg=fg_c,
                       activebackground="#4a4a4a", relief="flat",
@@ -1183,7 +1202,7 @@ class GraspExecuteApp:
 
         r_roi = tk.Frame(roi, bg=bg); r_roi.pack(fill="x", pady=(0, 2))
         self._roi_btn = tk.Button(
-            r_roi, text="🔲  Select ROI",
+            r_roi, text="[ ] Select ROI",
             bg="#3a3a3a", fg="#FFD700", activebackground="#4a4a4a",
             relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
             command=self._on_roi_select)
@@ -1250,16 +1269,17 @@ class GraspExecuteApp:
         _sep()
 
         _lbl("Inference Parameters:")
-        for label, attr, default in [
-                ("Num grasps", "_num_grasps_var",  str(self.args.num_grasps)),
-                ("Top-K",      "_topk_grasps_var", str(self.args.topk_num_grasps))]:
-            r = tk.Frame(p, bg=bg); r.pack(fill="x", padx=10, pady=1)
-            tk.Label(r, text=label+":", bg=bg, fg="#ccc",
-                     font=("Helvetica", 8), anchor="w", width=13).pack(side="left")
-            v = tk.StringVar(value=default); setattr(self, attr, v)
-            tk.Entry(r, textvariable=v, width=6, bg="#3a3a3a", fg="white",
-                     insertbackground="white", relief="flat",
-                     font=("Helvetica", 8)).pack(side="right")
+        r = tk.Frame(p, bg=bg); r.pack(fill="x", padx=10, pady=1)
+        tk.Label(r, text="Grasps:", bg=bg, fg="#ccc",
+                 font=("Helvetica", 8), anchor="w", width=13).pack(side="left")
+        self._topk_grasps_var = tk.StringVar(value=str(self.args.topk_num_grasps))
+        self._num_grasps_var  = self._topk_grasps_var   # same var — both use it
+        tk.Entry(r, textvariable=self._topk_grasps_var, width=6,
+                 bg="#3a3a3a", fg="white", insertbackground="white",
+                 relief="flat", font=("Helvetica", 8)).pack(side="right")
+        tk.Label(p, text="samples N candidates, returns best N by confidence",
+                 bg=bg, fg="#555", font=("Helvetica", 7), wraplength=200,
+                 justify="left").pack(anchor="w", padx=10)
         _sep()
 
         _lbl("Selected Grasp  (Robot Frame):")
@@ -1409,12 +1429,12 @@ class GraspExecuteApp:
         tk.Label(p, text="List Files", bg=bg, fg="#e5c07b",
                  font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(0,2))
         fr = tk.Frame(p, bg=bg); fr.pack(fill="x", padx=10, pady=(0,3))
-        tk.Button(fr, text="📂  Load List",
+        tk.Button(fr, text="Load List",
                   bg="#3a3a3a", fg="#e5c07b", activebackground="#444",
                   relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
                   command=self._on_load_list
                   ).pack(side="left", ipady=4, ipadx=6)
-        tk.Button(fr, text="💾  Save List",
+        tk.Button(fr, text="Save List",
                   bg="#3a3a3a", fg="#98c379", activebackground="#444",
                   relief="flat", cursor="hand2", bd=0, font=("Helvetica", 8),
                   command=self._on_save_list
@@ -1501,6 +1521,15 @@ class GraspExecuteApp:
             font=("Helvetica", 8, "bold"), state="disabled",
             command=self._on_stop_batch)
         self._batch_stop_btn.pack(padx=10, pady=(0,4), fill="x", ipady=5)
+        _sep()
+
+        _lbl("Visualisation")
+        tk.Button(p, text="Open Meshcat Viewer",
+                  bg="#3a3a3a", fg="#56b6c2", activebackground="#444",
+                  relief="flat", cursor="hand2", bd=0,
+                  font=("Helvetica", 8),
+                  command=self._on_open_meshcat
+                  ).pack(padx=10, pady=2, fill="x", ipady=5)
 
     # ------------------------------------------------------------------
     # ROI selection
@@ -1525,7 +1554,7 @@ class GraspExecuteApp:
             self._canvas.itemconfig(_id, state="hidden")
         self._canvas.itemconfig(self._roi_preview_id, state="hidden")
         self._roi_info_var.set("")
-        self._roi_btn.config(text="🔲  Select ROI")
+        self._roi_btn.config(text="[ ] Select ROI")
         self._canvas.config(cursor="")
         self._save_roi()
         self._cb_queue.put(self._refresh_canvas)
@@ -1572,7 +1601,7 @@ class GraspExecuteApp:
             self._roi_poly_img = img_pts
             self._roi_selecting = False
             self._roi_canvas_pts = []
-            self._roi_btn.config(text="🔲  Select ROI")
+            self._roi_btn.config(text="[ ] Select ROI")
             self._canvas.config(cursor="")
             xs = [p[0] for p in img_pts]
             ys = [p[1] for p in img_pts]
@@ -1597,7 +1626,7 @@ class GraspExecuteApp:
             self.camera.stop()
             self._cam_status_var.set("● No camera")
             self._cam_status_lbl.config(fg="#e06c75")
-            self._cam_connect_btn.config(text="📷  Connect Camera")
+            self._cam_connect_btn.config(text="Connect Camera Camera")
             self._log("[Camera] Disconnected.")
         else:
             # Connect in background (Pipeline() can take a moment)
@@ -1613,14 +1642,14 @@ class GraspExecuteApp:
             def _ok():
                 self._cam_status_var.set("● Connected")
                 self._cam_status_lbl.config(fg="#98c379")
-                self._cam_connect_btn.config(state="normal", text="⏏  Disconnect Camera")
+                self._cam_connect_btn.config(state="normal", text="Disconnect Camera")
             self._cb_queue.put(_ok)
         except Exception as e:
             self._log(f"[Camera] Failed to connect: {e}")
             def _err():
                 self._cam_status_var.set(f"● Error: {e}")
                 self._cam_status_lbl.config(fg="#e06c75")
-                self._cam_connect_btn.config(state="normal", text="📷  Connect Camera")
+                self._cam_connect_btn.config(state="normal", text="Connect Camera Camera")
             self._cb_queue.put(_err)
 
     # ------------------------------------------------------------------
@@ -2224,13 +2253,16 @@ class GraspExecuteApp:
                 f"{len(scene_pc) if scene_pc is not None else 0} scene pts)")
             # ────────────────────────────────────────────────────────────────
 
-            self._log("[GraspGen] Running inference…")
+            _ng  = max(1, int(self._num_grasps_var.get() or args.num_grasps))
+            _topk = max(1, int(self._topk_grasps_var.get() or args.topk_num_grasps))
+            self._log(f"[GraspGen] Running inference  num_grasps={_ng}  topk={_topk}…")
             t1 = time.time()
             grasps, grasp_conf = GraspGenSampler.run_inference(
                 pc_centered, sampler,
                 grasp_threshold=args.grasp_threshold,
-                num_grasps=int(self._num_grasps_var.get()),
-                topk_num_grasps=int(self._topk_grasps_var.get()))
+                num_grasps=_ng,
+                topk_num_grasps=_topk,
+                min_grasps=_topk)
             self._log(f"[GraspGen] {time.time()-t1:.2f}s — {len(grasps)} grasps")
 
             if len(grasps) == 0:
@@ -2631,7 +2663,7 @@ class GraspExecuteApp:
 
     def _on_robot_connected_ui(self):
         self._robot_status.config(text=f"● Connected  {self._ip_var.get()}", fg="#98c379")
-        self._connect_btn.config(state="normal", text="⏏  Disconnect")
+        self._connect_btn.config(state="normal", text="Disconnect")
         self._home_btn.config(state="normal")
         self._recover_btn.config(state="normal")
         self._save_home_btn.config(state="normal")
@@ -3219,6 +3251,53 @@ class GraspExecuteApp:
         self._log(f"[List] Saved {len(words)} word(s) to {Path(path).name}")
 
     # ------------------------------------------------------------------
+    def _on_open_meshcat(self):
+        try:
+            url = self._vis.url() if self._vis is not None else "http://127.0.0.1:7000"
+        except Exception:
+            url = "http://127.0.0.1:7000"
+        # Always print to terminal — guaranteed untruncated
+        print(f"\n[Meshcat] {url}\n", flush=True)
+        # Try xdg-open then webbrowser
+        opened = False
+        try:
+            import subprocess
+            subprocess.Popen(["xdg-open", url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            opened = True
+        except Exception:
+            pass
+        if not opened:
+            try:
+                opened = webbrowser.open(url)
+            except Exception:
+                pass
+        if opened:
+            self._log("[Meshcat] Browser opened.")
+            return
+        # No browser — show popup with selectable URL
+        popup = tk.Toplevel(self.root)
+        popup.title("Meshcat URL")
+        popup.configure(bg="#1e1e1e")
+        popup.resizable(False, False)
+        tk.Label(popup, text="Open this URL in your browser:",
+                 bg="#1e1e1e", fg="#abb2bf",
+                 font=("Helvetica", 9)).pack(padx=16, pady=(12, 4))
+        entry = tk.Entry(popup, font=("Courier", 11), width=30,
+                         bg="#3a3a3a", fg="#98c379",
+                         insertbackground="white", relief="flat", bd=4)
+        entry.insert(0, url)
+        entry.config(state="readonly")
+        entry.pack(padx=16, pady=(0, 8))
+        entry.select_range(0, "end")
+        tk.Button(popup, text="Close", bg="#3a3a3a", fg="#aaa",
+                  relief="flat", cursor="hand2", bd=0,
+                  font=("Helvetica", 8),
+                  command=popup.destroy).pack(pady=(0, 10))
+        popup.transient(self.root)
+        popup.grab_set()
+
+    # ------------------------------------------------------------------
     def _on_recover_robot(self):
         if not self._robot_connected or self._executing or self._batch_running:
             return
@@ -3338,63 +3417,202 @@ def main():
     args.sam3_socket = cli.sam3_socket
 
     config_map = scan_checkpoints(CHECKPOINTS_DIR)
-    if config_map:
-        print(f"[Config] Found {len(config_map)} config(s):")
-        for n in config_map:
-            print(f"  {n}")
-    else:
-        print(f"[Config] WARNING: No .yml in '{CHECKPOINTS_DIR}'")
 
-    # SAM3 server
-    sam3_proc = None
-    print(f"[SAM3] Checking {args.sam3_socket}…")
-    try:
-        import socket as _s
-        s = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
-        s.settimeout(2.0); s.connect(args.sam3_socket); s.close()
-        print("[SAM3] Using existing server.")
-    except OSError:
-        print("[SAM3] Starting server…")
-        sam3_proc = start_sam3_server(args.sam3_socket, args.sam3_device,
-                                       not args.sam3_no_fp16)
+    # ── Splash / loading screen ──────────────────────────────────────────
+    splash = tk.Tk()
+    splash.title("AnySort — Loading")
+    splash.configure(bg="#1e1e1e")
+    splash.resizable(True, False)
+    _sw, _sh = 440, 210
+    splash.update_idletasks()
+    _x = (splash.winfo_screenwidth() - _sw) // 2
+    _y = (splash.winfo_screenheight() - _sh) // 2
+    splash.geometry(f"{_sw}x{_sh}+{_x}+{_y}")
 
-    # Meshcat
-    vis = None
-    try:
-        vis = create_visualizer()
-        print(f"[Meshcat] {getattr(vis,'viewer_url','http://127.0.0.1:7000/static/')}")
-    except Exception as e:
-        print(f"[Meshcat] Not available: {e}")
+    _splash_closed = False
 
-    # Camera — optional, can connect later via the UI button
-    print("[Camera] Starting Orbbec pipeline…")
-    camera = OrbbecCamera()
-    try:
-        camera.start()
-        print("[Camera] Live stream running.")
-    except Exception as e:
-        print(f"[Camera] No device found ({e}) — starting without camera. "
-              f"Use '📷 Connect Camera' in the UI once the device is attached.")
+    def _splash_close():
+        nonlocal _splash_closed
+        _splash_closed = True
+        splash.destroy()
+        print("Startup cancelled by user.")
+        sys.exit(0)
+
+    splash.protocol("WM_DELETE_WINDOW", _splash_close)
+
+    tk.Label(splash, text="AnySort", bg="#1e1e1e", fg="#61afef",
+             font=("Helvetica", 22, "bold")).pack(pady=(24, 2))
+    _step_var = tk.StringVar(value="Initialising…")
+    tk.Label(splash, textvariable=_step_var, bg="#1e1e1e", fg="#abb2bf",
+             font=("Helvetica", 9)).pack()
+
+    _pbar = ttk.Progressbar(splash, mode="determinate", maximum=100)
+    _pbar.pack(fill="x", padx=40, pady=(14, 6))
+
+    _detail_var = tk.StringVar(value="")
+    tk.Label(splash, textvariable=_detail_var, bg="#1e1e1e", fg="#666",
+             font=("Courier", 8)).pack()
+
+    _terminal_var = tk.StringVar(value="")
+    tk.Label(splash, textvariable=_terminal_var, bg="#1e1e1e", fg="#3a3a5a",
+             font=("Courier", 7), wraplength=400, justify="left").pack(pady=(4, 0))
+
+    splash.update()
+
+    # Thread-safe queue for splash updates (no splash.after from threads)
+    _splash_q = queue.Queue()
+    _loaded = {}
+    _loader_done = threading.Event()
+
+    # Intercept stdout — forward to real stdout + push last line to splash
+    class _SplashStdout:
+        def __init__(self, real):
+            self._real = real
+        def write(self, s):
+            self._real.write(s)
+            line = s.strip()
+            if line:
+                _splash_q.put(("__terminal__", line, None))
+        def flush(self):
+            self._real.flush()
+        def __getattr__(self, a):
+            return getattr(self._real, a)
+
+    _real_stdout = sys.stdout
+    sys.stdout = _SplashStdout(_real_stdout)
+
+    def _flush_splash():
+        """Polled from main thread every 100ms."""
+        if _splash_closed:
+            return
+        while not _splash_q.empty():
+            step, detail, pct = _splash_q.get_nowait()
+            if step == "__terminal__":
+                _terminal_var.set(detail[:80])  # cap width
+            else:
+                _step_var.set(step)
+                _detail_var.set(detail)
+                if pct is not None:
+                    _pbar["value"] = pct
+        if _loader_done.is_set():
+            splash.quit()
+            return
+        splash.after(100, _flush_splash)
+
+    def _loader():
+        def _set(step, detail="", pct=None):
+            print(f"  [{pct:3d}%] {step}  {detail}" if pct is not None
+                  else f"        {step}  {detail}")
+            _splash_q.put((step, detail, pct))
+
+        try:
+            # 1 — Configs
+            n = len(config_map)
+            _set("Scanning gripper configs…",
+                 f"{n} found" if n else "WARNING: none found", 10)
+
+            # 2 — Meshcat
+            _set("Starting Meshcat visualiser…", "ZMQ + HTTP server", 20)
+            vis = None
+            try:
+                import meshcat as _mc
+                vis = _mc.Visualizer()
+                vis.delete()
+                _set("Meshcat ready.", vis.url(), 35)
+            except Exception as e:
+                _set("Meshcat unavailable.", str(e), 35)
+            _loaded["vis"] = vis
+
+            # 3 — Camera
+            _set("Opening camera…", "Orbbec Gemini 2", 45)
+            camera = OrbbecCamera()
+            try:
+                camera.start()
+                _set("Camera connected.", "", 55)
+            except Exception as e:
+                _set("Camera not found.", "connect later via UI", 55)
+            _loaded["camera"] = camera
+
+            # 4 — SAM3
+            sock = args.sam3_socket
+            import socket as _s
+            try:
+                s = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+                s.settimeout(2.0); s.connect(sock); s.close()
+                _set("SAM3 server found.", "existing socket", 85)
+                _loaded["sam3_proc"] = None
+            except OSError:
+                _set("Starting SAM3 server…",
+                     "loading model weights (may take minutes)", 60)
+                try:
+                    proc = start_sam3_server(sock, args.sam3_device,
+                                             not args.sam3_no_fp16)
+                    _loaded["sam3_proc"] = proc
+                    _set("SAM3 ready.", "", 85)
+                except Exception as e:
+                    _loaded["sam3_proc"] = None
+                    _set("SAM3 FAILED.", str(e), 85)
+
+            # 5 — Default gripper config / GraspGen weights
+            if config_map:
+                cfg_name = next(iter(config_map))
+                cfg_path = config_map[cfg_name]
+                _set("Loading GraspGen weights…", cfg_name, 90)
+                try:
+                    cfg = load_grasp_cfg(cfg_path)
+                    sampler = GraspGenSampler(cfg)
+                    _loaded["preloaded_config"] = {
+                        "name": cfg_name, "cfg": cfg, "sampler": sampler}
+                    _set("GraspGen ready.", cfg.data.gripper_name, 95)
+                except Exception as e:
+                    _set("GraspGen load failed.", str(e), 95)
+                    _loaded["preloaded_config"] = None
+            else:
+                _loaded["preloaded_config"] = None
+
+            # 6 — Done
+            _set("All systems ready.", "Opening AnySort…", 100)
+            import time as _t; _t.sleep(0.5)
+
+        except Exception as e:
+            print(f"[Loader] Error: {e}")
+        finally:
+            _loader_done.set()
+
+    splash.after(100, _flush_splash)
+    threading.Thread(target=_loader, daemon=True).start()
+    splash.mainloop()
+    sys.stdout = _real_stdout   # restore stdout
+    if not _splash_closed:
+        splash.destroy()
+
+    # ── Main UI ─────────────────────────────────────────────────────────
+    camera          = _loaded.get("camera",           OrbbecCamera())
+    vis             = _loaded.get("vis",              None)
+    sam3_proc       = _loaded.get("sam3_proc",        None)
+    preloaded_config = _loaded.get("preloaded_config", None)
 
     root = tk.Tk()
-    app_ref = [GraspExecuteApp(root, args, camera, config_map, sam3_proc=sam3_proc, vis=vis)]
+    app_ref = [GraspExecuteApp(root, args, camera, config_map,
+                               sam3_proc=sam3_proc, vis=vis,
+                               preloaded_config=preloaded_config)]
 
     def _on_close():
         print("Shutting down…")
-        app_ref[0]._debug_event.set()   # unblock any waiting debug pause
+        app_ref[0]._debug_event.set()
         camera.stop()
-        if sam3_proc:
+        if app_ref[0].sam3_proc:
             try:
-                sam3_proc.terminate(); sam3_proc.wait(timeout=5)
+                app_ref[0].sam3_proc.terminate()
+                app_ref[0].sam3_proc.wait(timeout=5)
             except Exception:
                 try:
-                    sam3_proc.kill()
+                    app_ref[0].sam3_proc.kill()
                 except Exception:
                     pass
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
-    print("UI ready.  Select gripper, enter prompt, click Capture & Run.")
     root.mainloop()
 
 

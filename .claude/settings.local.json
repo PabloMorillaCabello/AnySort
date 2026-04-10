@@ -20,7 +20,10 @@
       "Bash(grep -r visualize_pointcloud . --include=*.py -n)",
       "Bash(grep -r meshcat . --include=*.py -A 3 -B 1)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(find /opt/GraspGen -name *.py)",
+      "Bash(cmd /c AnySort.cmd)",
+      "Bash(docker compose:*)"
     ]
   }
 }
