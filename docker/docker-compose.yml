@@ -36,16 +36,11 @@ services:
       - PYTHONPATH=/opt/GraspGen:/opt/Dobot_hv
       - CUDA_HOME=/usr/local/cuda
     volumes:
-      # Mount ROS2 workspace packages (your pipeline code)
-      - ../ros2_ws/src/graspgen_pipeline:/ros2_ws/src/graspgen_pipeline
-      - ../ros2_ws/src/robotiq_3f_driver:/ros2_ws/src/robotiq_3f_driver
       # Persist model weights between rebuilds
       - model_cache:/opt/models
       # Data directory for captured images and results
       - ../data:/ros2_ws/data
       - ../results:/ros2_ws/results
-      # Config files
-      - ../config:/ros2_ws/config
       # Scripts (utilities and tests)
       - ../scripts:/ros2_ws/scripts
       # App — final solution (AnySort pipeline)
@@ -58,7 +53,7 @@ services:
       - 'c 189:* rwm'   # USB devices (/dev/bus/usb)
       - 'c 180:* rwm'   # USB serial
       - 'c 81:* rwm'    # Video devices (/dev/video*)
-    #network_mode: host  # Uncomment for ROS2 multi-machine DDS discovery
+    #network_mode: host  # Uncomment for multi-machine DDS discovery
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stdin_open: true

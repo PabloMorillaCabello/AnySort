@@ -24,7 +24,8 @@
       "Bash(find /opt/GraspGen -name *.py)",
       "Bash(cmd /c AnySort.cmd)",
       "Bash(docker compose:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(echo \"exit:$?\")"
     ]
   }
 }

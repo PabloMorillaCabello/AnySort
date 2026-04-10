@@ -18,11 +18,7 @@ venv/
 .venv/
 env/
 
-# --- AI Model weights (large files, download via script) ---
-models/sam3/
-!models/sam3/.gitkeep
-models/graspgen/
-!models/graspgen/.gitkeep
+# --- AI Model weights (stored in Docker named volume, not in repo) ---
 *.onnx
 *.pt
 *.pth
@@ -46,14 +42,7 @@ data/depth_aligned/*.png
 results/*
 !results/.gitkeep
 
-# --- ROS2 build artifacts ---
-ros2_ws/build/
-ros2_ws/install/
-ros2_ws/log/
-ros2_ws/.colcon/
-
 # --- Orbbec SDK (cloned at Docker build, not tracked) ---
-ros2_ws/src/OrbbecSDK_ROS2/
 OrbbecSDK_v2/
 orbbec_examples/
 

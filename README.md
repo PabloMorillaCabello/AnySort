@@ -81,7 +81,7 @@ No terminal window. Automatically:
 **From terminal (inside container):**
 ```bash
 docker compose -f docker/docker-compose.yml exec graspgen bash
-cd /ros2_ws/app
+cd app
 python grasp_execute_pipeline.py
 ```
 
@@ -195,6 +195,7 @@ GraspGen_Thesis_Repo/
 │   ├── test_camera.sh           # Orbbec ROS2 connectivity
 │   ├── test_full_pipeline.py    # End-to-end integration (synthetic)
 │   ├── build_workspace.sh       # colcon build helper
+│   ├── reattach.ps1             # USB passthrough re-attachment (WSL2)
 │   └── download_models.sh       # Manual model weight download
 │
 ├── data/
@@ -206,35 +207,29 @@ GraspGen_Thesis_Repo/
 │   ├── rgb/, depth/             # Captured frames (gitignored)
 │   └── OrbbecSDK_v2.7.6_amd64.deb
 │
-├── ros2_ws/src/
-│   ├── graspgen_pipeline/       # ROS2 nodes (alternative workflow)
-│   │   ├── launch/
-│   │   │   ├── full_pipeline.launch.py
-│   │   │   └── orbbec_camera.launch.py
-│   │   └── config/
-│   │       └── pipeline_params.yaml
-│   └── robotiq_3f_driver/       # Robotiq 3F gripper Modbus driver
-│
-├── models/                      # Model weights (runtime, gitignored)
 ├── results/                     # Grasp JSONs (runtime, gitignored)
-└── config/                      # Global config overrides
+└── docs/                        # Additional documentation
 ```
 
 ---
 
 ## Python Environments (Inside Container)
 
+The container hosts **three isolated Python environments**:
+
 | Env | Path | Python | Used for |
 |-----|------|--------|----------|
-| GraspGen (main) | `/opt/GraspGen/.venv/` | 3.10 (uv) | AnySort, GraspGen, pyorbbecsdk, Dobot |
-| SAM3 | `/opt/sam3env/` | 3.12 | SAM3 segmentation server |
-| System | `/usr/bin/python3` | 3.10 | ROS2 packages |
+| **GraspGen** (main) | `/opt/GraspGen/.venv/` | 3.10 (uv) | AnySort pipeline, GraspGen, pyorbbecsdk, Dobot API |
+| **SAM3** | `/opt/sam3env/` | 3.12 (pip) | Segmentation model server |
+| **System** | `/usr/bin/python3` | 3.10 | ROS2 system packages |
 
-Container aliases:
+Default entry uses the GraspGen venv. Container aliases for manual switching:
 ```bash
-graspgen_activate  # Switch to GraspGen venv (default)
+graspgen_activate  # Switch to GraspGen venv
 sam3_activate      # Switch to SAM3 venv
 ```
+
+**Model weights:** Cached in Docker named volume `model_cache` → `/opt/models` inside container (persisted across restarts).
 
 ---
 
@@ -246,7 +241,7 @@ Before executing grasps, the robot must know where the camera is relative to its
 
 **Step 1: Capture calibration poses**
 ```bash
-cd /ros2_ws/app
+cd app
 python hand_eye_calibration.py --robot-ip 192.168.5.1
 ```
 
@@ -281,7 +276,7 @@ Tests calibration accuracy by:
 Camera intrinsics (focal length, principal point) must be calibrated once per camera setup:
 
 ```bash
-cd /ros2_ws/app
+cd app
 python camera_calibration.py
 ```
 
@@ -302,27 +297,27 @@ docker compose -f docker/docker-compose.yml exec graspgen bash
 
 ### Full environment check
 ```bash
-/ros2_ws/scripts/test_environment.sh
+bash scripts/test_environment.sh
 ```
 
 Verifies: Python versions, CUDA, PyTorch, GraspGen imports, SAM3 imports, Dobot API, ROS2, model weights.
 
 ### GraspGen (grasp generation + CUDA)
 ```bash
-python3 /ros2_ws/scripts/test_graspgen.py
-python3 /ros2_ws/scripts/test_graspgen.py --no-display  # Headless
+python3 scripts/test_graspgen.py
+python3 scripts/test_graspgen.py --no-display  # Headless
 ```
 
 Tests: PointNet++ CUDA extensions, model weights, GPU inference.
 
 ### SAM3 (segmentation model)
 ```bash
-/opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py
-/opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py --image <path> --prompt "object"
-/opt/sam3env/bin/python /ros2_ws/scripts/test_sam3.py --no-display  # Headless
+/opt/sam3env/bin/python scripts/test_sam3.py
+/opt/sam3env/bin/python scripts/test_sam3.py --image <path> --prompt "object"
+/opt/sam3env/bin/python scripts/test_sam3.py --no-display  # Headless
 ```
 
-Output: `/ros2_ws/results/sam3_test_result.png`
+Output: `results/sam3_test_result.png`
 
 ### Orbbec Gemini 2 Camera
 
@@ -332,11 +327,11 @@ ros2 launch orbbec_camera gemini2.launch.py
 ros2 topic hz /camera/color/image_raw  # Verify publishing
 ```
 
-**Pure Python viewer (no ROS2):**
+**Pure Python viewer (no ROS2 required):**
 ```bash
-python3 /ros2_ws/scripts/view_camera.py                    # RGB + depth
-python3 /ros2_ws/scripts/view_camera.py --ir --align       # With IR + alignment
-python3 /ros2_ws/scripts/view_camera.py --pointcloud       # 3D point cloud
+python3 scripts/view_camera.py                    # RGB + depth
+python3 scripts/view_camera.py --ir --align       # With IR + alignment
+python3 scripts/view_camera.py --pointcloud       # 3D point cloud
 ```
 
 Press 's' to save, 'q' to quit.
@@ -351,35 +346,22 @@ python3 -c "from dobot_api import DobotApiDashboard, DobotApiFeedBack; print('OK
 python3 /opt/Dobot_hv/ui.py
 ```
 
-### ROS2 Workspace
-```bash
-ros2 pkg list | grep -E "orbbec_camera|moveit"
+### End-to-end pipeline test (synthetic, no hardware)
 
-# Rebuild if needed
-/ros2_ws/scripts/build_workspace.sh
+```bash
+python3 scripts/test_full_pipeline.py
 ```
 
-### End-to-end pipeline (synthetic, no hardware)
-
-Terminal 1:
-```bash
-ros2 launch graspgen_pipeline full_pipeline.launch.py \
-    use_sim:=true launch_camera:=false text_prompt:="object"
-```
-
-Terminal 2:
-```bash
-python3 /ros2_ws/scripts/test_full_pipeline.py
-```
+This tests the core pipeline without requiring actual robot or camera hardware.
 
 | Test | Script | Hardware needed |
 |------|--------|-----------------|
-| Environment | `test_environment.sh` | None |
-| GraspGen | `test_graspgen.py` | GPU only |
-| SAM3 | `test_sam3.py` | GPU only |
-| Camera | `view_camera.py` | Orbbec camera |
-| Dobot | `python3 -c "import dobot_api"` | None (robot for full) |
-| Full pipeline | `test_full_pipeline.py` | GPU only |
+| Environment check | `scripts/test_environment.sh` | None |
+| GraspGen | `scripts/test_graspgen.py` | GPU only |
+| SAM3 | `scripts/test_sam3.py` | GPU only |
+| Camera | `scripts/view_camera.py` | Orbbec Gemini 2 camera |
+| Dobot API | `python3 -c "from dobot_api import DobotApiDashboard"` | None |
+| Full pipeline | `scripts/test_full_pipeline.py` | GPU only |
 
 ---
 
@@ -447,9 +429,9 @@ Background threads updating Tkinter widgets cause segfaults on Linux. The app us
 The Dobot feedback socket sends 1440-byte packets. Python's `socket.recv()` doesn't guarantee a full buffer. The Dockerfile patches this with a byte-accumulation loop.
 
 ### SAM3 Model Loading
-- Cached at `/opt/models/sam3/` (persisted via docker-compose volume)
-- Falls back to HuggingFace if not present
-- First inference loads model (~2–5 minutes), then cached in memory
+- Cached in Docker named volume `model_cache` → `/opt/models/sam3/` inside container
+- Falls back to HuggingFace API if cache is empty
+- First inference loads model (~2–5 minutes), then cached in memory for session
 
 ### Meshcat Visualization
 Self-hosted via `meshcat.Visualizer()` — no external `meshcat-server` needed.
@@ -469,9 +451,9 @@ Docker build context is the **repository root**, not `docker/`. All `COPY` paths
 | `Calibration error > 10 mm` | Collect more poses (≥20), ensure board fully visible |
 | `Grasp off-target by 50+ mm` | Use `calibration_tester.py` to measure/correct systematic bias |
 | `Camera not found (USB)` | Run `usbipd attach` again in PowerShell (WSL2) |
-| `ROS2 topics not publishing` | Check `ros2 topic list`, verify camera launch with `color_format:=RGB` |
 | `Meshcat not opening` | Ensure port 7000 is exposed; check firewall; try `http://127.0.0.1:7000` |
-| `Dobot connection refused` | Verify IP (default `192.168.5.1`), ensure same network, check `netstat` on robot |
+| `Dobot connection refused` | Verify IP (default `192.168.5.1`), ensure same network subnet |
+| `Docker model cache empty` | Models auto-download on first use via HuggingFace API; ensure `HF_TOKEN` set in `docker/.env` |
 
 ---
 

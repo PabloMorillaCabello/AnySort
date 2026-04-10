@@ -47,22 +47,8 @@ GraspGen_Thesis_Repo/
 │   ├── build_workspace.sh      # colcon build helper
 │   ├── download_models.sh      # Model weight downloader
 │   └── setup_orbbec.sh         # Orbbec SDK host setup
-├── ros2_ws/
-│   └── src/
-│       ├── graspgen_pipeline/
-│       │   ├── graspgen_pipeline/
-│       │   │   ├── camera_node.py           # RGB-D sync relay (message_filters)
-│       │   │   ├── segmentation_node.py     # SAM3 integration node
-│       │   │   ├── grasp_generator_node.py  # GraspGen inference node
-│       │   │   ├── motion_planner_node.py   # MoveIt2 planning node
-│       │   │   └── pipeline_orchestrator.py # Workflow coordinator
-│       │   └── launch/
-│       │       ├── full_pipeline.launch.py      # Orchestrates all 7 ROS2 nodes (145 lines)
-│       │       └── orbbec_camera.launch.py      # Camera driver wrapper (57 lines)
-│       └── robotiq_3f_driver/              # Gripper Modbus driver node
-├── orbbec_examples/                        # Orbbec SDK reference examples (40+ scripts)
+├── orbbec_examples/                        # Orbbec SDK reference examples (not in git)
 ├── results/                                # Grasp result JSONs (not in git)
-├── models/                                 # Model weights (not in git, populated at runtime)
 ├── config/                                 # Global config overrides
 ├── docs/                                   # Documentation
 ├── AnySort.cmd                 # Windows one-click launcher (cmd version)
@@ -202,9 +188,6 @@ cd /ros2_ws/app && python grasp_execute_pipeline.py
 python /ros2_ws/app/hand_eye_calibration.py --robot-ip 192.168.5.1
 python /ros2_ws/app/calibration_tester.py
 python /ros2_ws/app/camera_calibration.py
-
-# Inside container — ROS2 camera node
-ros2 launch orbbec_camera gemini2.launch.py color_format:=RGB
 
 # Inside container — Dobot UI
 python3 /opt/Dobot_hv/main_UI.py
