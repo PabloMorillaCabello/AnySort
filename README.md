@@ -193,11 +193,19 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
    No special attachment needed — works natively on Linux.
 
 8. **Launch AnySort**
+
+   **Option A — shell script (terminal):**
    ```bash
-   docker compose -f docker/docker-compose.yml exec graspgen bash
-   cd app
-   python grasp_execute_pipeline.py
+   chmod +x AnySort.sh   # only needed once
+   ./AnySort.sh
    ```
+
+   **Option B — double-click (no terminal):**
+   ```bash
+   chmod +x AnySort.desktop   # only needed once
+   ```
+   Then double-click `AnySort.desktop` in your file manager.
+   If prompted, choose "Run" or "Trust and Launch".
 
 ---
 
