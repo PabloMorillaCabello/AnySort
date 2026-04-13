@@ -36,7 +36,8 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
 - nvidia-container-toolkit installed in WSL2 (install via `wsl.exe -d <distro> sudo apt install nvidia-docker2`)
 - X11 server for Windows (VcXsrv or X410)
 - PowerShell with admin privileges (for USB attachment)
-- HuggingFace account with access to `facebook/sam3` and `adithyamurali/GraspGenModels`
+- HuggingFace account with **approved access** to [`facebook/sam3`](https://huggingface.co/facebook/sam3) and [`adithyamurali/GraspGenModels`](https://huggingface.co/adithyamurali/GraspGenModels) — request access on each model page before building (approval can take minutes to hours)
+- **Orbbec SDK `.deb`** placed at `data/OrbbecSDK_v2.7.6_amd64.deb` — download from [Orbbec Developer Center](https://www.orbbec.com/developers/) (file is not in git)
 
 **Setup Steps:**
 
@@ -53,7 +54,12 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
    ```
    Set:
    - `HF_TOKEN`: Generate at https://huggingface.co/settings/tokens
-   - `TORCH_CUDA_ARCH_LIST`: Match your GPU (8.6 for RTX 30-series, 8.9 for RTX 40-series)
+   - `TORCH_CUDA_ARCH_LIST`: Match your GPU — find it with:
+     ```bash
+     nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+     # e.g. output "8.6" → set TORCH_CUDA_ARCH_LIST=8.6
+     ```
+     Common values: `8.6` (RTX 30-series), `8.9` (RTX 40-series), `7.5` (RTX 20-series / GTX 16-series)
    - `DISPLAY`: Leave as `host.docker.internal:0.0` (Windows X server)
 
 3. **Start X11 server on Windows**
@@ -102,9 +108,25 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
 
 **Prerequisites:**
 - Docker Engine + Docker Compose v2
-- NVIDIA GPU with CUDA 12.6+ and nvidia-container-toolkit on host
+  ```bash
+  # Install Docker Engine (Ubuntu/Debian):
+  curl -fsSL https://get.docker.com | sh
+  sudo usermod -aG docker $USER  # log out and back in after this
+  ```
+- NVIDIA GPU with CUDA 12.6+ and nvidia-container-toolkit on host:
+  ```bash
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  sudo apt update && sudo apt install -y nvidia-container-toolkit
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
+  ```
 - X11 display server (default on most Linux desktops)
-- HuggingFace account with access to `facebook/sam3` and `adithyamurali/GraspGenModels`
+- HuggingFace account with **approved access** to [`facebook/sam3`](https://huggingface.co/facebook/sam3) and [`adithyamurali/GraspGenModels`](https://huggingface.co/adithyamurali/GraspGenModels) — request access on each model page before building (approval can take minutes to hours)
+- **Orbbec SDK `.deb`** placed at `data/OrbbecSDK_v2.7.6_amd64.deb` — download from [Orbbec Developer Center](https://www.orbbec.com/developers/) (file is not in git)
 
 **Setup Steps:**
 
