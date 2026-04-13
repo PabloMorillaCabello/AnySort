@@ -43,8 +43,8 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
 
 1. **Clone and configure**
    ```bash
-   git clone <repo-url>
-   cd GraspGen_Thesis_Repo
+   git clone https://github.com/PabloMorillaCabello/AnySort.git
+   cd AnySort
    cp docker/.env.example docker/.env
    ```
 
@@ -132,12 +132,20 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
 
 1. **Clone and configure (same as Windows)**
    ```bash
-   git clone <repo-url>
-   cd GraspGen_Thesis_Repo
+   git clone https://github.com/PabloMorillaCabello/AnySort.git
+   cd AnySort
    cp docker/.env.example docker/.env
    nano docker/.env
    ```
-   Set `HF_TOKEN` and `TORCH_CUDA_ARCH_LIST` only (ignore `DISPLAY` — will be overridden below).
+   > **Note:** `.env.example` starts with a dot — it's a hidden file. If you don't see it in your file manager, press `Ctrl+H` to show hidden files, or use `ls -la docker/` in the terminal to confirm it's there.
+   Set:
+   - `HF_TOKEN`: Generate at https://huggingface.co/settings/tokens
+   - `TORCH_CUDA_ARCH_LIST`: Match your GPU:
+     ```bash
+     nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+     # e.g. output "8.6" → set TORCH_CUDA_ARCH_LIST=8.6
+     ```
+   - `DISPLAY`: Leave blank — will be set by `${DISPLAY}` at runtime
 
 2. **Enable X11 access for Docker**
    ```bash
@@ -552,6 +560,9 @@ Docker build context is the **repository root**, not `docker/`. All `COPY` paths
 | Issue | Solution |
 |-------|----------|
 | `HF_TOKEN not set` | Set in `docker/.env` and rebuild |
+| `403 / access denied on HuggingFace` | Request access to `facebook/sam3` and `adithyamurali/GraspGenModels` on huggingface.co — gated repos require approval |
+| `COPY failed: data/OrbbecSDK*.deb not found` | Download `OrbbecSDK_v2.7.6_amd64.deb` from Orbbec Developer Center and place at `data/OrbbecSDK_v2.7.6_amd64.deb` |
+| `docker/.env not found` after cloning | `.env` is gitignored — run `cp docker/.env.example docker/.env` then fill in your `HF_TOKEN` |
 | `CUDA out of memory` | Reduce `--num_grasps` in app or use smaller model |
 | `ChArUco board not detected` | Ensure good overhead lighting, print larger |
 | `Calibration error > 10 mm` | Collect more poses (≥20), ensure board fully visible |
