@@ -5,6 +5,22 @@
 #   2. docker compose build --build-arg HF_TOKEN=$(cat .env | grep HF_TOKEN | cut -d= -f2)
 #   3. docker compose up -d
 #   4. docker compose exec graspgen bash
+#
+# ── PLATFORM NOTES ───────────────────────────────────────────────────────────
+# Windows + WSL2 (current default):
+#   • DISPLAY=host.docker.internal:0.0  ← requires VcXsrv/X410 running on Windows
+#   • extra_hosts host.docker.internal  ← needed so container resolves Windows host
+#   • /tmp/.X11-unix volume             ← NOT needed (X server is on Windows side)
+#   • Camera USB via usbipd-win + scripts/reattach.ps1
+#
+# Native Linux:
+#   • Comment out:  DISPLAY=host.docker.internal:0.0
+#   • Uncomment:    DISPLAY=${DISPLAY}
+#   • Uncomment:    /tmp/.X11-unix:/tmp/.X11-unix  volume
+#   • Comment out:  extra_hosts block (not needed, host is localhost)
+#   • Run on host before starting container: xhost +local:docker
+#   • Camera USB works natively — no usbipd-win needed
+#   • Verify GPU: nvidia-container-toolkit must be installed on host
 # =============================================================================
 
 services:
@@ -28,7 +44,9 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
-      - DISPLAY=host.docker.internal:0.0
+      - DISPLAY=host.docker.internal:0.0  # Windows+WSL2: X server on Windows side
+      # [LINUX] Comment line above, uncomment line below:
+      # - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -48,14 +66,18 @@ services:
       # Camera device access (Orbbec USB)
       - /dev:/dev
       - /dev/bus/usb:/dev/bus/usb
+      # [LINUX] Uncomment line below for X11 display passthrough (not needed on Windows+WSL2):
+      # - /tmp/.X11-unix:/tmp/.X11-unix
     # USB + video device access (more secure than privileged: true)
     device_cgroup_rules:
       - 'c 189:* rwm'   # USB devices (/dev/bus/usb)
       - 'c 180:* rwm'   # USB serial
       - 'c 81:* rwm'    # Video devices (/dev/video*)
     #network_mode: host  # Uncomment for multi-machine DDS discovery
+    # [WINDOWS+WSL2] Needed so container resolves Windows host for X display:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # [LINUX] Comment out the extra_hosts block above — not needed on native Linux
     stdin_open: true
     tty: true
     # Keep the container alive in detached mode (docker compose up -d).

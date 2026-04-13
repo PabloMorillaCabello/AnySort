@@ -13,77 +13,161 @@ Everything runs inside Docker with CUDA 12.6, ROS2 Humble, and WSL2 on Windows. 
 
 ---
 
-## Quick Start (5 minutes)
+## Quick Start
 
-### Prerequisites
-- NVIDIA GPU (CUDA 12.6+) with Docker + NVIDIA Container Toolkit
+Choose your platform below for detailed setup instructions:
+
+- **[Windows + WSL2](#platform-windows--wsl2)** (current default) — Docker Desktop with WSL2 backend, X11 via VcXsrv/X410, USB camera via usbipd-win
+- **[Native Linux](#platform-native-linux)** — Docker Engine with native GPU support, standard X11
+
+Both paths take **30–45 minutes** for the initial Docker build, then launch is **single-click** (Windows) or **one command** (Linux).
+
+---
+
+## Installation & Platform Setup
+
+The project runs in Docker with support for **Windows + WSL2** (current default) and **Native Linux**. Platform-specific setup differs slightly.
+
+### Platform: Windows + WSL2
+
+**Prerequisites:**
+- Windows 11 with WSL2 installed and Docker Desktop with WSL2 backend
+- NVIDIA GPU with CUDA 12.6+ support
+- nvidia-container-toolkit installed in WSL2 (install via `wsl.exe -d <distro> sudo apt install nvidia-docker2`)
+- X11 server for Windows (VcXsrv or X410)
+- PowerShell with admin privileges (for USB attachment)
 - HuggingFace account with access to `facebook/sam3` and `adithyamurali/GraspGenModels`
-- Orbbec Gemini 2 USB 3.0 camera
-- Dobot CR robot (or UR robot) on network
-- Windows 11 with WSL2 + X11 server (VcXsrv/X410) or Linux
 
-### 1. Clone and configure
+**Setup Steps:**
 
-```bash
-git clone <repo-url>
-cd GraspGen_Thesis_Repo
+1. **Clone and configure**
+   ```bash
+   git clone <repo-url>
+   cd GraspGen_Thesis_Repo
+   cp docker/.env.example docker/.env
+   ```
 
-# Copy .env template and set your secrets
-cp docker/.env.example docker/.env
+2. **Edit `.env`**
+   ```bash
+   nano docker/.env
+   ```
+   Set:
+   - `HF_TOKEN`: Generate at https://huggingface.co/settings/tokens
+   - `TORCH_CUDA_ARCH_LIST`: Match your GPU (8.6 for RTX 30-series, 8.9 for RTX 40-series)
+   - `DISPLAY`: Leave as `host.docker.internal:0.0` (Windows X server)
 
-# Edit docker/.env — set HF_TOKEN, TORCH_CUDA_ARCH_LIST
-# HF_TOKEN: generate at https://huggingface.co/settings/tokens
-# TORCH_CUDA_ARCH_LIST: 8.6 (RTX 3060/3070/3080/3090) or 8.9 (RTX 4060/4070/4080/4090)
-nano docker/.env
-```
+3. **Start X11 server on Windows**
+   - Launch VcXsrv or X410
+   - Enable "Disable access control" option
 
-### 2. Build Docker image
+4. **Build Docker image (from repo root in WSL2 terminal)**
+   ```bash
+   docker compose -f docker/docker-compose.yml build
+   ```
+   Takes 30–45 minutes on first build.
 
-```bash
-# From repo root (build context is repo root, not docker/)
-docker compose -f docker/docker-compose.yml build
+5. **Start container**
+   ```bash
+   docker compose -f docker/docker-compose.yml up -d
+   ```
 
-# Takes ~30-45 minutes first time
-# Installs: CUDA 12.6, ROS2 Humble, GraspGen (uv venv), SAM3 (Python 3.12 venv),
-# Dobot API, OrbbecSDK v2.7.6, PointNet++ CUDA extensions
-```
+6. **Attach Orbbec camera via USB (in PowerShell with admin)**
+   ```powershell
+   # List USB devices (find Orbbec: VID 2bc5, PID 0670)
+   usbipd list
 
-### 3. Start container
+   # Bind and attach (replace <ID> with bus ID from previous step)
+   usbipd bind --busid <ID>
+   usbipd attach --wsl --busid <ID>
+   ```
+   See [USB_WSL_Docker_Guide.md](USB_WSL_Docker_Guide.md) for detailed USB setup and troubleshooting.
 
-```bash
-docker compose -f docker/docker-compose.yml up -d
-```
+7. **Launch AnySort**
+   ```bash
+   # From Windows desktop (no terminal window):
+   Double-click AnySort.vbs
 
-### 4. USB camera passthrough (WSL2, once per session)
+   # OR from terminal inside container:
+   docker compose -f docker/docker-compose.yml exec graspgen bash
+   cd app
+   python grasp_execute_pipeline.py
+   ```
 
-In PowerShell (Administrator):
-```powershell
-usbipd list              # Find Orbbec bus ID (VID 2bc5, PID 0670)
-usbipd bind --busid <ID>
-usbipd attach --wsl --busid <ID>
-```
+**docker-compose.yml notes (Windows+WSL2 — already configured):**
+- `DISPLAY=host.docker.internal:0.0` — X server runs on Windows side
+- `extra_hosts: host.docker.internal` — enables container to resolve Windows host
+- `/tmp/.X11-unix` volume — NOT mounted (not needed on Windows)
 
-See [USB_WSL_Docker_Guide.md](USB_WSL_Docker_Guide.md) for detailed setup.
+### Platform: Native Linux
 
-### 5. Launch AnySort
+**Prerequisites:**
+- Docker Engine + Docker Compose v2
+- NVIDIA GPU with CUDA 12.6+ and nvidia-container-toolkit on host
+- X11 display server (default on most Linux desktops)
+- HuggingFace account with access to `facebook/sam3` and `adithyamurali/GraspGenModels`
 
-**From Windows desktop (recommended):**
-```
-Double-click AnySort.vbs
-```
+**Setup Steps:**
 
-No terminal window. Automatically:
-1. Starts container if not running
-2. Launches `grasp_execute_pipeline.py`
-3. Loads Meshcat visualiser
-4. Initializes camera and models
+1. **Clone and configure (same as Windows)**
+   ```bash
+   git clone <repo-url>
+   cd GraspGen_Thesis_Repo
+   cp docker/.env.example docker/.env
+   nano docker/.env
+   ```
+   Set `HF_TOKEN` and `TORCH_CUDA_ARCH_LIST` only (ignore `DISPLAY` — will be overridden below).
 
-**From terminal (inside container):**
-```bash
-docker compose -f docker/docker-compose.yml exec graspgen bash
-cd app
-python grasp_execute_pipeline.py
-```
+2. **Enable X11 access for Docker**
+   ```bash
+   xhost +local:docker
+   ```
+
+3. **Modify docker-compose.yml for Linux**
+   Edit `docker/docker-compose.yml`:
+   ```yaml
+   environment:
+     # Comment out Windows line:
+     # - DISPLAY=host.docker.internal:0.0
+     # Uncomment Linux line:
+     - DISPLAY=${DISPLAY}
+     # ... rest of environment vars ...
+
+   volumes:
+     # ... existing volumes ...
+     # Uncomment X11 socket for Linux:
+     - /tmp/.X11-unix:/tmp/.X11-unix
+     # ... rest of volumes ...
+
+   # extra_hosts block — Comment out entire block (not needed on Linux):
+   # extra_hosts:
+   #   - "host.docker.internal:host-gateway"
+   ```
+
+4. **Verify GPU access**
+   ```bash
+   docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi
+   ```
+   Should show GPU info without error.
+
+5. **Build Docker image**
+   ```bash
+   docker compose -f docker/docker-compose.yml build
+   ```
+
+6. **Start container**
+   ```bash
+   docker compose -f docker/docker-compose.yml up -d
+   ```
+
+7. **Attach Orbbec camera (plug in via USB 3.0 port)**
+   No special attachment needed — works natively on Linux.
+
+8. **Launch AnySort**
+   ```bash
+   docker compose -f docker/docker-compose.yml exec graspgen bash
+   cd app
+   python grasp_execute_pipeline.py
+   ```
 
 ---
 
