@@ -13,6 +13,28 @@ Everything runs inside Docker with CUDA 12.6, ROS2 Humble, and WSL2 on Windows. 
 
 ---
 
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Installation & Platform Setup](#installation--platform-setup)
+  - [Windows + WSL2](#platform-windows--wsl2)
+  - [Native Linux](#platform-native-linux)
+- [Verify Your Installation](#verify-your-installation)
+- [AnySort UI Overview](#anysort-ui-overview)
+- [Batch / Sorting Mode](#batch--sorting-mode)
+- [Project Structure](#project-structure)
+- [Python Environments](#python-environments-inside-container)
+- [Hand-Eye Calibration](#hand-eye-calibration)
+- [Camera Calibration](#camera-calibration)
+- [Testing](#testing)
+- [Docker Reference](#docker-reference)
+- [Exposed Ports](#exposed-ports)
+- [Key Technical Notes](#key-technical-notes)
+- [Troubleshooting](#troubleshooting)
+- [Upstream Repositories](#upstream-repositories)
+
+---
+
 ## Quick Start
 
 Choose your platform below for detailed setup instructions:
@@ -41,43 +63,61 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
 
 **Setup Steps:**
 
-1. **Clone and configure**
+1. **Clone the repository (in WSL2 terminal)**
    ```bash
    git clone https://github.com/PabloMorillaCabello/AnySort.git
    cd AnySort
-   cp docker/.env.example docker/.env
    ```
 
-2. **Edit `.env`**
+2. **Copy and edit the env file**
+
+   WSL2 / Git Bash:
    ```bash
+   cp docker/.env.example docker/.env
    nano docker/.env
    ```
-   Set:
+   PowerShell:
+   ```powershell
+   Copy-Item docker\.env.example docker\.env
+   notepad docker\.env
+   ```
+   CMD:
+   ```cmd
+   copy docker\.env.example docker\.env
+   notepad docker\.env
+   ```
+   Set these values:
    - `HF_TOKEN`: Generate at https://huggingface.co/settings/tokens
-   - `TORCH_CUDA_ARCH_LIST`: Match your GPU — find it with:
+   - `TORCH_CUDA_ARCH_LIST`: Find your GPU's compute capability:
      ```bash
      nvidia-smi --query-gpu=compute_cap --format=csv,noheader
      # e.g. output "8.6" → set TORCH_CUDA_ARCH_LIST=8.6
      ```
-     Common values: `8.6` (RTX 30-series), `8.9` (RTX 40-series), `7.5` (RTX 20-series / GTX 16-series)
-   - `DISPLAY`: Leave as `host.docker.internal:0.0` (Windows X server)
+     Common values: `8.6` (RTX 30-series / A500 / A2000), `8.9` (RTX 40-series), `7.5` (RTX 20-series)
+   - `DISPLAY`: Leave as `host.docker.internal:0.0`
 
-3. **Start X11 server on Windows**
+3. **Place Orbbec SDK file**
+   Download `OrbbecSDK_v2.7.6_amd64.deb` from [Orbbec Developer Center](https://www.orbbec.com/developers/) and place it at:
+   ```
+   AnySort/data/OrbbecSDK_v2.7.6_amd64.deb
+   ```
+
+4. **Start X11 server on Windows**
    - Launch VcXsrv or X410
    - Enable "Disable access control" option
 
-4. **Build Docker image (from repo root in WSL2 terminal)**
+5. **Build Docker image (from repo root in WSL2 terminal)**
    ```bash
-   docker compose -f docker/docker-compose.yml build
+   docker compose -f docker/docker-compose.yml --env-file docker/.env build
    ```
    Takes 30–45 minutes on first build.
 
-5. **Start container**
+6. **Start container**
    ```bash
-   docker compose -f docker/docker-compose.yml up -d
+   docker compose -f docker/docker-compose.yml --env-file docker/.env up -d
    ```
 
-6. **Attach Orbbec camera via USB (in PowerShell with admin)**
+7. **Attach Orbbec camera via USB (PowerShell as admin)**
    ```powershell
    # List USB devices (find Orbbec: VID 2bc5, PID 0670)
    usbipd list
@@ -88,15 +128,14 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
    ```
    See [USB_WSL_Docker_Guide.md](USB_WSL_Docker_Guide.md) for detailed USB setup and troubleshooting.
 
-7. **Launch AnySort**
-   ```bash
-   # From Windows desktop (no terminal window):
-   Double-click AnySort.vbs
+8. **Launch AnySort**
 
-   # OR from terminal inside container:
-   docker compose -f docker/docker-compose.yml exec graspgen bash
-   cd app
-   python grasp_execute_pipeline.py
+   Double-click `AnySort.vbs` (no terminal window)
+
+   Or from WSL2 terminal:
+   ```bash
+   docker compose -f docker/docker-compose.yml exec graspgen bash -c \
+     "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python grasp_execute_pipeline.py"
    ```
 
 **docker-compose.yml notes (Windows+WSL2 — already configured):**
@@ -130,71 +169,79 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
 
 **Setup Steps:**
 
-1. **Clone and configure (same as Windows)**
+1. **Clone the repository**
    ```bash
    git clone https://github.com/PabloMorillaCabello/AnySort.git
    cd AnySort
+   ```
+
+2. **Copy and edit the env file**
+   ```bash
    cp docker/.env.example docker/.env
+   ```
+   > **Note:** `.env.example` starts with a dot — hidden file. Use `ls -la docker/` to confirm it's there, or press `Ctrl+H` in your file manager.
+   ```bash
    nano docker/.env
    ```
-   > **Note:** `.env.example` starts with a dot — it's a hidden file. If you don't see it in your file manager, press `Ctrl+H` to show hidden files, or use `ls -la docker/` in the terminal to confirm it's there.
-   Set:
+   Set these values:
    - `HF_TOKEN`: Generate at https://huggingface.co/settings/tokens
-   - `TORCH_CUDA_ARCH_LIST`: Match your GPU:
+   - `TORCH_CUDA_ARCH_LIST`: Find your GPU's compute capability:
      ```bash
      nvidia-smi --query-gpu=compute_cap --format=csv,noheader
      # e.g. output "8.6" → set TORCH_CUDA_ARCH_LIST=8.6
      ```
-   - `DISPLAY`: Leave blank — will be set by `${DISPLAY}` at runtime
+   - `DISPLAY`: Leave blank — overridden at runtime by `${DISPLAY}`
 
-2. **Enable X11 access for Docker**
-   ```bash
-   xhost +local:docker
+3. **Place Orbbec SDK file**
+   Download `OrbbecSDK_v2.7.6_amd64.deb` from [Orbbec Developer Center](https://www.orbbec.com/developers/) and place it at:
+   ```
+   AnySort/data/OrbbecSDK_v2.7.6_amd64.deb
    ```
 
-3. **Modify docker-compose.yml for Linux**
-   Edit `docker/docker-compose.yml`:
+4. **Modify docker-compose.yml for Linux**
+   Edit `docker/docker-compose.yml` (comments already guide you):
    ```yaml
    environment:
-     # Comment out Windows line:
+     # Comment out this line:
      # - DISPLAY=host.docker.internal:0.0
-     # Uncomment Linux line:
+     # Uncomment this line:
      - DISPLAY=${DISPLAY}
-     # ... rest of environment vars ...
 
    volumes:
-     # ... existing volumes ...
-     # Uncomment X11 socket for Linux:
+     # Uncomment this line:
      - /tmp/.X11-unix:/tmp/.X11-unix
-     # ... rest of volumes ...
 
-   # extra_hosts block — Comment out entire block (not needed on Linux):
+   # Comment out the entire extra_hosts block:
    # extra_hosts:
    #   - "host.docker.internal:host-gateway"
    ```
 
-4. **Verify GPU access**
+5. **Verify GPU access**
    ```bash
    docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi
    ```
    Should show GPU info without error.
 
-5. **Build Docker image**
+6. **Build Docker image**
    ```bash
-   docker compose -f docker/docker-compose.yml build
+   docker compose -f docker/docker-compose.yml --env-file docker/.env build
+   ```
+   Takes 30–45 minutes on first build.
+
+7. **Start container**
+   ```bash
+   docker compose -f docker/docker-compose.yml --env-file docker/.env up -d
    ```
 
-6. **Start container**
+8. **Plug in Orbbec camera (USB 3.0)**
+   No special setup — works natively on Linux. Verify with:
    ```bash
-   docker compose -f docker/docker-compose.yml up -d
+   lsusb | grep 2bc5
    ```
 
-7. **Attach Orbbec camera (plug in via USB 3.0 port)**
-   No special attachment needed — works natively on Linux.
+9. **Launch AnySort**
 
-8. **Launch AnySort**
-
-   **Option A — shell script (terminal):**
+   **Option A — shell script (terminal, handles xhost automatically):**
    ```bash
    chmod +x AnySort.sh   # only needed once
    ./AnySort.sh
@@ -204,8 +251,66 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
    ```bash
    chmod +x AnySort.desktop   # only needed once
    ```
-   Then double-click `AnySort.desktop` in your file manager.
-   If prompted, choose "Run" or "Trust and Launch".
+   Then double-click `AnySort.desktop` in your file manager. If prompted, choose "Run" or "Trust and Launch".
+
+   > **Note:** `xhost +local:docker` is required each reboot for X11 display. `AnySort.sh` and `AnySort.desktop` run it automatically. If launching manually, run it first:
+   > ```bash
+   > xhost +local:docker
+   > ```
+
+---
+
+## Verify Your Installation
+
+Run these checks in order after a fresh install. Enter the container first:
+```bash
+docker compose -f docker/docker-compose.yml exec graspgen bash
+```
+
+### Step 1 — Full environment check (no hardware needed)
+```bash
+bash scripts/test_environment.sh
+```
+Verifies: Python versions, CUDA, PyTorch, GraspGen imports, SAM3 imports, Dobot API, ROS2, model weights.
+All lines should print `OK` or `PASS`. Fix any failures before continuing.
+
+### Step 2 — GPU + GraspGen inference
+```bash
+python3 scripts/test_graspgen.py --no-display
+```
+Expected: PointNet++ CUDA extensions load, model weights found, inference runs without error.
+
+### Step 3 — SAM3 segmentation model
+```bash
+/opt/sam3env/bin/python scripts/test_sam3.py --no-display
+```
+Expected: model loads from cache, inference runs. Output saved to `results/sam3_test_result.png`.
+> First run downloads model weights (~2 GB) — takes a few minutes if not cached.
+
+### Step 4 — Camera (requires Orbbec plugged in)
+```bash
+python3 scripts/view_camera.py
+```
+RGB and depth windows should open. Press `s` to save a frame, `q` to quit.
+If camera not detected, verify USB connection:
+- **Windows**: run `usbipd attach` again in PowerShell (admin)
+- **Linux**: run `lsusb | grep 2bc5`
+
+### Step 5 — End-to-end pipeline (no hardware needed)
+```bash
+python3 scripts/test_full_pipeline.py
+```
+Runs a synthetic scene through the full pipeline (camera → SAM3 → GraspGen). No robot or camera required.
+
+### Quick reference
+
+| Test | Command | Hardware |
+|------|---------|----------|
+| Environment | `bash scripts/test_environment.sh` | None |
+| GraspGen | `python3 scripts/test_graspgen.py --no-display` | GPU only |
+| SAM3 | `/opt/sam3env/bin/python scripts/test_sam3.py --no-display` | GPU only |
+| Camera | `python3 scripts/view_camera.py` | Orbbec camera |
+| Full pipeline | `python3 scripts/test_full_pipeline.py` | GPU only |
 
 ---
 

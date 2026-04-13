@@ -9,8 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 xhost +local:docker > /dev/null 2>&1
 
 # Start container (no-op if already running)
-docker compose -f "$SCRIPT_DIR/docker/docker-compose.yml" up -d
+docker compose -f "$SCRIPT_DIR/docker/docker-compose.yml" --env-file "$SCRIPT_DIR/docker/.env" up -d
 
 # Launch AnySort pipeline
-docker compose -f "$SCRIPT_DIR/docker/docker-compose.yml" exec graspgen bash -c \
+docker compose -f "$SCRIPT_DIR/docker/docker-compose.yml" --env-file "$SCRIPT_DIR/docker/.env" exec graspgen bash -c \
   "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python grasp_execute_pipeline.py"
