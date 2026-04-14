@@ -607,18 +607,37 @@ class DobotDashboard:
     # Reachability check (InverseKin)
     # ------------------------------------------------------------------
     def _ik_raw(self, x, y, z, rx, ry, rz):
-        """Send InverseKin as a raw string, bypassing the library wrapper.
+        """Send InverseKin as a raw string and parse the response.
 
-        The Dobot_hv DobotApiDashboard wrapper can mis-format InverseKin.
-        Sending via send_data/wait_reply gives us full control over the command
-        string and the raw response bytes.
+        The Dobot response echoes the command back:
+          '-50001,{},InverseKin(x,y,z,...);'  ← failure
+          '0,{j1,j2,j3,j4,j5,j6},InverseKin(x,y,z,...);'  ← success
 
-        Returns (raw_response_str, nums_list).
+        We extract only the part before the first '{' for the error code,
+        and the part inside '{}' for the joint values — ignoring the echo.
+
+        Returns (err_id: int, joints: tuple|None, raw: str).
         """
         cmd = f"InverseKin({x:.3f},{y:.3f},{z:.3f},{rx:.3f},{ry:.3f},{rz:.3f},0,0)"
         self._dashboard.send_data(cmd)
         raw = str(self._dashboard.wait_reply())
-        return raw, self._nums(raw)
+
+        # Error code is the first number before the '{'
+        pre  = raw.split("{")[0]
+        err_nums = re.findall(r"-?\d+", pre)
+        if not err_nums:
+            return None, None, raw
+        err_id = int(err_nums[0])
+
+        # Joint values are inside the first '{ ... }'
+        joints = None
+        m = re.search(r"\{([^}]*)\}", raw)
+        if m and err_id == 0:
+            jnums = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", m.group(1))]
+            if len(jnums) == 6:
+                joints = tuple(jnums)
+
+        return err_id, joints, raw
 
     def check_reachability(self, x, y, z, rx, ry, rz):
         """Query InverseKin to verify (x,y,z mm, rx,ry,rz deg) is reachable.
@@ -626,46 +645,40 @@ class DobotDashboard:
         Returns:
             reachable (bool)
             joints    (tuple of 6 floats in degrees, or None)
-            message   (str)  — "ErrorID=<n>" on failure so callers can inspect the code
+            message   (str)
         """
         try:
-            raw, nums = self._ik_raw(x, y, z, rx, ry, rz)
-            if not nums:
+            err_id, joints, raw = self._ik_raw(x, y, z, rx, ry, rz)
+            if err_id is None:
                 return False, None, f"No response: {raw!r}"
-            err_id = int(nums[0])
             if err_id != 0:
                 return False, None, f"ErrorID={err_id}"
-            joints = tuple(nums[1:7]) if len(nums) >= 7 else None
             return True, joints, "OK"
         except Exception as e:
             return False, None, f"InverseKin error: {e}"
 
     def probe_ik(self):
-        """Test InverseKin with the robot's current known-valid pose.
+        """Test InverseKin with the known-valid home pose [300,0,450,0,0,0].
 
-        Used at connect time to decide whether IK is usable.
-        Prints the raw response so the format is visible in the terminal.
+        Uses home pose instead of the current robot pose — the current pose
+        may be at an extreme orientation that has no IK solution, which would
+        give a false negative for whether IK is available at all.
 
-        Returns True if IK accepted the current pose.
+        Returns True if IK is functional.
         """
         try:
-            pose = self.get_pose()          # (x, y, z, rx, ry, rz) in mm / deg
-            raw, nums = self._ik_raw(*pose)
-            print(f"[IK-probe] pose={tuple(f'{v:.1f}' for v in pose)}", flush=True)
-            print(f"[IK-probe] raw_resp={raw!r}", flush=True)
-            print(f"[IK-probe] parsed nums={nums}", flush=True)
-            if not nums:
-                print(f"[IK-probe] No numbers in response — IK unusable", flush=True)
-                return False
-            err_id = int(nums[0])
+            # Use home pose — known safe, always has an IK solution
+            hx, hy, hz, hrx, hry, hrz = HOME_POSE
+            err_id, joints, raw = self._ik_raw(hx, hy, hz, hrx, hry, hrz)
+            print(f"[IK-probe] home pose raw_resp={raw!r}", flush=True)
+            print(f"[IK-probe] err_id={err_id}  joints={joints}", flush=True)
             if err_id == 0:
-                joints = tuple(nums[1:7]) if len(nums) >= 7 else None
-                print(f"[IK-probe] IK OK  joints={joints}", flush=True)
+                print(f"[IK-probe] IK functional ✓", flush=True)
                 return True
-            print(f"[IK-probe] ErrorID={err_id} for current pose — IK unusable", flush=True)
+            print(f"[IK-probe] ErrorID={err_id} even for home pose — IK unavailable", flush=True)
             return False
         except Exception as e:
-            print(f"[IK-probe] Exception: {e} — IK unusable", flush=True)
+            print(f"[IK-probe] Exception: {e} — IK unavailable", flush=True)
             return False
 
     # ------------------------------------------------------------------
@@ -2378,6 +2391,20 @@ class GraspExecuteApp:
             else:
                 grasps_base_np = grasps_work_np
 
+            # ── Orientation flip for vacuum gripper (execution only) ─────────
+            # Applied HERE — before collision and reachability filters — so that
+            # both filters check the actual execution orientations, not the raw
+            # GraspGen orientations.  Visualization uses grasps_work_np which is
+            # never modified by this flip.
+            if self._flip_orient:
+                _R_flip = np.eye(4)
+                _R_flip[:3, :3] = np.array([[1., 0., 0.],
+                                             [0., -1., 0.],
+                                             [0., 0., -1.]])   # 180° around X
+                grasps_base_np = np.array([g @ _R_flip for g in grasps_base_np])
+                self._log("[GraspGen] Approach Z flipped for execution (tool approaches from above)")
+            # ────────────────────────────────────────────────────────────────
+
             # Visualization uses the Z-up work frame (same as point cloud above)
             _, grasps_centered, scores, _ = _process_point_cloud(
                 pc_base, grasps_work_np, grasp_conf_np)
@@ -2463,20 +2490,6 @@ class GraspExecuteApp:
                               f"{len(grasps_work_np)} reachable grasps")
                     if len(grasps_work_np) == 0:
                         raise RuntimeError("All grasps filtered by reachability check")
-            # ────────────────────────────────────────────────────────────────
-
-            # ── Orientation flip for vacuum gripper (execution only) ─────────
-            # Visualization stays unchanged.  For the execution poses we flip the
-            # approach direction (tool Z) so it always points downward in the robot
-            # base frame (negative Z component), meaning the robot descends from
-            # above rather than coming up from below.
-            if self._flip_orient:
-                _R_flip = np.eye(4)
-                _R_flip[:3, :3] = np.array([[1., 0., 0.],
-                                             [0., -1., 0.],
-                                             [0., 0., -1.]])   # 180° around X
-                grasps_base_np = np.array([g @ _R_flip for g in grasps_base_np])
-                self._log("[GraspGen] Approach Z flipped for execution (tool approaches from above)")
             # ────────────────────────────────────────────────────────────────
 
             # Sort all grasps by confidence descending and store for retry loop
