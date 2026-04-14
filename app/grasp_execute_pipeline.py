@@ -1002,7 +1002,8 @@ class GraspExecuteApp:
                 data["sort_joints"] = self._sort_joints
             if self._last_list_path:
                 data["last_list_path"] = self._last_list_path
-            data["tcp_z_offset"] = float(self._tcp_z_var.get())
+            data["tcp_z_offset"]  = float(self._tcp_z_var.get())
+            data["tilt_limit_deg"] = float(self._tilt_var.get())
             try:
                 words = list(self._batch_listbox.get(0, "end"))
                 if words:
@@ -1035,6 +1036,8 @@ class GraspExecuteApp:
                     pass
             if "tcp_z_offset" in data:
                 self._tcp_z_var.set(str(data["tcp_z_offset"]))
+            if "tilt_limit_deg" in data:
+                self._tilt_var.set(str(data["tilt_limit_deg"]))
             # Restore word list: prefer last saved file, fall back to embedded list
             last_path = data.get("last_list_path")
             if last_path and Path(last_path).exists():
@@ -1402,7 +1405,8 @@ class GraspExecuteApp:
         for label, attr, default in [
                 ("Speed %",     "_speed_var",    "15"),
                 ("Approach mm", "_approach_var", str(APPROACH_OFFSET)),
-                ("TCP Z mm",    "_tcp_z_var",    "0")]:
+                ("TCP Z mm",    "_tcp_z_var",    "0"),
+                ("Tilt limit °","_tilt_var",     "45")]:
             r2 = tk.Frame(p, bg=bg); r2.pack(fill="x", padx=10, pady=1)
             tk.Label(r2, text=label+":", bg=bg, fg="#ccc",
                      font=("Helvetica", 8), anchor="w", width=13).pack(side="left")
@@ -2342,42 +2346,7 @@ class GraspExecuteApp:
                 f"Step 5/7 — All GraspGen poses  ({len(grasps_obj_np)} raw grasps)")
             # ────────────────────────────────────────────────────────────────
 
-            # Filter: keep only grasps approaching from above.
-            # When the orientation flip is enabled (GraspGen outputs reversed
-            # orientations for this tool), the grasps that are visually correct
-            # top-down have approach_z > 0 in GraspGen's frame — after the 180°
-            # flip applied later they become approach_z < 0 (downward) for
-            # execution.  Without the flip, the standard convention applies.
-            approach_z = grasps_obj_np[:, 2, 2]
-            if self._flip_orient:
-                top_down = approach_z > 0   # inverted: GraspGen orientation is reversed
-                filter_label = "top-down (inverted — flip enabled)"
-            else:
-                top_down = approach_z < 0   # standard: approach Z points down
-                filter_label = "top-down"
-            if top_down.sum() == 0:
-                self._log(f"[GraspGen] WARNING: no {filter_label} grasps — keeping all")
-            else:
-                n_before = len(grasps_obj_np)
-                grasps_obj_np = grasps_obj_np[top_down]
-                grasp_conf_np = grasp_conf_np[top_down]
-                n_topdown_removed = n_before - len(grasps_obj_np)
-                self._log(f"[GraspGen] {filter_label.capitalize()} filter: {n_before} → "
-                          f"{len(grasps_obj_np)} grasps")
-
-            # ── Debug step 6: top-down filtered grasps ───────────────────────
-            if self._debug_var.get() and self._vis:
-                _grasps_td_work = t_center_inv @ grasps_obj_np
-                self._vis.delete()
-                visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
-                                     size=args.scene_point_size)
-                _gn = grasp_cfg.data.gripper_name
-                for _i, _g in enumerate(_grasps_td_work):
-                    visualize_grasp(self._vis, f"grasps_td/{_i:03d}/grasp", _g,
-                                    color=[180, 255, 180], gripper_name=_gn, linewidth=0.8)
-            self._debug_pause(
-                f"Step 6/7 — Top-down filtered  ({len(grasps_obj_np)} grasps)")
-            # ────────────────────────────────────────────────────────────────
+            # (top-down filter applied later in robot base frame — see below)
 
             # Un-center: grasps go from centered → work frame (Z-up base)
             grasps_work_np = t_center_inv @ grasps_obj_np   # (4,4) @ (N,4,4) → (N,4,4)
@@ -2403,13 +2372,37 @@ class GraspExecuteApp:
                                              [0., 0., -1.]])   # 180° around X
                 grasps_base_np = np.array([g @ _R_flip for g in grasps_base_np])
                 self._log("[GraspGen] Approach Z flipped for execution (tool approaches from above)")
-            # ────────────────────────────────────────────────────────────────
+
+            # ── Top-down filter in robot base frame ───────────────────────────
+            # Checked HERE — after coordinate transforms AND execution flip — so
+            # we test the actual approach direction in the robot base frame.
+            # approach vector = column 2 of the rotation matrix (grasps_base_np[:,2,2])
+            # Negative Z in robot base frame = pointing downward = top-down grasp.
+            # Early object-frame checks are unreliable because the camera→base
+            # transform rotates the approach vector unpredictably.
+            n_topdown_removed = 0
+            tilt_limit_deg = float(self._tilt_var.get())
+            # cos(tilt_limit) is the minimum |approach_z| for a valid top-down grasp.
+            # approach_z must be < -threshold (pointing down, within tilt_limit of vertical).
+            tilt_threshold = float(np.cos(np.deg2rad(tilt_limit_deg)))
+            approach_z_base = grasps_base_np[:, 2, 2]
+            top_down = approach_z_base < -tilt_threshold
+            if top_down.sum() == 0:
+                self._log(f"[GraspGen] WARNING: no grasps within {tilt_limit_deg:.0f}° of vertical — keeping all")
+            else:
+                n_before = len(grasps_base_np)
+                grasps_base_np = grasps_base_np[top_down]
+                grasps_work_np = grasps_work_np[top_down]
+                grasp_conf_np  = grasp_conf_np[top_down]
+                n_topdown_removed = n_before - len(grasps_base_np)
+                self._log(f"[GraspGen] Top-down filter (≤{tilt_limit_deg:.0f}° tilt): "
+                          f"{n_before} → {len(grasps_base_np)} grasps")
+            # ─────────────────────────────────────────────────────────────────
 
             # Visualization uses the Z-up work frame (same as point cloud above)
             _, grasps_centered, scores, _ = _process_point_cloud(
                 pc_base, grasps_work_np, grasp_conf_np)
 
-            n_topdown_removed  = 0
             n_collision_removed = 0
             n_reach_removed    = 0
 
