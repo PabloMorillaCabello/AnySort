@@ -606,39 +606,6 @@ class DobotDashboard:
     # ------------------------------------------------------------------
     # Reachability check (InverseKin)
     # ------------------------------------------------------------------
-    def _ik_raw(self, x, y, z, rx, ry, rz):
-        """Send InverseKin as a raw string and parse the response.
-
-        The Dobot response echoes the command back:
-          '-50001,{},InverseKin(x,y,z,...);'  ← failure
-          '0,{j1,j2,j3,j4,j5,j6},InverseKin(x,y,z,...);'  ← success
-
-        We extract only the part before the first '{' for the error code,
-        and the part inside '{}' for the joint values — ignoring the echo.
-
-        Returns (err_id: int, joints: tuple|None, raw: str).
-        """
-        cmd = f"InverseKin({x:.3f},{y:.3f},{z:.3f},{rx:.3f},{ry:.3f},{rz:.3f},0,0)"
-        self._dashboard.send_data(cmd)
-        raw = str(self._dashboard.wait_reply())
-
-        # Error code is the first number before the '{'
-        pre  = raw.split("{")[0]
-        err_nums = re.findall(r"-?\d+", pre)
-        if not err_nums:
-            return None, None, raw
-        err_id = int(err_nums[0])
-
-        # Joint values are inside the first '{ ... }'
-        joints = None
-        m = re.search(r"\{([^}]*)\}", raw)
-        if m and err_id == 0:
-            jnums = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", m.group(1))]
-            if len(jnums) == 6:
-                joints = tuple(jnums)
-
-        return err_id, joints, raw
-
     def check_reachability(self, x, y, z, rx, ry, rz):
         """Query InverseKin to verify (x,y,z mm, rx,ry,rz deg) is reachable.
 
@@ -648,38 +615,17 @@ class DobotDashboard:
             message   (str)
         """
         try:
-            err_id, joints, raw = self._ik_raw(x, y, z, rx, ry, rz)
-            if err_id is None:
-                return False, None, f"No response: {raw!r}"
+            resp = self._dashboard.InverseKin(x, y, z, rx, ry, rz)
+            nums = self._nums(resp)
+            if not nums:
+                return False, None, f"No response: {resp!r}"
+            err_id = int(nums[0])
             if err_id != 0:
-                return False, None, f"ErrorID={err_id}"
+                return False, None, f"Out of workspace (ErrorID={err_id})"
+            joints = tuple(nums[1:7]) if len(nums) >= 7 else None
             return True, joints, "OK"
         except Exception as e:
             return False, None, f"InverseKin error: {e}"
-
-    def probe_ik(self):
-        """Test InverseKin with the known-valid home pose [300,0,450,0,0,0].
-
-        Uses home pose instead of the current robot pose — the current pose
-        may be at an extreme orientation that has no IK solution, which would
-        give a false negative for whether IK is available at all.
-
-        Returns True if IK is functional.
-        """
-        try:
-            # Use home pose — known safe, always has an IK solution
-            hx, hy, hz, hrx, hry, hrz = HOME_POSE
-            err_id, joints, raw = self._ik_raw(hx, hy, hz, hrx, hry, hrz)
-            print(f"[IK-probe] home pose raw_resp={raw!r}", flush=True)
-            print(f"[IK-probe] err_id={err_id}  joints={joints}", flush=True)
-            if err_id == 0:
-                print(f"[IK-probe] IK functional ✓", flush=True)
-                return True
-            print(f"[IK-probe] ErrorID={err_id} even for home pose — IK unavailable", flush=True)
-            return False
-        except Exception as e:
-            print(f"[IK-probe] Exception: {e} — IK unavailable", flush=True)
-            return False
 
     # ------------------------------------------------------------------
     # Motion commands (return CommandID for wait_motion)
@@ -897,7 +843,6 @@ class GraspExecuteApp:
         # Robot
         self._robot: DobotDashboard = None
         self._robot_connected = False
-        self._ik_available    = False   # set to True after probe_ik() succeeds at connect
 
         # Pipeline options
         self._collision_var  = tk.BooleanVar(value=False)  # enable GraspGen collision check
@@ -1002,8 +947,7 @@ class GraspExecuteApp:
                 data["sort_joints"] = self._sort_joints
             if self._last_list_path:
                 data["last_list_path"] = self._last_list_path
-            data["tcp_z_offset"]  = float(self._tcp_z_var.get())
-            data["tilt_limit_deg"] = float(self._tilt_var.get())
+            data["tcp_z_offset"] = float(self._tcp_z_var.get())
             try:
                 words = list(self._batch_listbox.get(0, "end"))
                 if words:
@@ -1036,8 +980,6 @@ class GraspExecuteApp:
                     pass
             if "tcp_z_offset" in data:
                 self._tcp_z_var.set(str(data["tcp_z_offset"]))
-            if "tilt_limit_deg" in data:
-                self._tilt_var.set(str(data["tilt_limit_deg"]))
             # Restore word list: prefer last saved file, fall back to embedded list
             last_path = data.get("last_list_path")
             if last_path and Path(last_path).exists():
@@ -1405,8 +1347,7 @@ class GraspExecuteApp:
         for label, attr, default in [
                 ("Speed %",     "_speed_var",    "15"),
                 ("Approach mm", "_approach_var", str(APPROACH_OFFSET)),
-                ("TCP Z mm",    "_tcp_z_var",    "0"),
-                ("Tilt limit °","_tilt_var",     "45")]:
+                ("TCP Z mm",    "_tcp_z_var",    "0")]:
             r2 = tk.Frame(p, bg=bg); r2.pack(fill="x", padx=10, pady=1)
             tk.Label(r2, text=label+":", bg=bg, fg="#ccc",
                      font=("Helvetica", 8), anchor="w", width=13).pack(side="left")
@@ -2346,7 +2287,42 @@ class GraspExecuteApp:
                 f"Step 5/7 — All GraspGen poses  ({len(grasps_obj_np)} raw grasps)")
             # ────────────────────────────────────────────────────────────────
 
-            # (top-down filter applied later in robot base frame — see below)
+            # Filter: keep only grasps approaching from above.
+            # When the orientation flip is enabled (GraspGen outputs reversed
+            # orientations for this tool), the grasps that are visually correct
+            # top-down have approach_z > 0 in GraspGen's frame — after the 180°
+            # flip applied later they become approach_z < 0 (downward) for
+            # execution.  Without the flip, the standard convention applies.
+            approach_z = grasps_obj_np[:, 2, 2]
+            if self._flip_orient:
+                top_down = approach_z > 0   # inverted: GraspGen orientation is reversed
+                filter_label = "top-down (inverted — flip enabled)"
+            else:
+                top_down = approach_z < 0   # standard: approach Z points down
+                filter_label = "top-down"
+            if top_down.sum() == 0:
+                self._log(f"[GraspGen] WARNING: no {filter_label} grasps — keeping all")
+            else:
+                n_before = len(grasps_obj_np)
+                grasps_obj_np = grasps_obj_np[top_down]
+                grasp_conf_np = grasp_conf_np[top_down]
+                n_topdown_removed = n_before - len(grasps_obj_np)
+                self._log(f"[GraspGen] {filter_label.capitalize()} filter: {n_before} → "
+                          f"{len(grasps_obj_np)} grasps")
+
+            # ── Debug step 6: top-down filtered grasps ───────────────────────
+            if self._debug_var.get() and self._vis:
+                _grasps_td_work = t_center_inv @ grasps_obj_np
+                self._vis.delete()
+                visualize_pointcloud(self._vis, "pc_obj", pc_base, object_colors_filtered,
+                                     size=args.scene_point_size)
+                _gn = grasp_cfg.data.gripper_name
+                for _i, _g in enumerate(_grasps_td_work):
+                    visualize_grasp(self._vis, f"grasps_td/{_i:03d}/grasp", _g,
+                                    color=[180, 255, 180], gripper_name=_gn, linewidth=0.8)
+            self._debug_pause(
+                f"Step 6/7 — Top-down filtered  ({len(grasps_obj_np)} grasps)")
+            # ────────────────────────────────────────────────────────────────
 
             # Un-center: grasps go from centered → work frame (Z-up base)
             grasps_work_np = t_center_inv @ grasps_obj_np   # (4,4) @ (N,4,4) → (N,4,4)
@@ -2360,49 +2336,11 @@ class GraspExecuteApp:
             else:
                 grasps_base_np = grasps_work_np
 
-            # ── Orientation flip for vacuum gripper (execution only) ─────────
-            # Applied HERE — before collision and reachability filters — so that
-            # both filters check the actual execution orientations, not the raw
-            # GraspGen orientations.  Visualization uses grasps_work_np which is
-            # never modified by this flip.
-            if self._flip_orient:
-                _R_flip = np.eye(4)
-                _R_flip[:3, :3] = np.array([[1., 0., 0.],
-                                             [0., -1., 0.],
-                                             [0., 0., -1.]])   # 180° around X
-                grasps_base_np = np.array([g @ _R_flip for g in grasps_base_np])
-                self._log("[GraspGen] Approach Z flipped for execution (tool approaches from above)")
-
-            # ── Top-down filter in robot base frame ───────────────────────────
-            # Checked HERE — after coordinate transforms AND execution flip — so
-            # we test the actual approach direction in the robot base frame.
-            # approach vector = column 2 of the rotation matrix (grasps_base_np[:,2,2])
-            # Negative Z in robot base frame = pointing downward = top-down grasp.
-            # Early object-frame checks are unreliable because the camera→base
-            # transform rotates the approach vector unpredictably.
-            n_topdown_removed = 0
-            tilt_limit_deg = float(self._tilt_var.get())
-            # cos(tilt_limit) is the minimum |approach_z| for a valid top-down grasp.
-            # approach_z must be < -threshold (pointing down, within tilt_limit of vertical).
-            tilt_threshold = float(np.cos(np.deg2rad(tilt_limit_deg)))
-            approach_z_base = grasps_base_np[:, 2, 2]
-            top_down = approach_z_base < -tilt_threshold
-            if top_down.sum() == 0:
-                self._log(f"[GraspGen] WARNING: no grasps within {tilt_limit_deg:.0f}° of vertical — keeping all")
-            else:
-                n_before = len(grasps_base_np)
-                grasps_base_np = grasps_base_np[top_down]
-                grasps_work_np = grasps_work_np[top_down]
-                grasp_conf_np  = grasp_conf_np[top_down]
-                n_topdown_removed = n_before - len(grasps_base_np)
-                self._log(f"[GraspGen] Top-down filter (≤{tilt_limit_deg:.0f}° tilt): "
-                          f"{n_before} → {len(grasps_base_np)} grasps")
-            # ─────────────────────────────────────────────────────────────────
-
             # Visualization uses the Z-up work frame (same as point cloud above)
             _, grasps_centered, scores, _ = _process_point_cloud(
                 pc_base, grasps_work_np, grasp_conf_np)
 
+            n_topdown_removed  = 0
             n_collision_removed = 0
             n_reach_removed    = 0
 
@@ -2483,6 +2421,20 @@ class GraspExecuteApp:
                               f"{len(grasps_work_np)} reachable grasps")
                     if len(grasps_work_np) == 0:
                         raise RuntimeError("All grasps filtered by reachability check")
+            # ────────────────────────────────────────────────────────────────
+
+            # ── Orientation flip for vacuum gripper (execution only) ─────────
+            # Visualization stays unchanged.  For the execution poses we flip the
+            # approach direction (tool Z) so it always points downward in the robot
+            # base frame (negative Z component), meaning the robot descends from
+            # above rather than coming up from below.
+            if self._flip_orient:
+                _R_flip = np.eye(4)
+                _R_flip[:3, :3] = np.array([[1., 0., 0.],
+                                             [0., -1., 0.],
+                                             [0., 0., -1.]])   # 180° around X
+                grasps_base_np = np.array([g @ _R_flip for g in grasps_base_np])
+                self._log("[GraspGen] Approach Z flipped for execution (tool approaches from above)")
             # ────────────────────────────────────────────────────────────────
 
             # Sort all grasps by confidence descending and store for retry loop
@@ -2582,27 +2534,21 @@ class GraspExecuteApp:
                float(rx), float(ry), float(rz)
 
     def _check_pose_valid(self, x, y, z, rx, ry, rz):
-        """Reachability check.
+        """Workspace radius bounds check.
 
-        Uses InverseKin when available (confirmed working at connect time via
-        probe_ik).  Falls back to XY radius bounds otherwise.
+        The Dobot InverseKin API returns ErrorID=-1 for negative Z values even
+        when the pose is physically valid (robot mounted above the working
+        surface).  We therefore only validate the XY reach radius and skip the
+        IK call entirely to avoid false negatives.
         """
         if not self._robot_connected or self._robot is None:
             return False, None, "Robot not connected"
-
-        if self._ik_available:
-            reachable, joints, msg = self._robot.check_reachability(x, y, z, rx, ry, rz)
-            if reachable:
-                return True, joints, "OK (IK)"
-            return False, None, msg
-
-        # Radius-only fallback
         r = float((x ** 2 + y ** 2) ** 0.5)
         if r < 100.0:
             return False, None, f"Too close to base (r={r:.1f} < 100 mm)"
         if r > 820.0:
             return False, None, f"Beyond max reach (r={r:.1f} > 820 mm)"
-        return True, None, f"OK (r={r:.0f} mm)"
+        return True, None, "OK"
 
     def _update_grasp_display(self):
         """Read robot-frame pose directly and update the display label + nav buttons."""
@@ -2709,9 +2655,6 @@ class GraspExecuteApp:
             self._robot = robot
             self._robot_connected = True
             self._log(f"[Robot] Ready  mode={robot.get_mode()}")
-            # Probe IK with current pose to decide whether InverseKin is usable
-            self._ik_available = robot.probe_ik()
-            self._log(f"[Robot] InverseKin: {'✓ available' if self._ik_available else '✗ unavailable — radius-only reachability'}")
             self._cb_queue.put(self._on_robot_connected_ui)
         except Exception as e:
             self._log(f"[Robot] Connection failed: {e}")
@@ -3150,7 +3093,6 @@ class GraspExecuteApp:
                 self._batch_listbox.see(i)))
 
             success = False
-            sam3_found = False
             for attempt in range(1, 4):
                 if self._batch_stop_event.is_set():
                     break
@@ -3201,10 +3143,9 @@ class GraspExecuteApp:
 
                 if self._all_grasps_base is None or \
                         len(self._all_grasps_base) == 0:
-                    self._log(f"[Batch]   SAM3 found no object — skipping to next word")
-                    break
+                    self._log(f"[Batch]   No grasps found — retrying")
+                    continue
 
-                sam3_found = True
                 # Execute the best grasp
                 self._log(f"[Batch]   {len(self._all_grasps_base)} grasp(s) "
                           f"found — executing…")
@@ -3257,9 +3198,9 @@ class GraspExecuteApp:
                         f"[Batch]   Execute failed: {exec_e}")
                     self._recover_robot(self._robot)
 
-            if not success and sam3_found and not self._batch_stop_event.is_set():
+            if not success and not self._batch_stop_event.is_set():
                 self._log(
-                    f"[Batch] '{word}' — all 3 robot attempts exhausted, "
+                    f"[Batch] '{word}' — all 3 attempts exhausted, "
                     f"moving to next word.")
 
             # Advance to next word; wrap around at end of list
