@@ -606,6 +606,20 @@ class DobotDashboard:
     # ------------------------------------------------------------------
     # Reachability check (InverseKin)
     # ------------------------------------------------------------------
+    def _ik_raw(self, x, y, z, rx, ry, rz):
+        """Send InverseKin as a raw string, bypassing the library wrapper.
+
+        The Dobot_hv DobotApiDashboard wrapper can mis-format InverseKin.
+        Sending via send_data/wait_reply gives us full control over the command
+        string and the raw response bytes.
+
+        Returns (raw_response_str, nums_list).
+        """
+        cmd = f"InverseKin({x:.3f},{y:.3f},{z:.3f},{rx:.3f},{ry:.3f},{rz:.3f},0,0)"
+        self._dashboard.send_data(cmd)
+        raw = str(self._dashboard.wait_reply())
+        return raw, self._nums(raw)
+
     def check_reachability(self, x, y, z, rx, ry, rz):
         """Query InverseKin to verify (x,y,z mm, rx,ry,rz deg) is reachable.
 
@@ -615,9 +629,7 @@ class DobotDashboard:
             message   (str)  — "ErrorID=<n>" on failure so callers can inspect the code
         """
         try:
-            resp = self._dashboard.InverseKin(x, y, z, rx, ry, rz)
-            raw = str(resp)
-            nums = self._nums(raw)
+            raw, nums = self._ik_raw(x, y, z, rx, ry, rz)
             if not nums:
                 return False, None, f"No response: {raw!r}"
             err_id = int(nums[0])
@@ -638,11 +650,10 @@ class DobotDashboard:
         """
         try:
             pose = self.get_pose()          # (x, y, z, rx, ry, rz) in mm / deg
-            resp = self._dashboard.InverseKin(*pose)
-            raw  = str(resp)
-            print(f"[IK-probe] pose={tuple(f'{v:.1f}' for v in pose)}  "
-                  f"raw_resp={raw!r}", flush=True)
-            nums = self._nums(raw)
+            raw, nums = self._ik_raw(*pose)
+            print(f"[IK-probe] pose={tuple(f'{v:.1f}' for v in pose)}", flush=True)
+            print(f"[IK-probe] raw_resp={raw!r}", flush=True)
+            print(f"[IK-probe] parsed nums={nums}", flush=True)
             if not nums:
                 print(f"[IK-probe] No numbers in response — IK unusable", flush=True)
                 return False
@@ -651,8 +662,7 @@ class DobotDashboard:
                 joints = tuple(nums[1:7]) if len(nums) >= 7 else None
                 print(f"[IK-probe] IK OK  joints={joints}", flush=True)
                 return True
-            print(f"[IK-probe] IK returned ErrorID={err_id} for current pose "
-                  f"— IK unusable (firmware quirk or wrong format)", flush=True)
+            print(f"[IK-probe] ErrorID={err_id} for current pose — IK unusable", flush=True)
             return False
         except Exception as e:
             print(f"[IK-probe] Exception: {e} — IK unusable", flush=True)
