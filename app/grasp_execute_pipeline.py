@@ -2534,35 +2534,36 @@ class GraspExecuteApp:
                float(rx), float(ry), float(rz)
 
     def _check_pose_valid(self, x, y, z, rx, ry, rz):
-        """Reachability check via robot InverseKin.
+        """Reachability check via robot InverseKin with radius-bounds fallback.
 
-        InverseKin is the authoritative check — it asks the robot's own solver
-        whether the pose is reachable and returns the joint angles on success.
-
-        Known quirk: Dobot returns ErrorID=-1 as a false negative for some poses
-        (observed with negative Z values when the robot is mounted above the table).
-        In that case we fall back to a simple XY radius bounds check so we don't
-        incorrectly discard valid grasps.
+        Strategy:
+          1. Ask the robot's IK solver (InverseKin on port 29999).
+          2. If IK confirms reachable → trust it (also gives joint angles).
+          3. If IK fails for any reason (API unavailable, non-zero ErrorID,
+             exception) → fall back to XY radius bounds check.
+             The radius check was the original behaviour and avoids incorrectly
+             rejecting valid poses when IK returns false negatives.
         """
         if not self._robot_connected or self._robot is None:
             return False, None, "Robot not connected"
 
-        reachable, joints, msg = self._robot.check_reachability(x, y, z, rx, ry, rz)
+        try:
+            reachable, joints, msg = self._robot.check_reachability(x, y, z, rx, ry, rz)
+            if reachable:
+                return True, joints, "OK"
+            # IK returned an error — log it and fall through to radius check
+            self._log(f"[Reach] IK returned '{msg}' for "
+                      f"X={x:.1f} Y={y:.1f} Z={z:.1f} — using radius fallback")
+        except Exception as e:
+            self._log(f"[Reach] IK call failed ({e}) — using radius fallback")
 
-        if reachable:
-            return True, joints, "OK"
-
-        # ErrorID=-1: known false negative — fall back to radius bounds
-        if msg == "ErrorID=-1":
-            r = float((x ** 2 + y ** 2) ** 0.5)
-            if r < 100.0:
-                return False, None, f"Too close to base (r={r:.1f} < 100 mm)"
-            if r > 820.0:
-                return False, None, f"Beyond max reach (r={r:.1f} > 820 mm)"
-            return True, None, f"OK (IK=-1 fallback, r={r:.0f} mm)"
-
-        # Any other IK error → genuinely unreachable
-        return False, None, msg
+        # Radius bounds fallback
+        r = float((x ** 2 + y ** 2) ** 0.5)
+        if r < 100.0:
+            return False, None, f"Too close to base (r={r:.1f} < 100 mm)"
+        if r > 820.0:
+            return False, None, f"Beyond max reach (r={r:.1f} > 820 mm)"
+        return True, None, f"OK (radius={r:.0f} mm)"
 
     def _update_grasp_display(self):
         """Read robot-frame pose directly and update the display label + nav buttons."""
