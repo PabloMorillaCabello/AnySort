@@ -558,6 +558,13 @@ class DobotDashboard:
     def clear_error(self):
         return self._dashboard.ClearError()
 
+    def stop(self):
+        """Decelerate and stop all motion, flush the motion queue."""
+        try:
+            return self._dashboard.StopRobot()
+        except Exception as e:
+            print(f"[DobotDashboard] stop() error (ignored): {e}", flush=True)
+
     def set_speed(self, p):
         self._speed = max(1, min(100, int(p)))
         return self._dashboard.SpeedFactor(self._speed)
@@ -2818,19 +2825,27 @@ class GraspExecuteApp:
             time.sleep(0.5)
 
     def _recover_robot(self, robot):
-        """Vacuum off → clear alarm → re-enable (up to 3 retries) → go home.
+        """Stop motion → vacuum off → clear alarm → re-enable (up to 3 retries) → go home.
         Returns True if robot reached an enabled/running state."""
         self._log("[Recover] Starting recovery sequence…")
         self._set_status("Recovering robot…")
 
-        # 1. Vacuum off — always safe
+        # 1. Stop any ongoing motion
+        try:
+            robot.stop()
+            self._log("[Recover] StopRobot sent")
+            time.sleep(0.4)
+        except Exception as e:
+            self._log(f"[Recover] stop error (ignored): {e}")
+
+        # 2. Vacuum off — always safe
         try:
             robot.vacuum_off()
             self._log("[Recover] Vacuum OFF")
         except Exception as e:
             self._log(f"[Recover] vacuum_off error (ignored): {e}")
 
-        # 2. Clear alarm + re-enable, up to 3 attempts
+        # 3. Clear alarm + re-enable, up to 3 attempts
         recovered = False
         for attempt in range(1, 4):
             try:
@@ -2854,7 +2869,7 @@ class GraspExecuteApp:
         if not recovered:
             self._log("[Recover] WARNING: robot did not reach enabled state after 3 attempts")
 
-        # 3. Go home
+        # 4. Go home
         try:
             home_joints = self._home_joints
             if home_joints:
@@ -3306,13 +3321,25 @@ class GraspExecuteApp:
 
     # ------------------------------------------------------------------
     def _on_recover_robot(self):
-        if not self._robot_connected or self._executing or self._batch_running:
+        if not self._robot_connected:
             return
-        self._recover_btn.config(state="disabled", text="Recovering…")
+        self._recover_btn.config(state="disabled", text="Stopping…")
         threading.Thread(target=self._recover_robot_worker, daemon=True).start()
 
     def _recover_robot_worker(self):
         try:
+            # ── 1. Signal all running loops to stop ───────────────────────────
+            self._retry_stop_event.set()
+            self._batch_stop_event.set()
+            self._executing = False
+
+            # ── 2. Hard-stop robot motion ─────────────────────────────────────
+            self._log("[Recover] Sending StopRobot…")
+            self._cb_queue.put(lambda: self._recover_btn.config(text="Recovering…"))
+            self._robot.stop()
+            time.sleep(0.5)
+
+            # ── 3. Full recovery (vacuum off → clear alarm → enable → home) ───
             ok = self._recover_robot(self._robot)
             self._set_status("Recovery done — robot enabled." if ok
                              else "Recovery attempted — check robot state.")

@@ -25,7 +25,9 @@
       "Bash(cmd /c AnySort.cmd)",
       "Bash(docker compose:*)",
       "Bash(cd:*)",
-      "Bash(echo \"exit:$?\")"
+      "Bash(echo \"exit:$?\")",
+      "Read(//opt/**)",
+      "Bash(find /mnt -name dobot_api.py)"
     ]
   }
 }
