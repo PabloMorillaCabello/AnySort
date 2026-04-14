@@ -3093,6 +3093,7 @@ class GraspExecuteApp:
                 self._batch_listbox.see(i)))
 
             success = False
+            sam3_found = False
             for attempt in range(1, 4):
                 if self._batch_stop_event.is_set():
                     break
@@ -3143,9 +3144,10 @@ class GraspExecuteApp:
 
                 if self._all_grasps_base is None or \
                         len(self._all_grasps_base) == 0:
-                    self._log(f"[Batch]   No grasps found — retrying")
-                    continue
+                    self._log(f"[Batch]   SAM3 found no object — skipping to next word")
+                    break
 
+                sam3_found = True
                 # Execute the best grasp
                 self._log(f"[Batch]   {len(self._all_grasps_base)} grasp(s) "
                           f"found — executing…")
