@@ -73,7 +73,7 @@ services:
       - 'c 189:* rwm'   # USB devices (/dev/bus/usb)
       - 'c 180:* rwm'   # USB serial
       - 'c 81:* rwm'    # Video devices (/dev/video*)
-    #network_mode: host  # Uncomment for multi-machine DDS discovery
+    #network_mode: host  # Uncomment for multi-machine DDS discovery (also fixes robot TCP routing on Linux)
     # [WINDOWS+WSL2] Needed so container resolves Windows host for X display:
     extra_hosts:
       - "host.docker.internal:host-gateway"

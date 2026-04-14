@@ -1336,7 +1336,8 @@ class GraspExecuteApp:
         _lbl("Motion")
         for label, attr, default in [
                 ("Speed %",     "_speed_var",    "15"),
-                ("Approach mm", "_approach_var", str(APPROACH_OFFSET))]:
+                ("Approach mm", "_approach_var", str(APPROACH_OFFSET)),
+                ("TCP Z mm",    "_tcp_z_var",    "0")]:
             r2 = tk.Frame(p, bg=bg); r2.pack(fill="x", padx=10, pady=1)
             tk.Label(r2, text=label+":", bg=bg, fg="#ccc",
                      font=("Helvetica", 8), anchor="w", width=13).pack(side="left")
@@ -2697,12 +2698,17 @@ class GraspExecuteApp:
 
         approach_mm = float(self._approach_var.get())
         speed = int(self._speed_var.get())
+        tcp_z_offset = float(self._tcp_z_var.get())
 
         # ── Tool-Z approach: offset backwards along grasp Z-axis ─────────────
         approach_m = approach_mm / 1000.0
         tool_z = self._best_grasp_base[:3, 2]          # unit vector (approach dir)
         pre_pos_mm = (self._best_grasp_base[:3, 3] - approach_m * tool_z) * 1000.0
         x_pre, y_pre, z_pre = float(pre_pos_mm[0]), float(pre_pos_mm[1]), float(pre_pos_mm[2])
+        # ── TCP Z offset: shift along gripper axis (+further in, -pull back) ──
+        tcp_shift_mm = tcp_z_offset * tool_z           # world-frame shift vector
+        x     += tcp_shift_mm[0]; y     += tcp_shift_mm[1]; z     += tcp_shift_mm[2]
+        x_pre += tcp_shift_mm[0]; y_pre += tcp_shift_mm[1]; z_pre += tcp_shift_mm[2]
         # ─────────────────────────────────────────────────────────────────────
 
         # ── Reachability safety check ────────────────────────────────────────
@@ -2874,6 +2880,7 @@ class GraspExecuteApp:
                 start_idx = self._current_grasp_idx
                 total = len(self._all_grasps_base)
                 approach_m = float(self._approach_var.get()) / 1000.0
+                tcp_z_offset = float(self._tcp_z_var.get())
                 succeeded = False
 
                 for idx in range(start_idx, total):
@@ -2891,6 +2898,9 @@ class GraspExecuteApp:
                         gx_pre = float(pre_mm[0])
                         gy_pre = float(pre_mm[1])
                         gz_pre = float(pre_mm[2])
+                        tcp_shift_mm = tcp_z_offset * tool_z
+                        gx     += tcp_shift_mm[0]; gy     += tcp_shift_mm[1]; gz     += tcp_shift_mm[2]
+                        gx_pre += tcp_shift_mm[0]; gy_pre += tcp_shift_mm[1]; gz_pre += tcp_shift_mm[2]
 
                         self._log(f"[Retry] Trying grasp {idx + 1}/{total}  "
                                   f"X={gx:.1f} Y={gy:.1f} Z={gz:.1f} mm")
@@ -3125,6 +3135,7 @@ class GraspExecuteApp:
                     f"[Batch] '{word}' attempt {attempt}/3 — executing…")
 
                 approach_m = float(self._approach_var.get()) / 1000.0
+                tcp_z_offset = float(self._tcp_z_var.get())
                 grasp = self._all_grasps_base[0]
                 try:
                     gx, gy, gz, grx, gry, grz = \
@@ -3134,6 +3145,9 @@ class GraspExecuteApp:
                     gx_pre = float(pre_mm[0])
                     gy_pre = float(pre_mm[1])
                     gz_pre = float(pre_mm[2])
+                    tcp_shift_mm = tcp_z_offset * tool_z
+                    gx     += tcp_shift_mm[0]; gy     += tcp_shift_mm[1]; gz     += tcp_shift_mm[2]
+                    gx_pre += tcp_shift_mm[0]; gy_pre += tcp_shift_mm[1]; gz_pre += tcp_shift_mm[2]
 
                     ok_g, _, _ = self._check_pose_valid(
                         gx, gy, gz, grx, gry, grz)

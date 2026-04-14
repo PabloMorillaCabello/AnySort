@@ -673,7 +673,7 @@ Docker build context is the **repository root**, not `docker/`. All `COPY` paths
 | Issue | Solution |
 |-------|----------|
 | `HF_TOKEN not set` | Set in `docker/.env` and rebuild |
-| `403 / access denied on HuggingFace` | Request access to `facebook/sam3` and `adithyamurali/GraspGenModels` on huggingface.co — gated repos require approval |
+| `403 / access denied on HuggingFace during build` | Three checks: (1) request access at huggingface.co/facebook/sam3 and wait for approval email; (2) ensure build uses `--env-file docker/.env` so token is passed; (3) token must have **read** scope for gated repos (check at huggingface.co/settings/tokens) |
 | `COPY failed: data/OrbbecSDK*.deb not found` | Download `OrbbecSDK_v2.7.6_amd64.deb` from Orbbec Developer Center and place at `data/OrbbecSDK_v2.7.6_amd64.deb` |
 | `docker/.env not found` after cloning | `.env` is gitignored — run `cp docker/.env.example docker/.env` then fill in your `HF_TOKEN` |
 | `CUDA out of memory` | Reduce `--num_grasps` in app or use smaller model |
