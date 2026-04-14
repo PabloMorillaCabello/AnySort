@@ -612,7 +612,7 @@ class DobotDashboard:
         Returns:
             reachable (bool)
             joints    (tuple of 6 floats in degrees, or None)
-            message   (str)
+            message   (str)  — "ErrorID=<n>" on failure so callers can inspect the code
         """
         try:
             resp = self._dashboard.InverseKin(x, y, z, rx, ry, rz)
@@ -621,7 +621,7 @@ class DobotDashboard:
                 return False, None, f"No response: {resp!r}"
             err_id = int(nums[0])
             if err_id != 0:
-                return False, None, f"Out of workspace (ErrorID={err_id})"
+                return False, None, f"ErrorID={err_id}"
             joints = tuple(nums[1:7]) if len(nums) >= 7 else None
             return True, joints, "OK"
         except Exception as e:
@@ -2534,21 +2534,35 @@ class GraspExecuteApp:
                float(rx), float(ry), float(rz)
 
     def _check_pose_valid(self, x, y, z, rx, ry, rz):
-        """Workspace radius bounds check.
+        """Reachability check via robot InverseKin.
 
-        The Dobot InverseKin API returns ErrorID=-1 for negative Z values even
-        when the pose is physically valid (robot mounted above the working
-        surface).  We therefore only validate the XY reach radius and skip the
-        IK call entirely to avoid false negatives.
+        InverseKin is the authoritative check — it asks the robot's own solver
+        whether the pose is reachable and returns the joint angles on success.
+
+        Known quirk: Dobot returns ErrorID=-1 as a false negative for some poses
+        (observed with negative Z values when the robot is mounted above the table).
+        In that case we fall back to a simple XY radius bounds check so we don't
+        incorrectly discard valid grasps.
         """
         if not self._robot_connected or self._robot is None:
             return False, None, "Robot not connected"
-        r = float((x ** 2 + y ** 2) ** 0.5)
-        if r < 100.0:
-            return False, None, f"Too close to base (r={r:.1f} < 100 mm)"
-        if r > 820.0:
-            return False, None, f"Beyond max reach (r={r:.1f} > 820 mm)"
-        return True, None, "OK"
+
+        reachable, joints, msg = self._robot.check_reachability(x, y, z, rx, ry, rz)
+
+        if reachable:
+            return True, joints, "OK"
+
+        # ErrorID=-1: known false negative — fall back to radius bounds
+        if msg == "ErrorID=-1":
+            r = float((x ** 2 + y ** 2) ** 0.5)
+            if r < 100.0:
+                return False, None, f"Too close to base (r={r:.1f} < 100 mm)"
+            if r > 820.0:
+                return False, None, f"Beyond max reach (r={r:.1f} > 820 mm)"
+            return True, None, f"OK (IK=-1 fallback, r={r:.0f} mm)"
+
+        # Any other IK error → genuinely unreachable
+        return False, None, msg
 
     def _update_grasp_display(self):
         """Read robot-frame pose directly and update the display label + nav buttons."""
