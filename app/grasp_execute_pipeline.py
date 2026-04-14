@@ -3200,9 +3200,9 @@ class GraspExecuteApp:
                         f"[Batch]   Execute failed: {exec_e}")
                     self._recover_robot(self._robot)
 
-            if not success and not self._batch_stop_event.is_set():
+            if not success and sam3_found and not self._batch_stop_event.is_set():
                 self._log(
-                    f"[Batch] '{word}' — all 3 attempts exhausted, "
+                    f"[Batch] '{word}' — all 3 robot attempts exhausted, "
                     f"moving to next word.")
 
             # Advance to next word; wrap around at end of list
