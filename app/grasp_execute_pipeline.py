@@ -616,9 +616,10 @@ class DobotDashboard:
         """
         try:
             resp = self._dashboard.InverseKin(x, y, z, rx, ry, rz)
-            nums = self._nums(resp)
+            raw = str(resp)
+            nums = self._nums(raw)
             if not nums:
-                return False, None, f"No response: {resp!r}"
+                return False, None, f"No response: {raw!r}"
             err_id = int(nums[0])
             if err_id != 0:
                 return False, None, f"ErrorID={err_id}"
@@ -626,6 +627,36 @@ class DobotDashboard:
             return True, joints, "OK"
         except Exception as e:
             return False, None, f"InverseKin error: {e}"
+
+    def probe_ik(self):
+        """Test InverseKin with the robot's current known-valid pose.
+
+        Used at connect time to decide whether IK is usable.
+        Prints the raw response so the format is visible in the terminal.
+
+        Returns True if IK accepted the current pose.
+        """
+        try:
+            pose = self.get_pose()          # (x, y, z, rx, ry, rz) in mm / deg
+            resp = self._dashboard.InverseKin(*pose)
+            raw  = str(resp)
+            print(f"[IK-probe] pose={tuple(f'{v:.1f}' for v in pose)}  "
+                  f"raw_resp={raw!r}", flush=True)
+            nums = self._nums(raw)
+            if not nums:
+                print(f"[IK-probe] No numbers in response — IK unusable", flush=True)
+                return False
+            err_id = int(nums[0])
+            if err_id == 0:
+                joints = tuple(nums[1:7]) if len(nums) >= 7 else None
+                print(f"[IK-probe] IK OK  joints={joints}", flush=True)
+                return True
+            print(f"[IK-probe] IK returned ErrorID={err_id} for current pose "
+                  f"— IK unusable (firmware quirk or wrong format)", flush=True)
+            return False
+        except Exception as e:
+            print(f"[IK-probe] Exception: {e} — IK unusable", flush=True)
+            return False
 
     # ------------------------------------------------------------------
     # Motion commands (return CommandID for wait_motion)
@@ -843,6 +874,7 @@ class GraspExecuteApp:
         # Robot
         self._robot: DobotDashboard = None
         self._robot_connected = False
+        self._ik_available    = False   # set to True after probe_ik() succeeds at connect
 
         # Pipeline options
         self._collision_var  = tk.BooleanVar(value=False)  # enable GraspGen collision check
@@ -2534,36 +2566,27 @@ class GraspExecuteApp:
                float(rx), float(ry), float(rz)
 
     def _check_pose_valid(self, x, y, z, rx, ry, rz):
-        """Reachability check via robot InverseKin with radius-bounds fallback.
+        """Reachability check.
 
-        Strategy:
-          1. Ask the robot's IK solver (InverseKin on port 29999).
-          2. If IK confirms reachable → trust it (also gives joint angles).
-          3. If IK fails for any reason (API unavailable, non-zero ErrorID,
-             exception) → fall back to XY radius bounds check.
-             The radius check was the original behaviour and avoids incorrectly
-             rejecting valid poses when IK returns false negatives.
+        Uses InverseKin when available (confirmed working at connect time via
+        probe_ik).  Falls back to XY radius bounds otherwise.
         """
         if not self._robot_connected or self._robot is None:
             return False, None, "Robot not connected"
 
-        try:
+        if self._ik_available:
             reachable, joints, msg = self._robot.check_reachability(x, y, z, rx, ry, rz)
             if reachable:
-                return True, joints, "OK"
-            # IK returned an error — log it and fall through to radius check
-            self._log(f"[Reach] IK returned '{msg}' for "
-                      f"X={x:.1f} Y={y:.1f} Z={z:.1f} — using radius fallback")
-        except Exception as e:
-            self._log(f"[Reach] IK call failed ({e}) — using radius fallback")
+                return True, joints, "OK (IK)"
+            return False, None, msg
 
-        # Radius bounds fallback
+        # Radius-only fallback
         r = float((x ** 2 + y ** 2) ** 0.5)
         if r < 100.0:
             return False, None, f"Too close to base (r={r:.1f} < 100 mm)"
         if r > 820.0:
             return False, None, f"Beyond max reach (r={r:.1f} > 820 mm)"
-        return True, None, f"OK (radius={r:.0f} mm)"
+        return True, None, f"OK (r={r:.0f} mm)"
 
     def _update_grasp_display(self):
         """Read robot-frame pose directly and update the display label + nav buttons."""
@@ -2670,6 +2693,9 @@ class GraspExecuteApp:
             self._robot = robot
             self._robot_connected = True
             self._log(f"[Robot] Ready  mode={robot.get_mode()}")
+            # Probe IK with current pose to decide whether InverseKin is usable
+            self._ik_available = robot.probe_ik()
+            self._log(f"[Robot] InverseKin: {'✓ available' if self._ik_available else '✗ unavailable — radius-only reachability'}")
             self._cb_queue.put(self._on_robot_connected_ui)
         except Exception as e:
             self._log(f"[Robot] Connection failed: {e}")
