@@ -940,6 +940,7 @@ class GraspExecuteApp:
                 data["sort_joints"] = self._sort_joints
             if self._last_list_path:
                 data["last_list_path"] = self._last_list_path
+            data["tcp_z_offset"] = float(self._tcp_z_var.get())
             try:
                 words = list(self._batch_listbox.get(0, "end"))
                 if words:
@@ -970,6 +971,8 @@ class GraspExecuteApp:
                         fg="#98c379")
                 except Exception:
                     pass
+            if "tcp_z_offset" in data:
+                self._tcp_z_var.set(str(data["tcp_z_offset"]))
             # Restore word list: prefer last saved file, fall back to embedded list
             last_path = data.get("last_list_path")
             if last_path and Path(last_path).exists():
