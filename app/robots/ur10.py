@@ -229,6 +229,15 @@ class UR10(RobotBase):
     #   from tools.onrobot import OnRobotGripper
     #   robot.attach_tool(OnRobotGripper(ip="192.168.1.1", model="RG2"))
 
+    # ── Freedrive (teach / hand-guide) ───────────────────────────────────
+    def freedrive_start(self):
+        """Enable freedrive (hand-guide) mode — robot can be moved by hand."""
+        self._rtde_c.teachMode()
+
+    def freedrive_stop(self):
+        """Disable freedrive mode — robot returns to normal control."""
+        self._rtde_c.endTeachMode()
+
     # ── Reachability ─────────────────────────────────────────────────────
     def check_reachability(self, x, y, z, rx, ry, rz):
         """Use ur_rtde inverse kinematics to check reachability."""

@@ -477,6 +477,7 @@ class OrbbecCamera:
 # ===========================================================================
 sys.path.insert(0, os.path.dirname(__file__))  # ensure 'robots' package is importable
 from robots import RobotBase, get_driver_names, get_available_drivers, create_robot
+from tools import get_tool_names, create_tool
 
 
 # ===========================================================================
@@ -1165,6 +1166,19 @@ class GraspExecuteApp:
                                   font=("Helvetica", 9), width=18)
         type_menu.pack(side="left", fill="x", expand=True, ipady=2)
 
+        # Tool selector
+        r_tool = tk.Frame(p, bg=bg); r_tool.pack(fill="x", padx=10, pady=(0,3))
+        tk.Label(r_tool, text="Tool:", bg=bg, fg="#ccc",
+                 font=("Helvetica", 9), width=5, anchor="w").pack(side="left")
+        tool_names = ["(built-in / none)"] + get_tool_names()
+        self._tool_var = tk.StringVar(value=tool_names[0])
+        tool_menu = ttk.Combobox(r_tool, textvariable=self._tool_var,
+                                  values=tool_names, state="readonly",
+                                  font=("Helvetica", 9), width=18)
+        tool_menu.pack(side="left", fill="x", expand=True, ipady=2)
+        self._tool_status = tk.Label(p, text="", bg=bg, fg="#555", font=("Courier", 8))
+        self._tool_status.pack(anchor="w", padx=10)
+
         r = tk.Frame(p, bg=bg); r.pack(fill="x", padx=10, pady=(0,5))
         tk.Label(r, text="IP:", bg=bg, fg="#ccc",
                  font=("Helvetica", 9), width=5, anchor="w").pack(side="left")
@@ -1207,6 +1221,21 @@ class GraspExecuteApp:
             command=self._on_recover_robot)
         self._recover_btn.pack(padx=10, pady=2, fill="x", ipady=5)
         self._home_btn = _btn("[H]  Move to Home", "#ccc", self._on_home)
+
+        # Gripper manual controls
+        r_grip = tk.Frame(p, bg=bg); r_grip.pack(fill="x", padx=10, pady=2)
+        self._gripper_close_btn = tk.Button(
+            r_grip, text="Gripper Close", bg="#3a3a3a", fg="#98c379",
+            activebackground="#444", relief="flat", cursor="hand2", bd=0,
+            font=("Helvetica", 9), state="disabled",
+            command=self._on_gripper_close)
+        self._gripper_close_btn.pack(side="left", fill="x", expand=True, ipady=5, padx=(0,2))
+        self._gripper_open_btn = tk.Button(
+            r_grip, text="Gripper Open", bg="#3a3a3a", fg="#e06c75",
+            activebackground="#444", relief="flat", cursor="hand2", bd=0,
+            font=("Helvetica", 9), state="disabled",
+            command=self._on_gripper_open)
+        self._gripper_open_btn.pack(side="left", fill="x", expand=True, ipady=5, padx=(2,0))
         _sep()
 
         _lbl("Positions")
@@ -2474,8 +2503,10 @@ class GraspExecuteApp:
             self._robot_status.config(text="-- Disconnected", fg="#e06c75")
             self._connect_btn.config(text=">>  Connect Robot")
             for btn in (self._execute_btn, self._home_btn, self._save_home_btn,
-                        self._save_sort_btn, self._go_sort_btn, self._recover_btn):
+                        self._save_sort_btn, self._go_sort_btn, self._recover_btn,
+                        self._gripper_close_btn, self._gripper_open_btn):
                 btn.config(state="disabled")
+            self._tool_status.config(text="", fg="#555")
             return
         ip = self._ip_var.get().strip()
         self._connect_btn.config(state="disabled", text="Connecting…")
@@ -2506,22 +2537,42 @@ class GraspExecuteApp:
                 robot.enable();      time.sleep(2.0)
             # Set default speed (low for safety)
             robot.set_speed(15)
+            # Attach tool driver if selected
+            tool_name = self._tool_var.get()
+            tool_msg = ""
+            if tool_name and tool_name != "(built-in / none)":
+                try:
+                    self._log(f"[Tool] Attaching '{tool_name}'…")
+                    tool = create_tool(tool_name, robot=robot)
+                    robot.attach_tool(tool)
+                    tool_msg = f"Tool: {tool_name}"
+                    self._log(f"[Tool] '{tool_name}' attached OK")
+                except Exception as te:
+                    tool_msg = f"Tool FAILED: {te}"
+                    self._log(f"[Tool] Attach failed: {te}")
             self._robot = robot
             self._robot_connected = True
             self._log(f"[Robot] Ready  mode={robot.get_mode()}")
-            self._cb_queue.put(self._on_robot_connected_ui)
+            self._cb_queue.put(lambda m=tool_msg: self._on_robot_connected_ui(m))
         except Exception as e:
             self._log(f"[Robot] Connection failed: {e}")
             self._cb_queue.put(lambda err=e: (
                 self._robot_status.config(text=f"-- Error: {err}", fg="#e06c75"),
                 self._connect_btn.config(state="normal", text=">>  Connect Robot")))
 
-    def _on_robot_connected_ui(self):
+    def _on_robot_connected_ui(self, tool_msg: str = ""):
         self._robot_status.config(
             text=f"-- {self._robot_type_var.get()} @ {self._ip_var.get()}", fg="#98c379")
+        if tool_msg:
+            color = "#e06c75" if "FAILED" in tool_msg else "#98c379"
+            self._tool_status.config(text=tool_msg, fg=color)
+        else:
+            self._tool_status.config(text="-- built-in / no tool", fg="#555")
         self._connect_btn.config(state="normal", text="Disconnect")
         self._home_btn.config(state="normal")
         self._recover_btn.config(state="normal")
+        self._gripper_close_btn.config(state="normal")
+        self._gripper_open_btn.config(state="normal")
         self._save_home_btn.config(state="normal")
         self._save_sort_btn.config(state="normal")
         if self._sort_joints is not None:
@@ -3234,6 +3285,30 @@ class GraspExecuteApp:
             return
         speed = int(self._speed_var.get())
         threading.Thread(target=self._home_worker, args=(speed,), daemon=True).start()
+
+    def _on_gripper_close(self):
+        if not self._robot_connected:
+            return
+        def _worker():
+            try:
+                self._log("[Gripper] Closing…")
+                self._robot.vacuum_on()
+                self._log("[Gripper] Closed.")
+            except Exception as e:
+                self._log(f"[Gripper] Close error: {e}")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_gripper_open(self):
+        if not self._robot_connected:
+            return
+        def _worker():
+            try:
+                self._log("[Gripper] Opening…")
+                self._robot.vacuum_off()
+                self._log("[Gripper] Opened.")
+            except Exception as e:
+                self._log(f"[Gripper] Open error: {e}")
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _ensure_enabled(self):
         """Re-enable the robot if it slipped into error/disabled state."""

@@ -547,13 +547,13 @@ class HandEyeCalibApp:
         row2 = tk.Frame(mid, bg="#2d2d2d"); row2.pack(fill="x", padx=12, pady=2)
         tk.Label(row2, text="Square (m):", bg="#2d2d2d", fg="#ccc",
                  font=("Helvetica", 9), width=11, anchor="w").pack(side="left")
-        self._sq_len_var = tk.StringVar(value="0.030")
+        self._sq_len_var = tk.StringVar(value="0.0245")
         tk.Entry(row2, textvariable=self._sq_len_var, width=8,
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left", padx=(0,8))
         tk.Label(row2, text="Marker (m):", bg="#2d2d2d", fg="#ccc",
                  font=("Helvetica", 9)).pack(side="left")
-        self._mk_len_var = tk.StringVar(value="0.022")
+        self._mk_len_var = tk.StringVar(value="0.0165")
         tk.Entry(row2, textvariable=self._mk_len_var, width=8,
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left")
@@ -682,6 +682,14 @@ class HandEyeCalibApp:
             right, text="● Disconnected",
             bg="#252525", fg="#e06c75", font=("Courier", 9))
         self._robot_status.pack(anchor="w", padx=12, pady=(0,4))
+
+        self._freedrive_btn = tk.Button(
+            right, text="✋  Freedrive OFF",
+            bg="#3a3a3a", fg="#888", activebackground="#444",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+            state="disabled", command=self._on_freedrive_toggle)
+        self._freedrive_btn.pack(padx=12, pady=(0,4), fill="x", ipady=4)
+        self._freedrive_active = False
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=6)
 
@@ -920,7 +928,7 @@ class HandEyeCalibApp:
             mk_len = float(self._mk_len_var.get())
         except ValueError:
             self._log("[Board] Invalid parameters — using defaults")
-            sq_x, sq_y, sq_len, mk_len = 5, 7, 0.030, 0.022
+            sq_x, sq_y, sq_len, mk_len = 5, 7, 0.0245, 0.0165
 
         self._aruco_dict, self._board = make_board(sq_x, sq_y, sq_len, mk_len)
         self._detector = make_charuco_detector(self._board)
@@ -1095,7 +1103,13 @@ class HandEyeCalibApp:
     # ------------------------------------------------------------------
     def _on_connect(self):
         if self._robot_connected:
-            # Disconnect
+            # Disconnect — stop freedrive first if active
+            if self._freedrive_active and self._robot and hasattr(self._robot, "freedrive_stop"):
+                try:
+                    self._robot.freedrive_stop()
+                except Exception:
+                    pass
+                self._freedrive_active = False
             if self._robot:
                 try:
                     self._robot.close()
@@ -1105,6 +1119,8 @@ class HandEyeCalibApp:
             self._robot_connected = False
             self._robot_status.config(text="● Disconnected", fg="#e06c75")
             self._connect_btn.config(text="⚡  Connect Robot", bg="#4a5568")
+            self._freedrive_btn.config(state="disabled", text="✋  Freedrive OFF",
+                                       bg="#3a3a3a", fg="#888")
             self._log("[Robot] Disconnected.")
             return
         ip = self._robot_ip_var.get().strip()
@@ -1151,6 +1167,37 @@ class HandEyeCalibApp:
         ip = self._robot_ip_var.get()
         self._robot_status.config(text=f"● Connected  {ip}", fg="#98c379")
         self._connect_btn.config(state="normal", text="⏏  Disconnect", bg="#3a6048")
+        # Enable freedrive button only if robot supports it
+        if hasattr(self._robot, "freedrive_start"):
+            self._freedrive_btn.config(state="normal", fg="#e5c07b")
+        else:
+            self._freedrive_btn.config(state="disabled", fg="#555",
+                                       text="✋  Freedrive (UR only)")
+
+    def _on_freedrive_toggle(self):
+        if not self._robot_connected or self._robot is None:
+            return
+        if not hasattr(self._robot, "freedrive_start"):
+            return
+        def _worker():
+            try:
+                if not self._freedrive_active:
+                    self._robot.freedrive_start()
+                    self._freedrive_active = True
+                    self._log("[Freedrive] ON — move robot by hand")
+                    self._ui(lambda: self._freedrive_btn.config(
+                        text="✋  Freedrive ON  (click to stop)",
+                        bg="#5a3a6a", fg="#c678dd"))
+                else:
+                    self._robot.freedrive_stop()
+                    self._freedrive_active = False
+                    self._log("[Freedrive] OFF")
+                    self._ui(lambda: self._freedrive_btn.config(
+                        text="✋  Freedrive OFF",
+                        bg="#3a3a3a", fg="#e5c07b"))
+            except Exception as e:
+                self._log(f"[Freedrive] Error: {e}")
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Board param handlers
