@@ -404,7 +404,14 @@ def solve_hand_eye(robot_poses: list, board_poses: list) -> dict:
 
 
 def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
-                     robot_poses: list, board_poses: list, output: Path):
+                     robot_poses: list, board_poses: list, output: Path,
+                     name: str = ""):
+    """Save calibration result.
+
+    If *name* is given, saves as ``hand_eye_calib_{name}.npz`` (named save).
+    Always saves a timestamped backup.  If no name, also overwrites the
+    default ``hand_eye_calib.npz``.
+    """
     output.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     data = dict(T_cam2base=result["T"], R_cam2base=result["R"], t_cam2base=result["t"],
@@ -412,8 +419,6 @@ def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
                 robot_poses=np.array(robot_poses),
                 board_rvecs=np.array([p[0].ravel() for p in board_poses]),
                 board_tvecs=np.array([p[1].ravel() for p in board_poses]))
-    np.savez(str(output / "hand_eye_calib.npz"), **data)
-    np.savez(str(output / f"hand_eye_calib_{ts}.npz"), **data)
     json_data = {
         "timestamp": ts, "n_poses": len(robot_poses), "primary_method": result["primary"],
         "T_cam2base": result["T"].tolist(),
@@ -424,9 +429,20 @@ def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
             for k, (R, t) in result["all"].items() if result["all"][k] is not None
         },
     }
-    with open(output / "hand_eye_calib.json", "w") as f:
-        json.dump(json_data, f, indent=2)
-    return ts
+    # Always save timestamped backup
+    np.savez(str(output / f"hand_eye_calib_{ts}.npz"), **data)
+    name = name.strip() if name else ""
+    if name:
+        # Named save
+        np.savez(str(output / f"hand_eye_calib_{name}.npz"), **data)
+        with open(output / f"hand_eye_calib_{name}.json", "w") as f:
+            json.dump(json_data, f, indent=2)
+    else:
+        # Default: overwrite the main file
+        np.savez(str(output / "hand_eye_calib.npz"), **data)
+        with open(output / "hand_eye_calib.json", "w") as f:
+            json.dump(json_data, f, indent=2)
+    return ts, name
 
 
 # ===========================================================================
@@ -562,6 +578,24 @@ class HandEyeCalibApp:
         # --- Auto-Mode Positions ---
         self._section(mid, "Auto-Mode Positions")
 
+        # Pose set selector
+        r_set = tk.Frame(mid, bg="#2d2d2d"); r_set.pack(fill="x", padx=12, pady=(0,4))
+        tk.Label(r_set, text="Set:", bg="#2d2d2d", fg="#ccc",
+                 font=("Helvetica", 9), width=5, anchor="w").pack(side="left")
+        self._pose_set_var = tk.StringVar(value="default")
+        self._pose_set_combo = ttk.Combobox(r_set, textvariable=self._pose_set_var,
+                                             font=("Helvetica", 9), width=12)
+        self._pose_set_combo.pack(side="left", fill="x", expand=True, ipady=2, padx=(0,3))
+        self._pose_set_combo.bind("<<ComboboxSelected>>", self._on_pose_set_selected)
+        tk.Button(r_set, text="Save", bg="#3a3a3a", fg="#98c379",
+                  activebackground="#444", relief="flat", cursor="hand2", bd=0,
+                  font=("Helvetica", 8), padx=4,
+                  command=self._on_save_pose_set).pack(side="left", ipady=2)
+        tk.Button(r_set, text="Load", bg="#3a3a3a", fg="#61afef",
+                  activebackground="#444", relief="flat", cursor="hand2", bd=0,
+                  font=("Helvetica", 8), padx=4,
+                  command=self._on_load_pose_set).pack(side="left", padx=(3,0), ipady=2)
+
         poses_hdr = tk.Frame(mid, bg="#2d2d2d"); poses_hdr.pack(fill="x", padx=12, pady=(0,2))
         self._poses_count_lbl = tk.Label(
             poses_hdr, text="0 saved  (will use built-in 15 poses)",
@@ -649,21 +683,6 @@ class HandEyeCalibApp:
             bg="#252525", fg="#e06c75", font=("Courier", 9))
         self._robot_status.pack(anchor="w", padx=12, pady=(0,4))
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
-
-        # Vacuum buttons
-        vac_row = tk.Frame(right, bg="#252525"); vac_row.pack(fill="x", padx=12, pady=(4,2))
-        tk.Label(vac_row, text="Vacuum DO1:", bg="#252525", fg="#ccc",
-                 font=("Helvetica", 9), width=10, anchor="w").pack(side="left")
-        tk.Button(vac_row, text="ON",
-                  bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a55f",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9, "bold"),
-                  width=5, command=self._on_vacuum_on).pack(side="left", padx=(0,4), ipady=3)
-        tk.Button(vac_row, text="OFF",
-                  bg="#3a3a3a", fg="#ccc", activebackground="#444",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
-                  width=5, command=self._on_vacuum_off).pack(side="left", ipady=3)
-
         ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=6)
 
         # --- Calibration ---
@@ -733,6 +752,17 @@ class HandEyeCalibApp:
                                      activebackground="#444", relief="flat", cursor="hand2",
                                      font=("Helvetica", 8), command=self._on_clear_poses)
         self._clear_btn.pack(side="right")
+
+        # Calibration save name
+        r_cname = tk.Frame(right, bg="#252525"); r_cname.pack(fill="x", padx=12, pady=(2,4))
+        tk.Label(r_cname, text="Save as:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=8, anchor="w").pack(side="left")
+        self._calib_name_var = tk.StringVar(value="")
+        tk.Entry(r_cname, textvariable=self._calib_name_var, width=15,
+                 bg="#3a3a3a", fg="white", insertbackground="white",
+                 relief="flat", font=("Helvetica", 9)).pack(side="left", fill="x", expand=True, ipady=2)
+        tk.Label(r_cname, text="(empty = default)", bg="#252525", fg="#555",
+                 font=("Helvetica", 7)).pack(side="left", padx=(4,0))
 
         self._solve_btn = tk.Button(
             right, text="✓  Solve Calibration",
@@ -905,12 +935,61 @@ class HandEyeCalibApp:
     # Event handlers
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # Auto-mode pose management
+    # Auto-mode pose management (named pose sets)
     # ------------------------------------------------------------------
-    def _load_auto_poses(self):
+    def _poses_file_path(self, name: str = None) -> Path:
+        """Return the file path for a named pose set."""
+        if name is None:
+            name = self._pose_set_var.get().strip()
+        if not name or name == "default":
+            return SAVED_POSES_FILE  # auto_calib_poses.json
+        return OUTPUT_DIR / f"auto_calib_poses_{name}.json"
+
+    def _refresh_pose_sets(self):
+        """Scan for available pose set files and update combo."""
+        sets = []
+        if SAVED_POSES_FILE.exists():
+            sets.append("default")
+        for f in sorted(OUTPUT_DIR.glob("auto_calib_poses_*.json")):
+            name = f.stem.replace("auto_calib_poses_", "")
+            if name:
+                sets.append(name)
         try:
-            if SAVED_POSES_FILE.exists():
-                with open(SAVED_POSES_FILE, "r") as f:
+            self._pose_set_combo["values"] = sets
+        except Exception:
+            pass
+
+    def _on_pose_set_selected(self, *_):
+        """When a pose set is selected from the combo, load it."""
+        self._load_auto_poses()
+
+    def _on_save_pose_set(self):
+        """Save current poses under the name in the combo."""
+        name = self._pose_set_var.get().strip()
+        if not name:
+            self._log("[Poses] Enter a pose set name first.")
+            return
+        self._save_auto_poses()
+        self._refresh_pose_sets()
+        self._log(f"[Poses] Saved pose set '{name}' ({len(self._auto_poses)} poses)")
+
+    def _on_load_pose_set(self):
+        """Load poses from the selected set name."""
+        name = self._pose_set_var.get().strip()
+        if not name:
+            self._log("[Poses] Select a pose set first.")
+            return
+        path = self._poses_file_path(name)
+        if not path.exists():
+            self._log(f"[Poses] Pose set '{name}' not found: {path}")
+            return
+        self._load_auto_poses()
+
+    def _load_auto_poses(self):
+        poses_file = self._poses_file_path()
+        try:
+            if poses_file.exists():
+                with open(poses_file, "r") as f:
                     data = json.load(f)
                 raw = data.get("poses", [])
                 # Support both old format (plain list) and new format (dict with joints)
@@ -922,17 +1001,21 @@ class HandEyeCalibApp:
                         self._auto_poses.append({"cartesian": p, "joints": None})
                     else:
                         continue
-                self._log(f"[Poses] Loaded {len(self._auto_poses)} saved positions")
+                name = self._pose_set_var.get().strip() or "default"
+                self._log(f"[Poses] Loaded {len(self._auto_poses)} positions from set '{name}'")
             else:
+                self._auto_poses = []
                 self._log(f"[Poses] No saved positions file — will use built-in {len(CALIB_POSES)} poses")
         except Exception as e:
             self._log(f"[Poses] Load error: {e}")
         self._update_poses_listbox()
+        self._refresh_pose_sets()
 
     def _save_auto_poses(self):
         try:
-            SAVED_POSES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(SAVED_POSES_FILE, "w") as f:
+            poses_file = self._poses_file_path()
+            poses_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(poses_file, "w") as f:
                 json.dump({"poses": self._auto_poses}, f, indent=2)
         except Exception as e:
             self._log(f"[Poses] Save error: {e}")
@@ -1068,26 +1151,6 @@ class HandEyeCalibApp:
         ip = self._robot_ip_var.get()
         self._robot_status.config(text=f"● Connected  {ip}", fg="#98c379")
         self._connect_btn.config(state="normal", text="⏏  Disconnect", bg="#3a6048")
-
-    # ------------------------------------------------------------------
-    # Vacuum handlers
-    # ------------------------------------------------------------------
-    def _on_vacuum_on(self):
-        ip = self._robot_ip_var.get().strip()
-        threading.Thread(target=self._vacuum_cmd, args=(ip, True), daemon=True).start()
-
-    def _on_vacuum_off(self):
-        ip = self._robot_ip_var.get().strip()
-        threading.Thread(target=self._vacuum_cmd, args=(ip, False), daemon=True).start()
-
-    def _vacuum_cmd(self, ip: str, on: bool):
-        try:
-            if not (self._robot_connected and self._robot):
-                raise RuntimeError("Robot not connected")
-            resp = self._robot.vacuum_on() if on else self._robot.vacuum_off()
-            self._log(f"[Vacuum] {'ON' if on else 'OFF'}  resp={resp}")
-        except Exception as e:
-            self._log(f"[Vacuum] Error: {e}")
 
     # ------------------------------------------------------------------
     # Board param handlers
@@ -1534,8 +1597,10 @@ class HandEyeCalibApp:
         try:
             self._log(f"[Solve] Running with {len(self._robot_poses)} poses…")
             result = solve_hand_eye(self._robot_poses, self._board_poses)
-            ts = save_calibration(result, self._K, self._d,
-                                  self._robot_poses, self._board_poses, OUTPUT_DIR)
+            calib_name = self._calib_name_var.get().strip()
+            ts, saved_name = save_calibration(result, self._K, self._d,
+                                              self._robot_poses, self._board_poses,
+                                              OUTPUT_DIR, name=calib_name)
             T = result["T"]
             t_mm = result["t"].ravel()
             primary_r, primary_t = result["residuals"][result["primary"]]
@@ -1546,17 +1611,20 @@ class HandEyeCalibApp:
                 e = Rotation.from_matrix(result["R"]).as_euler("ZYX", degrees=True)
                 self._log(f"[Result] R ZYX = [{e[0]:.2f}, {e[1]:.2f}, {e[2]:.2f}] deg")
             self._log(f"[Result] T_cam2base:\n{np.array2string(T, precision=3, suppress_small=True)}")
-            self._log(f"[Result] Saved to {OUTPUT_DIR}/hand_eye_calib.npz + .json")
+            if saved_name:
+                self._log(f"[Result] Saved as '{saved_name}' → hand_eye_calib_{saved_name}.npz")
+            else:
+                self._log(f"[Result] Saved to {OUTPUT_DIR}/hand_eye_calib.npz + .json")
             quality = "GOOD" if primary_t < 3.0 else ("ACCEPTABLE" if primary_t < 8.0 else "POOR — recollect poses")
             self._set_status(f"Calibration done! [{quality}]  residual={primary_t:.2f}mm  "
                              f"t=[{t_mm[0]:.1f},{t_mm[1]:.1f},{t_mm[2]:.1f}]mm")
             self._log("[All methods — translation residual (lower = better)]")
-            for name, val in result["all"].items():
+            for mname, val in result["all"].items():
                 if val:
                     R, t = val
-                    r_res, t_res = result["residuals"][name]
-                    marker = " ← selected" if name == result["primary"] else ""
-                    self._log(f"  {name:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm  "
+                    r_res, t_res = result["residuals"][mname]
+                    marker = " ← selected" if mname == result["primary"] else ""
+                    self._log(f"  {mname:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm  "
                               f"residual={t_res:.2f}mm{marker}")
         except Exception as e:
             self._log(f"[Solve] ERROR: {e}")

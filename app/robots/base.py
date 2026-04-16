@@ -24,6 +24,9 @@ class RobotBase(ABC):
     MODE_ERROR:   int = -2   # robot is in an error / protective-stop state
     MODE_ENABLED: int = -3   # robot is idle and ready to accept commands
 
+    # Attached tool (set via attach_tool(); None = no tool)
+    _tool = None
+
     @abstractmethod
     def __init__(self, ip: str, **kwargs):
         """Connect to the robot at *ip*.  Raise on failure."""
@@ -96,13 +99,44 @@ class RobotBase(ABC):
         """
 
     # ── End-effector ─────────────────────────────────────────────────────
-    @abstractmethod
-    def vacuum_on(self, port: int = 0):
-        """Activate the vacuum / gripper."""
+    def attach_tool(self, tool):
+        """Attach an end-effector tool (``ToolBase`` instance).
 
-    @abstractmethod
+        After attaching, ``vacuum_on()`` calls ``tool.grasp()`` and
+        ``vacuum_off()`` calls ``tool.release()`` — unless the subclass
+        overrides those methods.
+
+        Pass ``None`` to detach the current tool.
+        """
+        if tool is not None:
+            print(f"[{type(self).__name__}] Tool attached: {tool.tool_name}", flush=True)
+        self._tool = tool
+
+    def vacuum_on(self, port: int = 0):
+        """Activate the vacuum / gripper.
+
+        Default: delegates to the attached tool's ``grasp()``.
+        Override in subclass for robot-specific direct control.
+        """
+        if self._tool is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.vacuum_on(): no tool attached. "
+                "Call robot.attach_tool(tool) first, or override vacuum_on()."
+            )
+        self._tool.grasp()
+
     def vacuum_off(self, port: int = 0):
-        """Deactivate the vacuum / gripper."""
+        """Deactivate the vacuum / gripper.
+
+        Default: delegates to the attached tool's ``release()``.
+        Override in subclass for robot-specific direct control.
+        """
+        if self._tool is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.vacuum_off(): no tool attached. "
+                "Call robot.attach_tool(tool) first, or override vacuum_off()."
+            )
+        self._tool.release()
 
     # ── Optional helpers (default implementations) ───────────────────────
     def wait_idle(self, timeout: float = 90.0) -> bool:

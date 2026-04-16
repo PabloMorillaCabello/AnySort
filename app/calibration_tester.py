@@ -546,10 +546,12 @@ class CalibTesterApp:
         lf = tk.LabelFrame(parent, text="Connections")
         lf.pack(fill=tk.X, pady=(0, 4))
 
-        # Calibration file row
+        # Calibration file row — combo showing available files + Browse
         tk.Label(lf, text="Calibration:").grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self._calib_var = tk.StringVar(value=self._calib_path)
-        tk.Entry(lf, textvariable=self._calib_var, width=35).grid(row=0, column=1, padx=2)
+        self._calib_combo_t = ttk.Combobox(lf, textvariable=self._calib_var, width=33)
+        self._calib_combo_t.grid(row=0, column=1, padx=2)
+        self._refresh_calib_combo_t()
         tk.Button(lf, text="Browse…", command=self._browse_calib).grid(row=0, column=2, padx=2)
         tk.Button(lf, text="Load", command=self._load_calib,
                   bg="#3a7fc1", fg="white").grid(row=0, column=3, padx=2)
@@ -692,6 +694,17 @@ class CalibTesterApp:
         self.root.after(0, lambda: self._status_lbl.config(text=msg))
 
     # -------------------------------------------------------- calibration IO
+    def _refresh_calib_combo_t(self):
+        """Populate the calibration combobox with available .npz files."""
+        files = []
+        if CALIB_DIR.is_dir():
+            for f in sorted(CALIB_DIR.glob("hand_eye_calib*.npz")):
+                files.append(str(f))
+        try:
+            self._calib_combo_t["values"] = files
+        except Exception:
+            pass
+
     def _browse_calib(self):
         path = filedialog.askopenfilename(
             title="Select calibration .npz",

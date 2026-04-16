@@ -221,17 +221,13 @@ class UR10(RobotBase):
         raise TimeoutError(f"Motion timeout after {timeout:.0f}s")
 
     # ── End-effector ─────────────────────────────────────────────────────
-    def vacuum_on(self, port: int = 0):
-        """Activate digital output for vacuum.
-
-        Default port=0 maps to digital_out[0].  Adjust for your wiring.
-        """
-        self._rtde_c.setStandardDigitalOut(port, True)
-        print(f"[UR10] vacuum_on  DO({port})=True", flush=True)
-
-    def vacuum_off(self, port: int = 0):
-        self._rtde_c.setStandardDigitalOut(port, False)
-        print(f"[UR10] vacuum_off DO({port})=False", flush=True)
+    # vacuum_on / vacuum_off are inherited from RobotBase and delegate to
+    # the attached tool (e.g. OnRobotGripper).
+    # Call robot.attach_tool(tool) before executing a grasp.
+    #
+    # Example:
+    #   from tools.onrobot import OnRobotGripper
+    #   robot.attach_tool(OnRobotGripper(ip="192.168.1.1", model="RG2"))
 
     # ── Reachability ─────────────────────────────────────────────────────
     def check_reachability(self, x, y, z, rx, ry, rz):

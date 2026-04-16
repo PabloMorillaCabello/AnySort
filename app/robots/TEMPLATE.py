@@ -75,8 +75,15 @@ class MyRobot(RobotBase):
         # Raise TimeoutError on timeout
         raise NotImplementedError
 
-    def vacuum_on(self, port: int = 0):
-        raise NotImplementedError
-
-    def vacuum_off(self, port: int = 0):
-        raise NotImplementedError
+    # ── End-effector ─────────────────────────────────────────────────────
+    # Option A (recommended): rely on RobotBase delegation.
+    #   Attach a tool with robot.attach_tool(tool) — vacuum_on/off are
+    #   handled automatically via tool.grasp() / tool.release().
+    #
+    # Option B: override directly (e.g. robot has built-in IO for gripper):
+    #
+    # def vacuum_on(self, port: int = 0):
+    #     raise NotImplementedError
+    #
+    # def vacuum_off(self, port: int = 0):
+    #     raise NotImplementedError

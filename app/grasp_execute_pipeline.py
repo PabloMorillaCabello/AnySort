@@ -805,6 +805,36 @@ class GraspExecuteApp:
         except Exception as e:
             self._log(f"[Calib] camera_intrinsics.npz not found — using SDK intrinsics (no distortion correction)")
 
+    def _refresh_calib_combo(self):
+        """Scan data/calibration/ for .npz calibration files and populate combo."""
+        calib_dir = Path(self.args.calib_file).parent
+        files = []
+        if calib_dir.is_dir():
+            for f in sorted(calib_dir.glob("hand_eye_calib*.npz")):
+                files.append(f.name)
+        try:
+            self._calib_combo["values"] = files
+            # Set current selection to match loaded file
+            current = Path(self.args.calib_file).name
+            if current in files:
+                self._calib_combo.set(current)
+            elif files:
+                self._calib_combo.set(files[0])
+        except Exception:
+            pass
+
+    def _on_calib_selected(self, *_):
+        """User picked a different calibration file from the combo."""
+        selected = self._calib_combo.get()
+        if not selected:
+            return
+        calib_dir = Path(self.args.calib_file).parent
+        new_path = str(calib_dir / selected)
+        if new_path == self.args.calib_file:
+            return
+        self.args.calib_file = new_path
+        self._load_calibration()
+
     def _start_config_if_available(self):
         if self._loaded_config_name and self._sampler:
             # Already pre-loaded from splash — just update combo + hints
@@ -1022,7 +1052,16 @@ class GraspExecuteApp:
         self._calib_status = tk.Label(p, text="Loading calibration...",
                                        bg=bg, fg="#888",
                                        font=("Courier", 8), wraplength=240, anchor="w")
-        self._calib_status.pack(anchor="w", padx=10, pady=(0,4))
+        self._calib_status.pack(anchor="w", padx=10, pady=(0,2))
+
+        # Calibration file selector
+        r_cal = tk.Frame(p, bg=bg); r_cal.pack(fill="x", padx=10, pady=(0,4))
+        tk.Label(r_cal, text="Calib:", bg=bg, fg="#ccc",
+                 font=("Helvetica", 8), anchor="w").pack(side="left")
+        self._calib_combo = ttk.Combobox(r_cal, font=("Helvetica", 8), width=28)
+        self._calib_combo.pack(side="left", fill="x", expand=True, ipady=1, padx=(4,3))
+        self._calib_combo.bind("<<ComboboxSelected>>", self._on_calib_selected)
+        self._refresh_calib_combo()
         _sep()
 
         _lbl("Gripper / Tool:")
