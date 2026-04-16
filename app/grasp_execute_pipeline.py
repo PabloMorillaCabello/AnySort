@@ -806,21 +806,31 @@ class GraspExecuteApp:
         except Exception as e:
             self._log(f"[Calib] camera_intrinsics.npz not found — using SDK intrinsics (no distortion correction)")
 
+    @staticmethod
+    def _calib_label(stem: str) -> str:
+        """Convert a file stem to a short display label."""
+        if stem == "hand_eye_calib":
+            return "(default)"
+        if stem.startswith("hand_eye_calib_"):
+            return stem[len("hand_eye_calib_"):]
+        return stem
+
     def _refresh_calib_combo(self):
-        """Scan data/calibration/ for .npz calibration files and populate combo."""
+        """Scan data/calibration/ for .npz files and populate combo with short labels."""
+        self._calib_file_map: dict = {}  # display label → filename
         calib_dir = Path(self.args.calib_file).parent
-        files = []
         if calib_dir.is_dir():
             for f in sorted(calib_dir.glob("hand_eye_calib*.npz")):
-                files.append(f.name)
+                label = self._calib_label(f.stem)
+                self._calib_file_map[label] = f.name
         try:
-            self._calib_combo["values"] = files
-            # Set current selection to match loaded file
-            current = Path(self.args.calib_file).name
-            if current in files:
-                self._calib_combo.set(current)
-            elif files:
-                self._calib_combo.set(files[0])
+            labels = list(self._calib_file_map.keys())
+            self._calib_combo["values"] = labels
+            current_label = self._calib_label(Path(self.args.calib_file).stem)
+            if current_label in labels:
+                self._calib_combo.set(current_label)
+            elif labels:
+                self._calib_combo.set(labels[0])
         except Exception:
             pass
 
@@ -829,8 +839,9 @@ class GraspExecuteApp:
         selected = self._calib_combo.get()
         if not selected:
             return
+        filename = self._calib_file_map.get(selected, selected)
         calib_dir = Path(self.args.calib_file).parent
-        new_path = str(calib_dir / selected)
+        new_path = str(calib_dir / filename)
         if new_path == self.args.calib_file:
             return
         self.args.calib_file = new_path
@@ -2672,8 +2683,14 @@ class GraspExecuteApp:
         time.sleep(0.3)
 
         self._log(f"[Execute] Pre-grasp  X={x_pre:.1f} Y={y_pre:.1f} Z={z_pre:.1f} mm")
-        self._set_status("MovL → pre-grasp…")
-        cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
+        self._set_status("MovJ → pre-grasp…")
+        # Use move_joint_nearest to avoid J1 full-rotation when IK picks a
+        # configuration far from the current one (short Cartesian distance ≠
+        # short joint distance for the Dobot solver).
+        if hasattr(robot, "move_joint_nearest"):
+            cmd_id = robot.move_joint_nearest(x_pre, y_pre, z_pre, rx, ry, rz)
+        else:
+            cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
         robot.wait_motion(cmd_id)
 
         self._log(f"[Execute] Grasp      X={x:.1f} Y={y:.1f} Z={z:.1f} mm")

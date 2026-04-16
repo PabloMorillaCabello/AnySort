@@ -88,14 +88,19 @@ class DobotCR(RobotBase):
 
     def close(self):
         self._feed_running = False
-        try:
-            self._dashboard.close()
-        except Exception:
-            pass
-        try:
-            self._feed.close()
-        except Exception:
-            pass
+        # dobot_api.py prints "Error while closing socket: [Errno 9]" internally
+        # when closing already-dead connections — suppress stdout for these calls.
+        import io, contextlib
+        _sink = io.StringIO()
+        with contextlib.redirect_stdout(_sink):
+            try:
+                self._dashboard.close()
+            except Exception:
+                pass
+            try:
+                self._feed.close()
+            except Exception:
+                pass
 
     # ── Status ───────────────────────────────────────────────────────────
     def get_mode(self) -> int:
@@ -125,6 +130,13 @@ class DobotCR(RobotBase):
         if len(nums) >= 6:
             return tuple(nums[:6])
         raise ValueError(f"Cannot parse joints — raw: {resp!r}")
+
+    def get_error_id(self) -> str:
+        """Return the raw GetErrorID response string for diagnostics."""
+        try:
+            return str(self._dashboard.GetErrorID())
+        except Exception as e:
+            return f"(GetErrorID failed: {e})"
 
     # ── Reachability ─────────────────────────────────────────────────────
     def check_reachability(self, x, y, z, rx, ry, rz):
@@ -199,6 +211,71 @@ class DobotCR(RobotBase):
         )
         return self._send_motion(resp)
 
+    def move_joint_angles_nearest(self, j1, j2, j3, j4, j5, j6) -> int:
+        """MovJ to joint-space target, normalising each axis to minimise travel.
+
+        ``move_joint_angles`` wraps each angle to [-180, 180] independently,
+        which can cause a ~360° spin when saved angles straddle the ±180°
+        boundary (e.g. stored as +183° → wraps to -177°, while the next pose
+        is stored as +177° → stays +177°, giving a 354° J1 rotation for what
+        is effectively a tiny move).
+
+        This method instead picks the equivalent angle closest to the current
+        joint position, guaranteeing the shortest arc per axis.
+        """
+        current = self.get_angle()
+        targets = (j1, j2, j3, j4, j5, j6)
+        nearest = []
+        for cur, tgt in zip(current, targets):
+            diff = ((tgt - cur) + 180.0) % 360.0 - 180.0
+            nearest.append(cur + diff)
+        fmt = lambda v: f"{v:+.2f}"
+        print(f"[DobotCR] nearest_angles  cur={[fmt(v) for v in current]}", flush=True)
+        print(f"[DobotCR] nearest_angles  tgt={[fmt(v) for v in targets]}", flush=True)
+        print(f"[DobotCR] nearest_angles  →  {[fmt(v) for v in nearest]}", flush=True)
+        resp = self._dashboard.MovJ(
+            nearest[0], nearest[1], nearest[2],
+            nearest[3], nearest[4], nearest[5],
+            1,          # coordinateMode=1 → joint angles
+            a=self._speed, v=self._speed
+        )
+        return self._send_motion(resp)
+
+    def move_joint_nearest(self, x, y, z, rx, ry, rz) -> int:
+        """MovJ to a Cartesian target, choosing the IK solution that minimises
+        joint travel from the current configuration.
+
+        The Dobot IK solver is deterministic and ignores the current joint state,
+        so it can return J1=+170° when the robot is at J1=-170°, causing a 340°
+        spin for a tiny Cartesian displacement.  This method:
+          1. Reads current joint angles.
+          2. Calls InverseKin for the target.
+          3. Normalises each IK joint to the nearest equivalent angle relative to
+             the current joints (shortest-path per axis).
+          4. Executes MovJ in joint-angle mode with the normalised angles.
+        Falls back to a standard Cartesian MovJ if InverseKin fails.
+        """
+        ok, ik_joints, _ = self.check_reachability(x, y, z, rx, ry, rz)
+        if not ok or ik_joints is None:
+            return self.move_joint(x, y, z, rx, ry, rz)
+
+        current = self.get_angle()
+
+        # For each axis, pick the equivalent angle closest to current position.
+        # diff is in (-180, +180], so cur+diff is always the short-arc target.
+        nearest = []
+        for cur, tgt in zip(current, ik_joints):
+            diff = ((tgt - cur) + 180.0) % 360.0 - 180.0
+            nearest.append(cur + diff)
+
+        resp = self._dashboard.MovJ(
+            nearest[0], nearest[1], nearest[2],
+            nearest[3], nearest[4], nearest[5],
+            1,          # coordinateMode=1 → joint angles
+            a=self._speed, v=self._speed
+        )
+        return self._send_motion(resp)
+
     def wait_motion(self, cmd_id: int, timeout: float = 90.0) -> bool:
         t0 = time.time()
         while time.time() - t0 < timeout:
@@ -208,7 +285,8 @@ class DobotCR(RobotBase):
             if cur_id > cmd_id or (mode == self.MODE_ENABLED and cur_id == cmd_id):
                 return True
             if mode == self.MODE_ERROR:
-                raise RuntimeError("Robot entered error state during motion")
+                err = self.get_error_id()
+                raise RuntimeError(f"Robot entered error state during motion — GetErrorID: {err}")
             time.sleep(0.1)
         raise TimeoutError(f"Motion timeout after {timeout:.0f}s (waiting for cmd {cmd_id})")
 

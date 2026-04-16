@@ -228,15 +228,24 @@ def save_corrected_calibration(original_path: str,
     """Save a new .npz and .json with the corrected T_cam2base."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Derive a short base name from the loaded file (strip hand_eye_calib_ prefix)
+    stem = Path(original_path).stem
+    if stem == "hand_eye_calib":
+        short = "default"
+    elif stem.startswith("hand_eye_calib_"):
+        short = stem[len("hand_eye_calib_"):]
+    else:
+        short = stem
+    backup_name = f"hand_eye_calib_{short}_backup_{ts}"
     # Load originals to preserve camera matrix etc.
     data = dict(np.load(original_path))
     data["T_cam2base"]   = T_corrected
     data["R_cam2base"]   = T_corrected[:3, :3]
     data["t_cam2base"]   = T_corrected[:3, 3]
     data["T_correction"] = T_correction
-    npz_path = out_dir / f"hand_eye_calib_corrected_{ts}.npz"
+    npz_path = out_dir / f"{backup_name}.npz"
     np.savez(str(npz_path), **data)
-    json_path = out_dir / f"hand_eye_calib_corrected_{ts}.json"
+    json_path = out_dir / f"{backup_name}.json"
     R = T_corrected[:3, :3]
     t = T_corrected[:3, 3]
     euler = Rotation.from_matrix(R).as_euler("ZYX", degrees=True).tolist() if _SCIPY_OK else []
@@ -506,6 +515,7 @@ class CalibTesterApp:
         self._robot_connected = False
         self._cam_dot_state  = "init"    # track last dot state to avoid redundant config
         self._robot_dot_state = "init"
+        self._calib_file_map: dict = {}  # display label → full path
 
         # 6-DOF correction variables
         self._cv = {k: tk.DoubleVar(value=0.0) for k in
@@ -694,14 +704,32 @@ class CalibTesterApp:
         self.root.after(0, lambda: self._status_lbl.config(text=msg))
 
     # -------------------------------------------------------- calibration IO
+    @staticmethod
+    def _calib_label(stem: str) -> str:
+        """Convert a file stem to a short display label."""
+        if stem == "hand_eye_calib":
+            return "(default)"
+        if stem.startswith("hand_eye_calib_"):
+            return stem[len("hand_eye_calib_"):]
+        return stem
+
     def _refresh_calib_combo_t(self):
-        """Populate the calibration combobox with available .npz files."""
-        files = []
+        """Populate the calibration combobox with short display labels."""
+        self._calib_file_map = {}
         if CALIB_DIR.is_dir():
             for f in sorted(CALIB_DIR.glob("hand_eye_calib*.npz")):
-                files.append(str(f))
+                label = self._calib_label(f.stem)
+                self._calib_file_map[label] = str(f)
         try:
-            self._calib_combo_t["values"] = files
+            labels = list(self._calib_file_map.keys())
+            self._calib_combo_t["values"] = labels
+            current_label = self._calib_label(Path(self._calib_path).stem)
+            if current_label in labels:
+                self._calib_combo_t.set(current_label)
+                self._calib_var.set(current_label)
+            elif labels:
+                self._calib_combo_t.set(labels[0])
+                self._calib_var.set(labels[0])
         except Exception:
             pass
 
@@ -713,7 +741,14 @@ class CalibTesterApp:
             self._calib_var.set(path)
 
     def _load_calib(self):
-        path = self._calib_var.get().strip()
+        selected = self._calib_var.get().strip()
+        # Resolve display label → full path
+        if selected in self._calib_file_map:
+            path = self._calib_file_map[selected]
+        elif os.path.isabs(selected) or os.path.isfile(selected):
+            path = selected
+        else:
+            path = str(CALIB_DIR / selected)
         if not os.path.isfile(path):
             messagebox.showerror("Error", f"File not found:\n{path}")
             return
@@ -968,28 +1003,27 @@ class CalibTesterApp:
         T_corr = self._get_correction_T()
         T_corrected = T_corr @ self._T_cam2base
         try:
-            npz_path, json_path = save_corrected_calibration(
-                self._calib_path, T_corrected, T_corr, CALIB_DIR)
-            self._log_msg("Saved corrected calibration:")
-            self._log_msg(f"  {npz_path}")
-            self._log_msg(f"  {json_path}")
-
-            # Ask whether to overwrite the main calibration so all tools pick it up
-            overwrite = messagebox.askyesno(
-                "Overwrite main calibration?",
-                f"Overwrite the main calibration file used by the pipeline?\n\n"
-                f"  {self._calib_path}\n\n"
-                "Yes → pipeline will use the corrected calibration immediately.\n"
-                "No  → only the timestamped backup is saved.")
-            if overwrite:
-                import shutil
-                shutil.copy2(str(npz_path), self._calib_path)
-                # Also update the .json sidecar (same name, .json extension)
-                json_main = str(Path(self._calib_path).with_suffix(".json"))
-                shutil.copy2(str(json_path), json_main)
-                self._log_msg(f"Main calibration overwritten: {self._calib_path}")
-                # Reload so the tester itself uses the corrected matrix
-                self._T_cam2base = T_corrected
+            # Overwrite the loaded file in-place — preserve all existing keys.
+            data = dict(np.load(self._calib_path))
+            data["T_cam2base"]   = T_corrected
+            data["R_cam2base"]   = T_corrected[:3, :3]
+            data["t_cam2base"]   = T_corrected[:3, 3]
+            data["T_correction"] = T_corr
+            np.savez(self._calib_path, **data)
+            # Update JSON sidecar
+            json_path = str(Path(self._calib_path).with_suffix(".json"))
+            t = T_corrected[:3, 3]
+            euler = Rotation.from_matrix(T_corrected[:3, :3]).as_euler(
+                "ZYX", degrees=True).tolist() if _SCIPY_OK else []
+            with open(json_path, "w") as f:
+                json.dump({
+                    "T_cam2base":    T_corrected.tolist(),
+                    "t_cam2base_mm": t.tolist(),
+                    "euler_ZYX_deg": euler,
+                    "T_correction":  T_corr.tolist(),
+                }, f, indent=2)
+            self._T_cam2base = T_corrected
+            self._log_msg(f"Saved → {self._calib_path}")
         except Exception as ex:
             messagebox.showerror("Save error", str(ex))
 

@@ -37,7 +37,9 @@
       "WebSearch",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:www.universal-robots.com)",
-      "WebFetch(domain:aydos.de)"
+      "WebFetch(domain:aydos.de)",
+      "Read(//c//**)",
+      "Bash(ls:*)"
     ]
   }
 }

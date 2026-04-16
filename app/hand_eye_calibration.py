@@ -769,7 +769,7 @@ class HandEyeCalibApp:
         tk.Entry(r_cname, textvariable=self._calib_name_var, width=15,
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left", fill="x", expand=True, ipady=2)
-        tk.Label(r_cname, text="(empty = default)", bg="#252525", fg="#555",
+        tk.Label(r_cname, text="e.g. Dobot, UR10", bg="#252525", fg="#555",
                  font=("Helvetica", 7)).pack(side="left", padx=(4,0))
 
         self._solve_btn = tk.Button(
@@ -1481,7 +1481,11 @@ class HandEyeCalibApp:
                     joints = None
                     cart = list(entry)
 
-                self._log(f"[Auto] Pose {idx+1}/{len(poses_to_use)}: {cart}")
+                if joints is not None:
+                    _pose_str = f"J={[round(v,2) for v in joints]}"
+                else:
+                    _pose_str = f"cart={[round(v,2) for v in cart]}"
+                self._log(f"[Auto] Pose {idx+1}/{len(poses_to_use)}: {_pose_str}")
                 self._set_status(f"Moving to pose {idx+1}/{len(poses_to_use)}…")
                 try:
                     if joints is not None:
