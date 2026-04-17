@@ -140,19 +140,39 @@ class UR10(RobotBase):
             return self.MODE_ERROR
 
     def get_pose(self) -> tuple:
-        """Return (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg).
+        """Return (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg) in ZYX Euler convention.
 
         ur_rtde returns TCP pose as [x_m, y_m, z_m, rx_rad, ry_rad, rz_rad]
-        using axis-angle representation.  We convert to mm and degrees.
+        where the rotation is an axis-angle (Rodrigues) vector, NOT Euler angles.
+        We convert: axis-angle → rotation matrix → ZYX Euler angles (degrees),
+        which is the convention expected by the hand-eye calibration solver.
         """
         pose = self._rtde_r.getActualTCPPose()
-        x_mm  = pose[0] * 1000.0
-        y_mm  = pose[1] * 1000.0
-        z_mm  = pose[2] * 1000.0
-        rx_deg = math.degrees(pose[3])
-        ry_deg = math.degrees(pose[4])
-        rz_deg = math.degrees(pose[5])
-        return (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg)
+        x_mm = pose[0] * 1000.0
+        y_mm = pose[1] * 1000.0
+        z_mm = pose[2] * 1000.0
+
+        # axis-angle → rotation matrix (Rodrigues)
+        ax, ay, az = pose[3], pose[4], pose[5]
+        angle = math.sqrt(ax*ax + ay*ay + az*az)
+        if angle < 1e-9:
+            return (x_mm, y_mm, z_mm, 0.0, 0.0, 0.0)
+        ux, uy, uz = ax / angle, ay / angle, az / angle
+        c, s, t = math.cos(angle), math.sin(angle), 1.0 - math.cos(angle)
+        R00 = t*ux*ux + c;       R01 = t*ux*uy - s*uz;  R02 = t*ux*uz + s*uy
+        R10 = t*ux*uy + s*uz;    R11 = t*uy*uy + c;     R12 = t*uy*uz - s*ux
+        R20 = t*ux*uz - s*uy;    R21 = t*uy*uz + s*ux;  R22 = t*uz*uz + c
+
+        # rotation matrix → ZYX Euler (R = Rz @ Ry @ Rx)
+        sy = max(-1.0, min(1.0, -R20))
+        ry = math.asin(sy)
+        if abs(math.cos(ry)) > 1e-6:
+            rx = math.atan2(R21, R22)
+            rz = math.atan2(R10, R00)
+        else:                          # gimbal lock
+            rx = math.atan2(-R12, R11)
+            rz = 0.0
+        return (x_mm, y_mm, z_mm, math.degrees(rx), math.degrees(ry), math.degrees(rz))
 
     def get_angle(self) -> tuple:
         """Return joint angles (j1..j6) in degrees."""
@@ -171,17 +191,31 @@ class UR10(RobotBase):
     def move_linear(self, x, y, z, rx, ry, rz) -> int:
         """Cartesian linear move.
 
-        Pipeline provides (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg).
-        ur_rtde expects (x_m, y_m, z_m, rx_rad, ry_rad, rz_rad) axis-angle.
+        Pipeline provides (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg) ZYX Euler.
+        ur_rtde expects (x_m, y_m, z_m, ax, ay, az) axis-angle (Rodrigues vector).
+        We convert: ZYX Euler → rotation matrix → axis-angle.
         """
-        pose = [
-            x / 1000.0,
-            y / 1000.0,
-            z / 1000.0,
-            math.radians(rx),
-            math.radians(ry),
-            math.radians(rz),
-        ]
+        # ZYX Euler → rotation matrix (R = Rz @ Ry @ Rx)
+        rxr, ryr, rzr = math.radians(rx), math.radians(ry), math.radians(rz)
+        cx, sx = math.cos(rxr), math.sin(rxr)
+        cy, sy = math.cos(ryr), math.sin(ryr)
+        cz, sz = math.cos(rzr), math.sin(rzr)
+        R00 = cz*cy;  R01 = cz*sy*sx - sz*cx;  R02 = cz*sy*cx + sz*sx
+        R10 = sz*cy;  R11 = sz*sy*sx + cz*cx;  R12 = sz*sy*cx - cz*sx
+        R20 = -sy;    R21 = cy*sx;              R22 = cy*cx
+
+        # rotation matrix → axis-angle (Rodrigues)
+        cos_a = max(-1.0, min(1.0, (R00 + R11 + R22 - 1.0) / 2.0))
+        angle = math.acos(cos_a)
+        if angle < 1e-9:
+            ax = ay = az = 0.0
+        else:
+            s2 = 2.0 * math.sin(angle)
+            ax = (R21 - R12) / s2 * angle
+            ay = (R02 - R20) / s2 * angle
+            az = (R10 - R01) / s2 * angle
+
+        pose = [x / 1000.0, y / 1000.0, z / 1000.0, ax, ay, az]
         cmd_id = self._next_cmd_id()
         vel = self._linear_vel()
         acc = DEFAULT_ACCEL * (self._speed_pct / 100.0)
