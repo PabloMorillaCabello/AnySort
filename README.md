@@ -7,7 +7,7 @@ An end-to-end pipeline that combines:
 - **SAM3** (Segment Anything 3) text-prompted segmentation
 - **GraspGen** (NVIDIA) 6-DOF grasp pose generation
 - **Hand-eye calibration** for accurate robot manipulation
-- **Dobot CR** (or other) robot arm with vacuum gripper
+- **Multi-robot support** — Dobot CR with vacuum gripper, UR10 with OnRobot RG gripper (or add your own)
 
 Everything runs inside Docker with CUDA 12.6, ROS2 Humble, and WSL2 on Windows. The main workflow is the **AnySort Tkinter application** — a graphical interface for capturing scenes, segmenting objects, generating grasps, and executing picks with automatic retry and batch processing.
 
@@ -21,6 +21,7 @@ Everything runs inside Docker with CUDA 12.6, ROS2 Humble, and WSL2 on Windows. 
   - [Native Linux](#platform-native-linux)
 - [Verify Your Installation](#verify-your-installation)
 - [AnySort UI Overview](#anysort-ui-overview)
+- [Multi-Robot Support](#multi-robot-support)
 - [Batch / Sorting Mode](#batch--sorting-mode)
 - [Project Structure](#project-structure)
 - [Python Environments](#python-environments-inside-container)
@@ -135,7 +136,7 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
    Or from WSL2 terminal:
    ```bash
    docker compose -f docker/docker-compose.yml exec graspgen bash -c \
-     "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python grasp_execute_pipeline.py"
+     "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python anysort.py"
    ```
 
 **docker-compose.yml notes (Windows+WSL2 — already configured):**
@@ -322,11 +323,13 @@ A **5-column layout** with status log bar:
 ┌─────────────┬──────────────┬────────────┬──────────────┬──────────────┐
 │   CAMERA    │  GRASPGEN    │   ROBOT    │  WORD LIST   │  EXECUTION   │
 ├─────────────┼──────────────┼────────────┼──────────────┼──────────────┤
-│ • Connect   │ • Calibration│ • IP entry │ • Add/Remove │ • Status     │
-│ • Capture   │ • Gripper    │ • Speed    │ • Load/Save  │ • Run single │
-│ • Save/Load │ • Prompt     │ • Recover  │ • Auto-load  │ • Batch mode │
-│ • ROI select│ • Options    │ • Home/Go  │              │ • Stop/Retry │
-│ • Mask view │ • Grasps (N) │ • Sort/Go  │              │ • Meshcat    │
+│ • Connect   │ • Calibration│ • Type sel.│ • Add/Remove │ • Status     │
+│ • Capture   │ • Calib file │ • IP entry │ • Load/Save  │ • Run single │
+│ • Save/Load │ • Tool type  │ • Connect  │ • Auto-load  │ • Batch mode │
+│ • ROI select│ • Prompt     │ • Speed    │              │ • Stop/Retry │
+│ • Mask view │ • Options    │ • Recover  │              │ • Meshcat    │
+│             │ • Grasps (N) │ • Home/Go  │              │              │
+│             │ • Navigator  │ • Sort/Go  │              │              │
 └─────────────┴──────────────┴────────────┴──────────────┴──────────────┘
 └────────────────────────────── LOG BAR ─────────────────────────────────┘
 ```
@@ -338,19 +341,22 @@ A **5-column layout** with status log bar:
 - **Mask & ROI** — Show segmentation overlay, define 4-point polygon ROI
 
 ### Column: GraspGen
-- **Calibration status** — Load hand-eye calib from file
-- **Gripper dropdown** — Auto-scans `/opt/GraspGen/GraspGenModels/checkpoints/` for available models
+- **Calibration status label** — Shows loaded calibration file or status
+- **Calibration file dropdown** — Browse and switch between available `.npz` files in `data/calibration/` without restart
+- **Tool dropdown** — Select end-effector type (e.g., Dobot Vacuum, OnRobot RG gripper)
 - **Object prompt** — Enter text description (e.g., "red cylinder")
 - **Options** — Collision filter, reachability filter, debug step-by-step
 - **Grasps** — Shows N candidates, best N returned by confidence
 - **Grasp navigator** — Previous/Next buttons
 
 ### Column: Robot
-- **IP entry & Connect** — Dobot TCP/IP address (default `192.168.5.1`)
-- **Speed slider** — Motion speed percentage
+- **Robot type dropdown** — Select robot model (DobotCR, UR10, or custom)
+- **IP entry & Connect** — Robot TCP/IP address (Dobot default: `192.168.5.1`, UR10: check pendant)
+- **Motion parameters** — Speed %, Approach offset (mm), TCP Z offset (mm)
 - **Recover Robot** — Reset alarm, re-enable, go home
 - **Save/Go Home** — Define and return to home position
 - **Save/Go Sort** — Define drop-off location
+- **Actions** — Emergency stop, motion test buttons
 
 ### Column: Word List
 - **Editable list** — Object names for batch mode
@@ -366,6 +372,53 @@ A **5-column layout** with status log bar:
 - **Run/Stop Batch** — Loop through word list continuously
 - **Clear Mask** — Reset segmentation
 - **Meshcat Viewer** — Open 3D viz (http://127.0.0.1:7000)
+
+---
+
+## Multi-Robot Support
+
+The pipeline supports multiple robot types through a modular architecture. Currently implemented:
+
+- **Dobot CR** — TCP/IP control on ports 29999 (commands) and 30004 (real-time feedback), vacuum gripper via digital output
+- **UR10** — `ur_rtde` real-time interface, OnRobot RG gripper via Dashboard program execution
+
+### Adding a New Robot
+
+Create a new driver in `app/robots/`:
+
+1. Copy `TEMPLATE.py` to `my_robot.py`
+2. Implement the `RobotBase` abstract interface:
+   ```python
+   from app.robots.base import RobotBase
+
+   class MyRobotDriver(RobotBase):
+       def connect(self, ip: str) -> bool: ...
+       def disconnect(self) -> bool: ...
+       def move_to(self, pose: list, speed_pct: float) -> bool: ...
+       def set_home(self, pose: list) -> None: ...
+       def go_home(self) -> bool: ...
+       def recover(self) -> bool: ...
+   ```
+3. Register in `app/robots/__init__.py`
+4. Select from UI dropdown
+
+### Adding a New End-Effector / Tool
+
+Create a new tool driver in `app/tools/`:
+
+1. Copy `TEMPLATE.py` to `my_tool.py`
+2. Implement the `ToolBase` abstract interface:
+   ```python
+   from app.tools.base import ToolBase
+
+   class MyTool(ToolBase):
+       def initialize(self) -> bool: ...
+       def grasp(self, duration_s: float = 1.0) -> bool: ...
+       def release(self, duration_s: float = 1.0) -> bool: ...
+       def cleanup(self) -> None: ...
+   ```
+3. Register in `app/tools/__init__.py`
+4. Select from UI dropdown
 
 ---
 
@@ -396,14 +449,28 @@ GraspGen_Thesis_Repo/
 ├── USB_WSL_Docker_Guide.md       # WSL2 USB passthrough setup
 │
 ├── app/                          # PRIMARY: AnySort application
-│   ├── grasp_execute_pipeline.py # Main Tkinter app with robot control
-│   ├── hand_eye_calibration.py   # ChArUco calibration UI
-│   ├── calibration_tester.py     # Calibration validation + correction
+│   ├── anysort.py # Main Tkinter app with robot control
+│   ├── hand_eye_calibration.py   # ChArUco calibration UI (named pose sets & calib saves)
+│   ├── calibration_tester.py     # Calibration validation + correction (calib file selector)
 │   ├── camera_calibration.py     # Camera intrinsics (OpenCV)
 │   ├── sam3_server.py            # Persistent SAM3 Unix socket server
 │   ├── orbbec_quiet.py           # Suppresses OrbbecSDK C-level stderr
 │   ├── pipeline_positions.json   # Saved Home/Sort positions
-│   └── pipeline_roi.json         # Saved ROI polygon
+│   ├── pipeline_roi.json         # Saved ROI polygon
+│   │
+│   ├── robots/                   # Multi-robot drivers (modular)
+│   │   ├── __init__.py          # Robot registry
+│   │   ├── base.py              # RobotBase abstract class
+│   │   ├── dobot_cr.py          # Dobot CR TCP/IP driver
+│   │   ├── ur10.py              # UR10 ur_rtde driver
+│   │   └── TEMPLATE.py          # Template for new robots
+│   │
+│   └── tools/                    # End-effector drivers (modular)
+│       ├── __init__.py          # Tool registry
+│       ├── base.py              # ToolBase abstract class
+│       ├── dobot_vacuum.py      # Dobot vacuum (digital output)
+│       ├── onrobot_urscript.py  # OnRobot RG gripper (Dashboard program execution)
+│       └── TEMPLATE.py          # Template for new tools
 │
 ├── docker/
 │   ├── Dockerfile               # CUDA 12.6 + ROS2 Humble + all Python envs
@@ -427,9 +494,15 @@ GraspGen_Thesis_Repo/
 │
 ├── data/
 │   ├── calibration/             # Hand-eye calib outputs + ChArUco board
-│   │   ├── hand_eye_calib.npz   # Binary calibration matrix
-│   │   ├── hand_eye_calib.json  # Human-readable JSON
-│   │   └── auto_calib_poses.json # 26 pre-programmed robot poses
+│   │   ├── hand_eye_calib.npz   # Default binary calibration matrix
+│   │   ├── hand_eye_calib.json  # Default human-readable JSON
+│   │   ├── hand_eye_calib_{name}.npz      # Named calibration saves
+│   │   ├── hand_eye_calib_{name}.json
+│   │   ├── hand_eye_calib_{ts}.npz        # Timestamped backups (auto-created)
+│   │   ├── auto_calib_poses.json          # Default pose set (26 pre-programmed poses)
+│   │   ├── auto_calib_poses_{name}.json   # Named pose sets (e.g., ur10, dobot)
+│   │   ├── camera_intrinsics.npz
+│   │   └── camera_intrinsics.json
 │   ├── object_lists/            # .txt word lists for batch mode
 │   ├── rgb/, depth/             # Captured frames (gitignored)
 │   └── OrbbecSDK_v2.7.6_amd64.deb
@@ -462,7 +535,7 @@ sam3_activate      # Switch to SAM3 venv
 
 ## Hand-Eye Calibration
 
-Before executing grasps, the robot must know where the camera is relative to its base frame.
+Before executing grasps, the robot must know where the camera is relative to its base frame. The system now supports **named calibration pose sets** and **named calibration saves** for managing multiple robot configurations.
 
 ### Workflow
 
@@ -478,12 +551,39 @@ python hand_eye_calibration.py --robot-ip 192.168.5.1
 - **Manual mode** — you move robot, click "Capture Pose" at each position
 - Collect **≥10 poses** (≥20 recommended)
 
+### Named Pose Sets
+
+Save and load different sets of calibration poses (e.g., one per robot type):
+
+- **Save as** field → Save current captured poses as `auto_calib_poses_{name}.json`
+- Example: `auto_calib_poses_ur10.json`, `auto_calib_poses_dobot.json`
+- On next run, load a named pose set via the UI combobox
+- Empty "Save as" field overwrites the default `auto_calib_poses.json`
+
 **Step 2: Solve**
 - Click "Solve" → runs `cv2.calibrateHandEye()`
 - Typical good error: < 5 mm
-- Saves:
-  - `data/calibration/hand_eye_calib.npz` (binary, used by app)
-  - `data/calibration/hand_eye_calib.json` (human-readable)
+
+### Named Calibration Saves
+
+Save calibration results by name for different robot/gripper combinations:
+
+- **Save as** field (GraspGen panel) → Save calibration as `hand_eye_calib_{name}.npz`
+- Example: `hand_eye_calib_ur10.npz`, `hand_eye_calib_dobot_v2.npz`
+- Timestamped backup always created: `hand_eye_calib_{timestamp}.npz` (auto-created)
+- Empty name overwrites default: `hand_eye_calib.npz`
+- Saved calibrations appear in **Calibration file dropdown** in main AnySort UI
+
+Files saved:
+- `data/calibration/hand_eye_calib_{name}.npz` (binary, used by app)
+- `data/calibration/hand_eye_calib_{name}.json` (human-readable)
+
+### Load Calibration in Main App
+
+In the **GraspGen column**, use the **Calibration file dropdown** to:
+- Browse available `.npz` files in `data/calibration/`
+- Switch calibrations without restarting the app
+- Display currently loaded calibration in status label
 
 **Step 3: Validate (optional but recommended)**
 ```bash
@@ -495,6 +595,8 @@ Tests calibration accuracy by:
 2. Measuring predicted vs. actual error
 3. Correcting systematic offsets with 6-DOF sliders
 4. Saving corrected calibration if needed
+
+The calibration file combobox lists all available `.npz` files; use the Browse button to load a specific file.
 
 ---
 
@@ -512,6 +614,54 @@ python camera_calibration.py
 - Saves to `data/calibration/camera_intrinsics.npz`
 
 Current reference: **1280×720**, fx=684.7, fy=685.9, cx=655.3, cy=357.0, RMS=0.20 px
+
+---
+
+## OnRobot RG Gripper Setup (UR10)
+
+The OnRobot RG gripper is controlled via UR Dashboard program execution. Programs must be created on the robot pendant and saved as `.urp` files.
+
+### Create Programs on the Pendant
+
+1. **Power on UR10** and access the pendant (teach pad)
+2. **Create a new program** (or modify existing):
+   - Open **Program** menu → New
+   - Name it `gripper_open`
+3. **Add the RG gripper control nodes**:
+   - From menu, insert: **Robotics** → **OnRobot** → **RG** → **Open RG6** (or your model)
+   - Save the program as `gripper_open.urp`
+4. **Repeat for close**:
+   - Create program `gripper_close`
+   - Insert: **Robotics** → **OnRobot** → **RG** → **Close RG6**
+   - Save as `gripper_close.urp`
+
+### Gripper Timing
+
+The `onrobot_urscript.py` driver waits for program completion + settle times:
+
+- `grasp_wait_s = 2.0` — time after "Close" program finishes before next action
+- `release_wait_s = 1.5` — time after "Open" program finishes before next action
+
+**Better approach (recommended):** Add a **Wait node** inside the `.urp` programs on the pendant:
+1. In program, after the gripper command, insert **Flow** → **Wait**
+2. Set duration to match gripper settle time
+3. Save the program
+4. Set `grasp_wait_s = 0.2` and `release_wait_s = 0.2` in the code (just for handshake)
+
+This ensures gripper timing is built into the program logic, not dependent on container delays.
+
+### Testing OnRobot Gripper
+
+From inside the container:
+```bash
+cd app
+python -c "from tools.onrobot_urscript import OnRobotRGGripper; g = OnRobotRGGripper('192.168.X.X'); g.initialize(); g.grasp(2.0); g.release(1.5)"
+```
+
+Verify:
+- UR pendant shows program execution starting
+- Gripper physically opens/closes
+- No timeout errors in log
 
 ---
 
@@ -683,6 +833,12 @@ Docker build context is the **repository root**, not `docker/`. All `COPY` paths
 | `Camera not found (USB)` | Run `usbipd attach` again in PowerShell (WSL2) |
 | `Meshcat not opening` | Ensure port 7000 is exposed; check firewall; try `http://127.0.0.1:7000` |
 | `Dobot connection refused` | Verify IP (default `192.168.5.1`), ensure same network subnet |
+| `UR10 connection refused` | Verify IP, ensure robot is in Manual mode (pendant), check firewall on robot controller |
+| `OnRobot gripper not responding` | Verify programs `gripper_open.urp` and `gripper_close.urp` exist on pendant; check Dashboard server enabled (robot settings); test gripper manually on pendant first |
+| `Gripper timing too slow / collisions during grasp` | Add Wait nodes to `.urp` programs on pendant; adjust `grasp_wait_s` and `release_wait_s` in `tools/onrobot_urscript.py` |
+| `Calibration file dropdown empty` | Ensure at least one `.npz` file exists in `data/calibration/`; run `hand_eye_calibration.py` to create one |
+| `Cannot switch calibration in main app` | Restart AnySort; verify calibration file readable; check file is valid `.npz` (not corrupted) |
+| `Robot not recognized in dropdown` | Verify robot driver imported in `app/robots/__init__.py`; check for syntax errors in driver file |
 | `Docker model cache empty` | Models auto-download on first use via HuggingFace API; ensure `HF_TOKEN` set in `docker/.env` |
 
 ---

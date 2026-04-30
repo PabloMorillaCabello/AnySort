@@ -30,7 +30,7 @@ GraspGen_Thesis_Repo/
 │   ├── rgb/                                # RGB captures
 │   └── pointcloud/                         # .npy and .ply point clouds
 ├── app/                        # *** FINAL SOLUTION (AnySort pipeline) ***
-│   ├── grasp_execute_pipeline.py  # AnySort: full pipeline + robot execution (Tkinter UI)
+│   ├── anysort.py  # AnySort: full pipeline + robot execution (Tkinter UI)
 │   ├── hand_eye_calibration.py    # ChArUco hand-eye calibration UI
 │   ├── calibration_tester.py      # Calibration validator + 6-DOF correction
 │   ├── camera_calibration.py      # Camera intrinsics calibration
@@ -60,7 +60,7 @@ GraspGen_Thesis_Repo/
 
 ## Primary Workflow (app/)
 
-**AnySort** (`app/grasp_execute_pipeline.py`) is the single entry point — starts SAM3 server, Meshcat, camera, and loads GraspGen weights automatically via a splash screen.
+**AnySort** (`app/anysort.py`) is the single entry point — starts SAM3 server, Meshcat, camera, and loads GraspGen weights automatically via a splash screen.
 
 ### Launch options:
 ```bash
@@ -71,7 +71,7 @@ AnySort.vbs   # double-click
 AnySort.cmd
 
 # From inside container:
-cd /ros2_ws/app && python grasp_execute_pipeline.py
+cd /ros2_ws/app && python anysort.py
 
 # Calibration tools (from inside container):
 python /ros2_ws/app/hand_eye_calibration.py --robot-ip 192.168.5.1
@@ -182,7 +182,7 @@ python3 /ros2_ws/scripts/view_camera.py
 python3 /ros2_ws/scripts/view_camera.py --ir --align --pointcloud
 
 # Inside container — AnySort (primary app, single command)
-cd /ros2_ws/app && python grasp_execute_pipeline.py
+cd /ros2_ws/app && python anysort.py
 
 # Inside container — calibration tools
 python /ros2_ws/app/hand_eye_calibration.py --robot-ip 192.168.5.1
@@ -205,7 +205,7 @@ python3 /ros2_ws/scripts/test_sam3.py
 - **TCP packet accumulation** — Dobot feedback socket needs exactly 1440 bytes before `np.frombuffer(data, dtype=MyType)`.
 - **No `privileged: true`** — use `device_cgroup_rules` for USB/video access.
 - **Build context is repo root** — all Dockerfile `COPY` paths must use `docker/`, `data/` prefixes.
-- **SAM3 server auto-starts** — `grasp_execute_pipeline.py` (AnySort) launches `app/sam3_server.py` automatically during splash loading. No manual pre-start needed.
+- **SAM3 server auto-starts** — `anysort.py` (AnySort) launches `app/sam3_server.py` automatically during splash loading. No manual pre-start needed.
 
 ## Dobot Feedback Fix Details
 

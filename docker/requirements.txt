@@ -17,6 +17,7 @@ scikit-learn>=1.3.0
 
 # --- Robot Control ---
 roboticstoolbox-python>=1.0.0
+ur_rtde>=1.5.0                    # Universal Robots RTDE interface (UR3/5/10/16e/20/30)
 
 # --- ROS2 Python tools ---
 pyyaml>=6.0

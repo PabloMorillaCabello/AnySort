@@ -13,4 +13,4 @@ docker compose -f "$SCRIPT_DIR/docker/docker-compose.yml" --env-file "$SCRIPT_DI
 
 # Launch AnySort pipeline
 docker compose -f "$SCRIPT_DIR/docker/docker-compose.yml" --env-file "$SCRIPT_DIR/docker/.env" exec graspgen bash -c \
-  "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python grasp_execute_pipeline.py"
+  "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python anysort.py"

@@ -27,7 +27,24 @@
       "Bash(cd:*)",
       "Bash(echo \"exit:$?\")",
       "Read(//opt/**)",
-      "Bash(find /mnt -name dobot_api.py)"
+      "Bash(find /mnt -name dobot_api.py)",
+      "Bash(/dev/null -name *.py)",
+      "Bash(python3 -c \"import rtde_control; print\\([m for m in dir\\(rtde_control.RTDEControlInterface\\) if ''''script'''' in m.lower\\(\\) or ''''custom'''' in m.lower\\(\\)]\\)\")",
+      "Bash(pip show:*)",
+      "Bash(pip3 show:*)",
+      "Bash(pip index:*)",
+      "WebFetch(domain:pypi.org)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.universal-robots.com)",
+      "WebFetch(domain:aydos.de)",
+      "Read(//c//**)",
+      "Bash(ls:*)",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\.obsidian\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Pipeline\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Components\\\\Robots\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Components\\\\Tools\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Infrastructure\")"
     ]
   }
 }

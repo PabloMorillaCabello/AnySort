@@ -63,7 +63,6 @@ except ImportError:
 # Defaults / constants
 # ===========================================================================
 ROBOT_IP_DEFAULT = "192.168.5.1"
-ROBOT_PORT       = 29999
 OUTPUT_DIR       = Path("/ros2_ws/data/calibration")
 SAVED_POSES_FILE = OUTPUT_DIR / "auto_calib_poses.json"
 MOVE_SPEED       = 15
@@ -227,211 +226,10 @@ class OrbbecCamera:
 
 
 # ===========================================================================
-# Dobot Dashboard  — wraps the real DobotApiDashboard + DobotApiFeedBack
+# Modular robot drivers  — see app/robots/ for available backends
 # ===========================================================================
-try:
-    sys.path.insert(0, "/opt/Dobot_hv")
-    from dobot_api import DobotApiDashboard as _DobotApiDashboard
-    from dobot_api import DobotApiFeedBack  as _DobotApiFeedBack
-    _DOBOT_API_OK = True
-except ImportError as _e:
-    _DOBOT_API_OK = False
-    print(f"[Dobot] WARNING: could not import dobot_api — robot disabled ({_e})")
-
-
-def _parse_result_id(resp):
-    """Parse dashboard response → [ErrorID, CommandID, ...]"""
-    if resp is None:
-        return [2]
-    if "Not Tcp" in str(resp):
-        return [1]
-    nums = re.findall(r"-?\d+", str(resp))
-    return [int(n) for n in nums] if nums else [2]
-
-
-class DobotDashboard:
-    """
-    Thin wrapper around DobotApiDashboard (port 29999) + DobotApiFeedBack (port 30004).
-    """
-    MODE_RUNNING = 7
-    MODE_ERROR   = 9
-    MODE_ENABLED = 5
-    _FEEDBACK_PORT = 30004
-
-    def __init__(self, ip: str, port: int = ROBOT_PORT):
-        if not _DOBOT_API_OK:
-            raise RuntimeError("dobot_api not available — cannot connect to robot")
-        self._ip        = ip
-        self._dashboard = _DobotApiDashboard(ip, port)
-        self._feed      = _DobotApiFeedBack(ip, self._FEEDBACK_PORT)
-        self._lock      = threading.Lock()
-        self._mode      = -1
-        self._cmd_id    = -1
-        self._speed     = 20
-        self._feed_running = True
-        threading.Thread(target=self._feed_loop, daemon=True).start()
-
-    # ------------------------------------------------------------------
-    # Feedback loop
-    # ------------------------------------------------------------------
-    def _feed_loop(self):
-        while self._feed_running:
-            try:
-                info = self._feed.feedBackData()
-                if info is not None and hex(int(info["TestValue"][0])) == "0x123456789abcdef":
-                    with self._lock:
-                        self._mode   = int(info["RobotMode"][0])
-                        self._cmd_id = int(info["CurrentCommandId"][0])
-            except Exception:
-                pass
-            time.sleep(0.004)
-
-    def get_mode(self) -> int:
-        with self._lock:
-            return self._mode
-
-    # ------------------------------------------------------------------
-    # Basic commands
-    # ------------------------------------------------------------------
-    def enable(self):
-        return self._dashboard.EnableRobot()
-
-    def power_on(self):
-        return self._dashboard.PowerOn()
-
-    def clear_error(self):
-        return self._dashboard.ClearError()
-
-    def set_speed(self, p):
-        self._speed = max(1, min(100, int(p)))
-        return self._dashboard.SpeedFactor(self._speed)
-
-    def set_tool(self, index: int):
-        """Select active tool TCP by index (0 = base flange, 1+ = user-defined tools)."""
-        return self._dashboard.Tool(index)
-
-    # ------------------------------------------------------------------
-    # Position getter
-    # ------------------------------------------------------------------
-    def _nums(self, resp) -> List[float]:
-        return [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", str(resp))]
-
-    def get_pose(self) -> tuple:
-        resp = self._dashboard.GetPose()
-        nums = self._nums(resp)
-        if len(nums) >= 7:
-            return tuple(nums[1:7])
-        if len(nums) >= 6:
-            return tuple(nums[:6])
-        raise ValueError(f"Cannot parse pose — raw response: {resp!r}")
-
-    def get_angle(self) -> tuple:
-        """Returns (J1, J2, J3, J4, J5, J6) in degrees."""
-        resp = self._dashboard.GetAngle()
-        nums = self._nums(resp)
-        if len(nums) >= 7:
-            return tuple(nums[1:7])
-        if len(nums) >= 6:
-            return tuple(nums[:6])
-        raise ValueError(f"Cannot parse angles — raw response: {resp!r}")
-
-    # ------------------------------------------------------------------
-    # Motion  (returns CommandID)
-    # ------------------------------------------------------------------
-    def _send_motion(self, resp):
-        # DobotApiDashboard methods may return None or b'' if the response
-        # wasn't read yet.  Try reading once more via wait_reply().
-        if resp is None or resp == b'' or resp == '':
-            try:
-                resp = self._dashboard.wait_reply()
-            except Exception:
-                pass
-        parsed = _parse_result_id(resp)
-        if len(parsed) < 2 or parsed[0] != 0:
-            raise RuntimeError(f"Move rejected (ErrorID={parsed[0] if parsed else '?'}): {resp!r}")
-        return parsed[1]
-
-    def _send_raw(self, cmd: str) -> str:
-        """Send a raw command string and read the response.
-
-        DobotApiDashboard.send_data() only sends (returns None).
-        The response must be read separately via wait_reply().
-        """
-        self._dashboard.send_data(cmd)
-        return self._dashboard.wait_reply()
-
-    def move_joint(self, x, y, z, rx, ry, rz):
-        """Move to Cartesian pose using joint-space motion."""
-        resp = self._dashboard.MovJ(
-            x, y, z, rx, ry, rz,
-            0,                  # coordinateMode=0 → Cartesian
-            a=self._speed, v=self._speed
-        )
-        return self._send_motion(resp)
-
-    def move_joint_angles(self, j1, j2, j3, j4, j5, j6):
-        """Move to joint-angle target (coordinateMode=1, no IK)."""
-        resp = self._dashboard.MovJ(
-            j1, j2, j3, j4, j5, j6,
-            1,
-            a=self._speed, v=self._speed
-        )
-        return self._send_motion(resp)
-
-    # ------------------------------------------------------------------
-    # Wait helpers
-    # ------------------------------------------------------------------
-    def wait_motion(self, cmd_id, timeout=90.0):
-        """Block until the robot finishes cmd_id."""
-        # Wait up to 3s for the feedback thread to get its first packet
-        # (self._cmd_id starts at -1; -1 > cmd_id is always False)
-        fb_wait = time.time() + 3.0
-        while time.time() < fb_wait:
-            with self._lock:
-                if self._cmd_id >= 0:
-                    break
-            time.sleep(0.05)
-
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            with self._lock:
-                mode   = self._mode
-                cur_id = self._cmd_id
-            if cur_id >= cmd_id and mode != self.MODE_RUNNING:
-                return True
-            if mode == self.MODE_ERROR:
-                raise RuntimeError("Robot entered error state during motion")
-            time.sleep(0.1)
-        raise TimeoutError(f"Motion timeout after {timeout:.0f}s")
-
-    def wait_idle(self, timeout=90.0):
-        """Block until mode is not RUNNING."""
-        time.sleep(0.4)
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            with self._lock:
-                mode = self._mode
-            if mode != self.MODE_RUNNING:
-                return True
-            time.sleep(0.15)
-        return False
-
-    def vacuum_on(self, port: int = 1):
-        return self._dashboard.ToolDO(port, 1)
-
-    def vacuum_off(self, port: int = 1):
-        return self._dashboard.ToolDO(port, 0)
-
-    def close(self):
-        self._feed_running = False
-        try:
-            self._dashboard.close()
-        except Exception:
-            pass
-        try:
-            self._feed.close()
-        except Exception:
-            pass
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from robots import RobotBase, get_driver_names, create_robot
 
 
 # ===========================================================================
@@ -606,7 +404,14 @@ def solve_hand_eye(robot_poses: list, board_poses: list) -> dict:
 
 
 def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
-                     robot_poses: list, board_poses: list, output: Path):
+                     robot_poses: list, board_poses: list, output: Path,
+                     name: str = ""):
+    """Save calibration result.
+
+    If *name* is given, saves as ``hand_eye_calib_{name}.npz`` (named save).
+    Always saves a timestamped backup.  If no name, also overwrites the
+    default ``hand_eye_calib.npz``.
+    """
     output.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     data = dict(T_cam2base=result["T"], R_cam2base=result["R"], t_cam2base=result["t"],
@@ -614,8 +419,6 @@ def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
                 robot_poses=np.array(robot_poses),
                 board_rvecs=np.array([p[0].ravel() for p in board_poses]),
                 board_tvecs=np.array([p[1].ravel() for p in board_poses]))
-    np.savez(str(output / "hand_eye_calib.npz"), **data)
-    np.savez(str(output / f"hand_eye_calib_{ts}.npz"), **data)
     json_data = {
         "timestamp": ts, "n_poses": len(robot_poses), "primary_method": result["primary"],
         "T_cam2base": result["T"].tolist(),
@@ -626,9 +429,20 @@ def save_calibration(result: dict, K: np.ndarray, d: np.ndarray,
             for k, (R, t) in result["all"].items() if result["all"][k] is not None
         },
     }
-    with open(output / "hand_eye_calib.json", "w") as f:
-        json.dump(json_data, f, indent=2)
-    return ts
+    # Always save timestamped backup
+    np.savez(str(output / f"hand_eye_calib_{ts}.npz"), **data)
+    name = name.strip() if name else ""
+    if name:
+        # Named save
+        np.savez(str(output / f"hand_eye_calib_{name}.npz"), **data)
+        with open(output / f"hand_eye_calib_{name}.json", "w") as f:
+            json.dump(json_data, f, indent=2)
+    else:
+        # Default: overwrite the main file
+        np.savez(str(output / "hand_eye_calib.npz"), **data)
+        with open(output / "hand_eye_calib.json", "w") as f:
+            json.dump(json_data, f, indent=2)
+    return ts, name
 
 
 # ===========================================================================
@@ -658,7 +472,7 @@ class HandEyeCalibApp:
         self._aruco_dict = None
         self._detector = None
         self._camera: Optional[OrbbecCamera] = None
-        self._robot: Optional[DobotDashboard] = None
+        self._robot: Optional[RobotBase] = None
         self._robot_connected = False
         self._K = np.array([[_DEFAULT_FX,0,_DEFAULT_CX],[0,_DEFAULT_FY,_DEFAULT_CY],[0,0,1]], np.float64)
         self._d = np.zeros((5,), np.float64)
@@ -733,13 +547,13 @@ class HandEyeCalibApp:
         row2 = tk.Frame(mid, bg="#2d2d2d"); row2.pack(fill="x", padx=12, pady=2)
         tk.Label(row2, text="Square (m):", bg="#2d2d2d", fg="#ccc",
                  font=("Helvetica", 9), width=11, anchor="w").pack(side="left")
-        self._sq_len_var = tk.StringVar(value="0.030")
+        self._sq_len_var = tk.StringVar(value="0.0245")
         tk.Entry(row2, textvariable=self._sq_len_var, width=8,
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left", padx=(0,8))
         tk.Label(row2, text="Marker (m):", bg="#2d2d2d", fg="#ccc",
                  font=("Helvetica", 9)).pack(side="left")
-        self._mk_len_var = tk.StringVar(value="0.022")
+        self._mk_len_var = tk.StringVar(value="0.0165")
         tk.Entry(row2, textvariable=self._mk_len_var, width=8,
                  bg="#3a3a3a", fg="white", insertbackground="white",
                  relief="flat", font=("Helvetica", 9)).pack(side="left")
@@ -763,6 +577,24 @@ class HandEyeCalibApp:
 
         # --- Auto-Mode Positions ---
         self._section(mid, "Auto-Mode Positions")
+
+        # Pose set selector
+        r_set = tk.Frame(mid, bg="#2d2d2d"); r_set.pack(fill="x", padx=12, pady=(0,4))
+        tk.Label(r_set, text="Set:", bg="#2d2d2d", fg="#ccc",
+                 font=("Helvetica", 9), width=5, anchor="w").pack(side="left")
+        self._pose_set_var = tk.StringVar(value="default")
+        self._pose_set_combo = ttk.Combobox(r_set, textvariable=self._pose_set_var,
+                                             font=("Helvetica", 9), width=12)
+        self._pose_set_combo.pack(side="left", fill="x", expand=True, ipady=2, padx=(0,3))
+        self._pose_set_combo.bind("<<ComboboxSelected>>", self._on_pose_set_selected)
+        tk.Button(r_set, text="Save", bg="#3a3a3a", fg="#98c379",
+                  activebackground="#444", relief="flat", cursor="hand2", bd=0,
+                  font=("Helvetica", 8), padx=4,
+                  command=self._on_save_pose_set).pack(side="left", ipady=2)
+        tk.Button(r_set, text="Load", bg="#3a3a3a", fg="#61afef",
+                  activebackground="#444", relief="flat", cursor="hand2", bd=0,
+                  font=("Helvetica", 8), padx=4,
+                  command=self._on_load_pose_set).pack(side="left", padx=(3,0), ipady=2)
 
         poses_hdr = tk.Frame(mid, bg="#2d2d2d"); poses_hdr.pack(fill="x", padx=12, pady=(0,2))
         self._poses_count_lbl = tk.Label(
@@ -806,6 +638,15 @@ class HandEyeCalibApp:
 
         # --- Robot ---
         self._section(right, "Robot")
+        row3t = tk.Frame(right, bg="#252525"); row3t.pack(fill="x", padx=12, pady=2)
+        tk.Label(row3t, text="Type:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=7, anchor="w").pack(side="left")
+        driver_names = get_driver_names()
+        self._robot_type_var = tk.StringVar(value=driver_names[0] if driver_names else "")
+        ttk.Combobox(row3t, textvariable=self._robot_type_var,
+                     values=driver_names, state="readonly",
+                     font=("Helvetica", 9), width=15).pack(side="left")
+
         row3 = tk.Frame(right, bg="#252525"); row3.pack(fill="x", padx=12, pady=2)
         tk.Label(row3, text="IP:", bg="#252525", fg="#ccc",
                  font=("Helvetica", 9), width=7, anchor="w").pack(side="left")
@@ -842,20 +683,13 @@ class HandEyeCalibApp:
             bg="#252525", fg="#e06c75", font=("Courier", 9))
         self._robot_status.pack(anchor="w", padx=12, pady=(0,4))
 
-        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=2)
-
-        # Vacuum buttons
-        vac_row = tk.Frame(right, bg="#252525"); vac_row.pack(fill="x", padx=12, pady=(4,2))
-        tk.Label(vac_row, text="Vacuum DO1:", bg="#252525", fg="#ccc",
-                 font=("Helvetica", 9), width=10, anchor="w").pack(side="left")
-        tk.Button(vac_row, text="ON",
-                  bg="#e5c07b", fg="#1e1e1e", activebackground="#c9a55f",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9, "bold"),
-                  width=5, command=self._on_vacuum_on).pack(side="left", padx=(0,4), ipady=3)
-        tk.Button(vac_row, text="OFF",
-                  bg="#3a3a3a", fg="#ccc", activebackground="#444",
-                  relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
-                  width=5, command=self._on_vacuum_off).pack(side="left", ipady=3)
+        self._freedrive_btn = tk.Button(
+            right, text="✋  Freedrive OFF",
+            bg="#3a3a3a", fg="#888", activebackground="#444",
+            relief="flat", cursor="hand2", bd=0, font=("Helvetica", 9),
+            state="disabled", command=self._on_freedrive_toggle)
+        self._freedrive_btn.pack(padx=12, pady=(0,4), fill="x", ipady=4)
+        self._freedrive_active = False
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", padx=8, pady=6)
 
@@ -926,6 +760,17 @@ class HandEyeCalibApp:
                                      activebackground="#444", relief="flat", cursor="hand2",
                                      font=("Helvetica", 8), command=self._on_clear_poses)
         self._clear_btn.pack(side="right")
+
+        # Calibration save name
+        r_cname = tk.Frame(right, bg="#252525"); r_cname.pack(fill="x", padx=12, pady=(2,4))
+        tk.Label(r_cname, text="Save as:", bg="#252525", fg="#ccc",
+                 font=("Helvetica", 9), width=8, anchor="w").pack(side="left")
+        self._calib_name_var = tk.StringVar(value="")
+        tk.Entry(r_cname, textvariable=self._calib_name_var, width=15,
+                 bg="#3a3a3a", fg="white", insertbackground="white",
+                 relief="flat", font=("Helvetica", 9)).pack(side="left", fill="x", expand=True, ipady=2)
+        tk.Label(r_cname, text="e.g. Dobot, UR10", bg="#252525", fg="#555",
+                 font=("Helvetica", 7)).pack(side="left", padx=(4,0))
 
         self._solve_btn = tk.Button(
             right, text="✓  Solve Calibration",
@@ -1083,7 +928,7 @@ class HandEyeCalibApp:
             mk_len = float(self._mk_len_var.get())
         except ValueError:
             self._log("[Board] Invalid parameters — using defaults")
-            sq_x, sq_y, sq_len, mk_len = 5, 7, 0.030, 0.022
+            sq_x, sq_y, sq_len, mk_len = 5, 7, 0.0245, 0.0165
 
         self._aruco_dict, self._board = make_board(sq_x, sq_y, sq_len, mk_len)
         self._detector = make_charuco_detector(self._board)
@@ -1098,12 +943,61 @@ class HandEyeCalibApp:
     # Event handlers
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # Auto-mode pose management
+    # Auto-mode pose management (named pose sets)
     # ------------------------------------------------------------------
-    def _load_auto_poses(self):
+    def _poses_file_path(self, name: str = None) -> Path:
+        """Return the file path for a named pose set."""
+        if name is None:
+            name = self._pose_set_var.get().strip()
+        if not name or name == "default":
+            return SAVED_POSES_FILE  # auto_calib_poses.json
+        return OUTPUT_DIR / f"auto_calib_poses_{name}.json"
+
+    def _refresh_pose_sets(self):
+        """Scan for available pose set files and update combo."""
+        sets = []
+        if SAVED_POSES_FILE.exists():
+            sets.append("default")
+        for f in sorted(OUTPUT_DIR.glob("auto_calib_poses_*.json")):
+            name = f.stem.replace("auto_calib_poses_", "")
+            if name:
+                sets.append(name)
         try:
-            if SAVED_POSES_FILE.exists():
-                with open(SAVED_POSES_FILE, "r") as f:
+            self._pose_set_combo["values"] = sets
+        except Exception:
+            pass
+
+    def _on_pose_set_selected(self, *_):
+        """When a pose set is selected from the combo, load it."""
+        self._load_auto_poses()
+
+    def _on_save_pose_set(self):
+        """Save current poses under the name in the combo."""
+        name = self._pose_set_var.get().strip()
+        if not name:
+            self._log("[Poses] Enter a pose set name first.")
+            return
+        self._save_auto_poses()
+        self._refresh_pose_sets()
+        self._log(f"[Poses] Saved pose set '{name}' ({len(self._auto_poses)} poses)")
+
+    def _on_load_pose_set(self):
+        """Load poses from the selected set name."""
+        name = self._pose_set_var.get().strip()
+        if not name:
+            self._log("[Poses] Select a pose set first.")
+            return
+        path = self._poses_file_path(name)
+        if not path.exists():
+            self._log(f"[Poses] Pose set '{name}' not found: {path}")
+            return
+        self._load_auto_poses()
+
+    def _load_auto_poses(self):
+        poses_file = self._poses_file_path()
+        try:
+            if poses_file.exists():
+                with open(poses_file, "r") as f:
                     data = json.load(f)
                 raw = data.get("poses", [])
                 # Support both old format (plain list) and new format (dict with joints)
@@ -1115,17 +1009,21 @@ class HandEyeCalibApp:
                         self._auto_poses.append({"cartesian": p, "joints": None})
                     else:
                         continue
-                self._log(f"[Poses] Loaded {len(self._auto_poses)} saved positions")
+                name = self._pose_set_var.get().strip() or "default"
+                self._log(f"[Poses] Loaded {len(self._auto_poses)} positions from set '{name}'")
             else:
+                self._auto_poses = []
                 self._log(f"[Poses] No saved positions file — will use built-in {len(CALIB_POSES)} poses")
         except Exception as e:
             self._log(f"[Poses] Load error: {e}")
         self._update_poses_listbox()
+        self._refresh_pose_sets()
 
     def _save_auto_poses(self):
         try:
-            SAVED_POSES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(SAVED_POSES_FILE, "w") as f:
+            poses_file = self._poses_file_path()
+            poses_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(poses_file, "w") as f:
                 json.dump({"poses": self._auto_poses}, f, indent=2)
         except Exception as e:
             self._log(f"[Poses] Save error: {e}")
@@ -1157,24 +1055,13 @@ class HandEyeCalibApp:
 
     def _save_auto_pose_thread(self, ip: str):
         try:
-            if not _DOBOT_API_OK:
-                raise RuntimeError("dobot_api not available")
             if not self._robot_connected or self._robot is None:
-                raise RuntimeError("Robot not connected — click ⚡ Connect Robot first")
-            # Read both Cartesian pose (for display) and joint angles (for motion)
-            pose_resp = self._robot._dashboard.GetPose()
-            angle_resp = self._robot._dashboard.GetAngle()
+                raise RuntimeError("Robot not connected")
+            pose = self._robot.get_pose()    # (x,y,z,rx,ry,rz)
+            angles = self._robot.get_angle() # (j1..j6)
 
-            def _parse6(resp):
-                nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", str(resp))]
-                if len(nums) >= 7:
-                    return list(nums[1:7])
-                if len(nums) >= 6:
-                    return list(nums[:6])
-                raise ValueError(f"Cannot parse: {resp!r}")
-
-            cartesian = _parse6(pose_resp)
-            joints = _parse6(angle_resp)
+            cartesian = list(pose)
+            joints = list(angles)
             entry = {"cartesian": cartesian, "joints": joints}
             self._auto_poses.append(entry)
             self._save_auto_poses()
@@ -1216,7 +1103,13 @@ class HandEyeCalibApp:
     # ------------------------------------------------------------------
     def _on_connect(self):
         if self._robot_connected:
-            # Disconnect
+            # Disconnect — stop freedrive first if active
+            if self._freedrive_active and self._robot and hasattr(self._robot, "freedrive_stop"):
+                try:
+                    self._robot.freedrive_stop()
+                except Exception:
+                    pass
+                self._freedrive_active = False
             if self._robot:
                 try:
                     self._robot.close()
@@ -1226,6 +1119,8 @@ class HandEyeCalibApp:
             self._robot_connected = False
             self._robot_status.config(text="● Disconnected", fg="#e06c75")
             self._connect_btn.config(text="⚡  Connect Robot", bg="#4a5568")
+            self._freedrive_btn.config(state="disabled", text="✋  Freedrive OFF",
+                                       bg="#3a3a3a", fg="#888")
             self._log("[Robot] Disconnected.")
             return
         ip = self._robot_ip_var.get().strip()
@@ -1235,21 +1130,21 @@ class HandEyeCalibApp:
 
     def _connect_worker(self, ip: str):
         try:
-            self._log(f"[Robot] Connecting to {ip}:{ROBOT_PORT}…")
-            robot = DobotDashboard(ip)
+            driver_name = self._robot_type_var.get()
+            self._log(f"[Robot] Connecting to {ip} via {driver_name!r}...")
+            robot = create_robot(driver_name, ip)
             robot.clear_error(); time.sleep(0.3)
             robot.enable()
-            # Wait for mode 5 (idle/enabled)
             deadline = time.time() + 15.0
             while time.time() < deadline:
                 m = robot.get_mode()
-                if m == DobotDashboard.MODE_ENABLED:
+                if m == robot.MODE_ENABLED:
                     break
-                if m == DobotDashboard.MODE_ERROR:
+                if m == robot.MODE_ERROR:
                     robot.clear_error(); time.sleep(0.3); robot.enable()
                 time.sleep(0.4)
             m = robot.get_mode()
-            if m not in (DobotDashboard.MODE_ENABLED, DobotDashboard.MODE_RUNNING):
+            if m not in (robot.MODE_ENABLED, robot.MODE_RUNNING):
                 raise RuntimeError(f"Robot not ready (mode={m})")
             try:
                 tool_idx = int(self._tool_idx_var.get())
@@ -1272,34 +1167,37 @@ class HandEyeCalibApp:
         ip = self._robot_ip_var.get()
         self._robot_status.config(text=f"● Connected  {ip}", fg="#98c379")
         self._connect_btn.config(state="normal", text="⏏  Disconnect", bg="#3a6048")
+        # Enable freedrive button only if robot supports it
+        if hasattr(self._robot, "freedrive_start"):
+            self._freedrive_btn.config(state="normal", fg="#e5c07b")
+        else:
+            self._freedrive_btn.config(state="disabled", fg="#555",
+                                       text="✋  Freedrive (UR only)")
 
-    # ------------------------------------------------------------------
-    # Vacuum handlers
-    # ------------------------------------------------------------------
-    def _on_vacuum_on(self):
-        ip = self._robot_ip_var.get().strip()
-        threading.Thread(target=self._vacuum_cmd, args=(ip, True), daemon=True).start()
-
-    def _on_vacuum_off(self):
-        ip = self._robot_ip_var.get().strip()
-        threading.Thread(target=self._vacuum_cmd, args=(ip, False), daemon=True).start()
-
-    def _vacuum_cmd(self, ip: str, on: bool):
-        try:
-            if not _DOBOT_API_OK:
-                raise RuntimeError("dobot_api not available")
-            if self._robot_connected and self._robot:
-                resp = self._robot.vacuum_on() if on else self._robot.vacuum_off()
-            else:
-                db = _DobotApiDashboard(ip, ROBOT_PORT)
-                resp = db.ToolDO(1, 1 if on else 0)
-                try:
-                    db.close()
-                except Exception:
-                    pass
-            self._log(f"[Vacuum] {'ON' if on else 'OFF'}  resp={resp}")
-        except Exception as e:
-            self._log(f"[Vacuum] Error: {e}")
+    def _on_freedrive_toggle(self):
+        if not self._robot_connected or self._robot is None:
+            return
+        if not hasattr(self._robot, "freedrive_start"):
+            return
+        def _worker():
+            try:
+                if not self._freedrive_active:
+                    self._robot.freedrive_start()
+                    self._freedrive_active = True
+                    self._log("[Freedrive] ON — move robot by hand")
+                    self._ui(lambda: self._freedrive_btn.config(
+                        text="✋  Freedrive ON  (click to stop)",
+                        bg="#5a3a6a", fg="#c678dd"))
+                else:
+                    self._robot.freedrive_stop()
+                    self._freedrive_active = False
+                    self._log("[Freedrive] OFF")
+                    self._ui(lambda: self._freedrive_btn.config(
+                        text="✋  Freedrive OFF",
+                        bg="#3a3a3a", fg="#e5c07b"))
+            except Exception as e:
+                self._log(f"[Freedrive] Error: {e}")
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Board param handlers
@@ -1521,28 +1419,28 @@ class HandEyeCalibApp:
                 robot.set_tool(tool_idx)
                 self._log(f"[Auto] Speed={speed}%  Tool={tool_idx}")
             else:
-                self._log(f"[Auto] Connecting to robot {ip}:{ROBOT_PORT} …")
-                robot = DobotDashboard(ip)
-                self._log("[Auto] Clearing errors…")
+                driver_name = self._robot_type_var.get()
+                self._log(f"[Auto] Connecting to robot {ip} via {driver_name!r}...")
+                robot = create_robot(driver_name, ip)
+                self._log("[Auto] Clearing errors...")
                 robot.clear_error(); time.sleep(0.5)
-                self._log("[Auto] PowerOn…")
+                self._log("[Auto] PowerOn...")
                 robot.power_on(); time.sleep(3.0)
-                self._log("[Auto] Enabling robot…")
+                self._log("[Auto] Enabling robot...")
                 robot.enable()
-                # Wait until robot is idle (mode 5)
                 deadline = time.time() + 20.0
                 while time.time() < deadline:
                     m = robot.get_mode()
-                    self._log(f"[Auto] Waiting for idle… mode={m}")
-                    if m == DobotDashboard.MODE_ENABLED:
+                    self._log(f"[Auto] Waiting for idle... mode={m}")
+                    if m == robot.MODE_ENABLED:
                         break
-                    if m == DobotDashboard.MODE_ERROR:
+                    if m == robot.MODE_ERROR:
                         robot.clear_error(); time.sleep(0.5); robot.enable()
                     time.sleep(0.5)
                 final_mode = robot.get_mode()
-                if final_mode != DobotDashboard.MODE_ENABLED:
+                if final_mode != robot.MODE_ENABLED:
                     raise RuntimeError(f"Robot not idle after 20s (mode={final_mode}). "
-                                       f"Check pendant — may need manual enable.")
+                                       f"Check pendant -- may need manual enable.")
                 self._log(f"[Auto] Robot idle (mode={final_mode}). Proceeding.")
                 robot.set_speed(speed)
                 try:
@@ -1583,7 +1481,11 @@ class HandEyeCalibApp:
                     joints = None
                     cart = list(entry)
 
-                self._log(f"[Auto] Pose {idx+1}/{len(poses_to_use)}: {cart}")
+                if joints is not None:
+                    _pose_str = f"J={[round(v,2) for v in joints]}"
+                else:
+                    _pose_str = f"cart={[round(v,2) for v in cart]}"
+                self._log(f"[Auto] Pose {idx+1}/{len(poses_to_use)}: {_pose_str}")
                 self._set_status(f"Moving to pose {idx+1}/{len(poses_to_use)}…")
                 try:
                     if joints is not None:
@@ -1746,8 +1648,10 @@ class HandEyeCalibApp:
         try:
             self._log(f"[Solve] Running with {len(self._robot_poses)} poses…")
             result = solve_hand_eye(self._robot_poses, self._board_poses)
-            ts = save_calibration(result, self._K, self._d,
-                                  self._robot_poses, self._board_poses, OUTPUT_DIR)
+            calib_name = self._calib_name_var.get().strip()
+            ts, saved_name = save_calibration(result, self._K, self._d,
+                                              self._robot_poses, self._board_poses,
+                                              OUTPUT_DIR, name=calib_name)
             T = result["T"]
             t_mm = result["t"].ravel()
             primary_r, primary_t = result["residuals"][result["primary"]]
@@ -1758,17 +1662,20 @@ class HandEyeCalibApp:
                 e = Rotation.from_matrix(result["R"]).as_euler("ZYX", degrees=True)
                 self._log(f"[Result] R ZYX = [{e[0]:.2f}, {e[1]:.2f}, {e[2]:.2f}] deg")
             self._log(f"[Result] T_cam2base:\n{np.array2string(T, precision=3, suppress_small=True)}")
-            self._log(f"[Result] Saved to {OUTPUT_DIR}/hand_eye_calib.npz + .json")
+            if saved_name:
+                self._log(f"[Result] Saved as '{saved_name}' → hand_eye_calib_{saved_name}.npz")
+            else:
+                self._log(f"[Result] Saved to {OUTPUT_DIR}/hand_eye_calib.npz + .json")
             quality = "GOOD" if primary_t < 3.0 else ("ACCEPTABLE" if primary_t < 8.0 else "POOR — recollect poses")
             self._set_status(f"Calibration done! [{quality}]  residual={primary_t:.2f}mm  "
                              f"t=[{t_mm[0]:.1f},{t_mm[1]:.1f},{t_mm[2]:.1f}]mm")
             self._log("[All methods — translation residual (lower = better)]")
-            for name, val in result["all"].items():
+            for mname, val in result["all"].items():
                 if val:
                     R, t = val
-                    r_res, t_res = result["residuals"][name]
-                    marker = " ← selected" if name == result["primary"] else ""
-                    self._log(f"  {name:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm  "
+                    r_res, t_res = result["residuals"][mname]
+                    marker = " ← selected" if mname == result["primary"] else ""
+                    self._log(f"  {mname:<12}: t=[{t[0,0]:.1f},{t[1,0]:.1f},{t[2,0]:.1f}]mm  "
                               f"residual={t_res:.2f}mm{marker}")
         except Exception as e:
             self._log(f"[Solve] ERROR: {e}")

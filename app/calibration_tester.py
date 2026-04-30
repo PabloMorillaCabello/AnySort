@@ -72,7 +72,6 @@ except ImportError:
 CALIB_FILE_DEFAULT  = "/ros2_ws/data/calibration/hand_eye_calib.npz"
 CALIB_DIR           = Path("/ros2_ws/data/calibration")
 ROBOT_IP_DEFAULT    = "192.168.5.1"
-ROBOT_PORT          = 29999
 APPROACH_OFFSET_MM  = 80                         # mm above marker for Mode A
 MOVE_SPEED          = 15                         # % speed for test moves
 
@@ -229,15 +228,24 @@ def save_corrected_calibration(original_path: str,
     """Save a new .npz and .json with the corrected T_cam2base."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Derive a short base name from the loaded file (strip hand_eye_calib_ prefix)
+    stem = Path(original_path).stem
+    if stem == "hand_eye_calib":
+        short = "default"
+    elif stem.startswith("hand_eye_calib_"):
+        short = stem[len("hand_eye_calib_"):]
+    else:
+        short = stem
+    backup_name = f"hand_eye_calib_{short}_backup_{ts}"
     # Load originals to preserve camera matrix etc.
     data = dict(np.load(original_path))
     data["T_cam2base"]   = T_corrected
     data["R_cam2base"]   = T_corrected[:3, :3]
     data["t_cam2base"]   = T_corrected[:3, 3]
     data["T_correction"] = T_correction
-    npz_path = out_dir / f"hand_eye_calib_corrected_{ts}.npz"
+    npz_path = out_dir / f"{backup_name}.npz"
     np.savez(str(npz_path), **data)
-    json_path = out_dir / f"hand_eye_calib_corrected_{ts}.json"
+    json_path = out_dir / f"{backup_name}.json"
     R = T_corrected[:3, :3]
     t = T_corrected[:3, 3]
     euler = Rotation.from_matrix(R).as_euler("ZYX", degrees=True).tolist() if _SCIPY_OK else []
@@ -471,129 +479,10 @@ class OrbbecCamera:
 
 
 # ===========================================================================
-# Dobot Dashboard wrapper  (identical pattern to grasp_execute_pipeline.py)
+# Modular robot drivers  — see app/robots/ for available backends
 # ===========================================================================
-try:
-    sys.path.insert(0, "/opt/Dobot_hv")
-    from dobot_api import DobotApiDashboard as _DobotApiDashboard
-    from dobot_api import DobotApiFeedBack  as _DobotApiFeedBack
-    _DOBOT_API_OK = True
-except ImportError as _e:
-    _DOBOT_API_OK = False
-    print(f"[Dobot] WARNING: dobot_api not found — robot disabled ({_e})")
-
-
-def _parse_result_id(resp):
-    if resp is None:
-        return [2]
-    if "Not Tcp" in str(resp):
-        return [1]
-    nums = re.findall(r"-?\d+", str(resp))
-    return [int(n) for n in nums] if nums else [2]
-
-
-class DobotDashboard:
-    MODE_RUNNING = 7
-    MODE_ERROR   = 9
-    MODE_ENABLED = 5
-    _FEEDBACK_PORT = 30004
-
-    def __init__(self, ip, port=ROBOT_PORT):
-        if not _DOBOT_API_OK:
-            raise RuntimeError("dobot_api not available")
-        self._ip        = ip
-        self._dashboard = _DobotApiDashboard(ip, port)
-        self._feed      = _DobotApiFeedBack(ip, self._FEEDBACK_PORT)
-        self._lock      = threading.Lock()
-        self._mode      = -1
-        self._cmd_id    = -1
-        self._speed     = MOVE_SPEED
-        self._feed_running = True
-        threading.Thread(target=self._feed_loop, daemon=True).start()
-
-    def _feed_loop(self):
-        while self._feed_running:
-            try:
-                info = self._feed.feedBackData()
-                if info is not None and hex(int(info["TestValue"][0])) == "0x123456789abcdef":
-                    with self._lock:
-                        self._mode   = int(info["RobotMode"][0])
-                        self._cmd_id = int(info["CurrentCommandId"][0])
-            except Exception:
-                pass
-            time.sleep(0.004)
-
-    def get_mode(self):
-        with self._lock:
-            return self._mode
-
-    def enable(self):
-        return self._dashboard.EnableRobot()
-
-    def clear_error(self):
-        return self._dashboard.ClearError()
-
-    def set_speed(self, p):
-        self._speed = max(1, min(100, int(p)))
-        return self._dashboard.SpeedFactor(self._speed)
-
-    def _nums(self, resp):
-        return [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", str(resp))]
-
-    def get_pose(self):
-        nums = self._nums(self._dashboard.GetPose())
-        if len(nums) >= 7:
-            return tuple(nums[1:7])
-        if len(nums) >= 6:
-            return tuple(nums[:6])
-        raise ValueError(f"Cannot parse pose: {self._dashboard.GetPose()!r}")
-
-    def _send_motion(self, resp):
-        if resp is None or resp == b'' or resp == '':
-            try:
-                resp = self._dashboard.wait_reply()
-            except Exception:
-                pass
-        parsed = _parse_result_id(resp)
-        if len(parsed) < 2 or parsed[0] != 0:
-            raise RuntimeError(f"Move rejected (err={parsed[0] if parsed else '?'}): {resp!r}")
-        return parsed[1]
-
-    def move_linear(self, x, y, z, rx, ry, rz):
-        resp = self._dashboard.MovL(x, y, z, rx, ry, rz, 0,
-                                    a=self._speed, v=self._speed)
-        return self._send_motion(resp)
-
-    def wait_motion(self, cmd_id, timeout=90.0):
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            with self._lock:
-                mode   = self._mode
-                cur_id = self._cmd_id
-            if cur_id > cmd_id or (mode == self.MODE_ENABLED and cur_id == cmd_id):
-                return True
-            if mode == self.MODE_ERROR:
-                raise RuntimeError("Robot error during motion")
-            time.sleep(0.1)
-        raise TimeoutError(f"Motion timeout ({timeout:.0f}s)")
-
-    def wait_idle(self, timeout=90.0):
-        t0 = time.time()
-        time.sleep(0.4)
-        while time.time() - t0 < timeout:
-            with self._lock:
-                mode = self._mode
-            if mode != self.MODE_RUNNING:
-                return True
-            time.sleep(0.15)
-        return False
-
-    def close(self):
-        self._feed_running = False
-        try: self._dashboard.close()
-        except Exception: pass
-        try: self._feed.close()
-        except Exception: pass
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from robots import RobotBase, get_driver_names, create_robot
 
 
 # ===========================================================================
@@ -626,6 +515,7 @@ class CalibTesterApp:
         self._robot_connected = False
         self._cam_dot_state  = "init"    # track last dot state to avoid redundant config
         self._robot_dot_state = "init"
+        self._calib_file_map: dict = {}  # display label → full path
 
         # 6-DOF correction variables
         self._cv = {k: tk.DoubleVar(value=0.0) for k in
@@ -666,26 +556,36 @@ class CalibTesterApp:
         lf = tk.LabelFrame(parent, text="Connections")
         lf.pack(fill=tk.X, pady=(0, 4))
 
-        # Calibration file row
+        # Calibration file row — combo showing available files + Browse
         tk.Label(lf, text="Calibration:").grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self._calib_var = tk.StringVar(value=self._calib_path)
-        tk.Entry(lf, textvariable=self._calib_var, width=35).grid(row=0, column=1, padx=2)
+        self._calib_combo_t = ttk.Combobox(lf, textvariable=self._calib_var, width=33)
+        self._calib_combo_t.grid(row=0, column=1, padx=2)
+        self._refresh_calib_combo_t()
         tk.Button(lf, text="Browse…", command=self._browse_calib).grid(row=0, column=2, padx=2)
         tk.Button(lf, text="Load", command=self._load_calib,
                   bg="#3a7fc1", fg="white").grid(row=0, column=3, padx=2)
 
+        # Robot type row
+        tk.Label(lf, text="Robot:").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        driver_names = get_driver_names()
+        self._robot_type_var = tk.StringVar(value=driver_names[0] if driver_names else "")
+        ttk.Combobox(lf, textvariable=self._robot_type_var,
+                     values=driver_names, state="readonly",
+                     width=14).grid(row=1, column=1, sticky="w", padx=2)
+
         # Robot IP row
-        tk.Label(lf, text="Robot IP:").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        tk.Label(lf, text="IP:").grid(row=2, column=0, sticky="w", padx=4, pady=2)
         self._ip_var = tk.StringVar(value=self._robot_ip)
-        tk.Entry(lf, textvariable=self._ip_var, width=18).grid(row=1, column=1, sticky="w", padx=2)
+        tk.Entry(lf, textvariable=self._ip_var, width=18).grid(row=2, column=1, sticky="w", padx=2)
         self._connect_btn = tk.Button(lf, text="Connect Robot",
                                       command=self._connect_robot,
                                       bg="#2e7d32", fg="white")
-        self._connect_btn.grid(row=1, column=2, columnspan=2, padx=2, pady=2)
+        self._connect_btn.grid(row=2, column=2, columnspan=2, padx=2, pady=2)
 
         # Status dots row
         status_row = tk.Frame(lf)
-        status_row.grid(row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
+        status_row.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
         self._calib_dot  = tk.Label(status_row, text="● Calib: NOT loaded", fg="red",  font=("Courier", 9))
         self._calib_dot.pack(side=tk.LEFT, padx=(0, 12))
         self._robot_dot  = tk.Label(status_row, text="● Robot: disconnected", fg="red", font=("Courier", 9))
@@ -695,7 +595,7 @@ class CalibTesterApp:
 
         # Utility buttons
         util = tk.Frame(lf)
-        util.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
+        util.grid(row=4, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
         tk.Button(util, text="Gen Marker", command=self._gen_marker).pack(side=tk.LEFT, padx=2)
         tk.Button(util, text="Enable Robot", command=self._enable_robot).pack(side=tk.LEFT, padx=2)
         tk.Button(util, text="Clear Error", command=self._clear_error).pack(side=tk.LEFT, padx=2)
@@ -804,6 +704,35 @@ class CalibTesterApp:
         self.root.after(0, lambda: self._status_lbl.config(text=msg))
 
     # -------------------------------------------------------- calibration IO
+    @staticmethod
+    def _calib_label(stem: str) -> str:
+        """Convert a file stem to a short display label."""
+        if stem == "hand_eye_calib":
+            return "(default)"
+        if stem.startswith("hand_eye_calib_"):
+            return stem[len("hand_eye_calib_"):]
+        return stem
+
+    def _refresh_calib_combo_t(self):
+        """Populate the calibration combobox with short display labels."""
+        self._calib_file_map = {}
+        if CALIB_DIR.is_dir():
+            for f in sorted(CALIB_DIR.glob("hand_eye_calib*.npz")):
+                label = self._calib_label(f.stem)
+                self._calib_file_map[label] = str(f)
+        try:
+            labels = list(self._calib_file_map.keys())
+            self._calib_combo_t["values"] = labels
+            current_label = self._calib_label(Path(self._calib_path).stem)
+            if current_label in labels:
+                self._calib_combo_t.set(current_label)
+                self._calib_var.set(current_label)
+            elif labels:
+                self._calib_combo_t.set(labels[0])
+                self._calib_var.set(labels[0])
+        except Exception:
+            pass
+
     def _browse_calib(self):
         path = filedialog.askopenfilename(
             title="Select calibration .npz",
@@ -812,7 +741,14 @@ class CalibTesterApp:
             self._calib_var.set(path)
 
     def _load_calib(self):
-        path = self._calib_var.get().strip()
+        selected = self._calib_var.get().strip()
+        # Resolve display label → full path
+        if selected in self._calib_file_map:
+            path = self._calib_file_map[selected]
+        elif os.path.isabs(selected) or os.path.isfile(selected):
+            path = selected
+        else:
+            path = str(CALIB_DIR / selected)
         if not os.path.isfile(path):
             messagebox.showerror("Error", f"File not found:\n{path}")
             return
@@ -839,14 +775,12 @@ class CalibTesterApp:
         if not ip:
             messagebox.showerror("Error", "Enter a robot IP address")
             return
-        if not _DOBOT_API_OK:
-            messagebox.showerror("Error", "dobot_api not installed in this environment")
-            return
 
         def _thread():
             try:
-                self._log_msg(f"Connecting to robot @ {ip}…")
-                robot = DobotDashboard(ip)
+                driver_name = self._robot_type_var.get()
+                self._log_msg(f"Connecting to robot @ {ip} via {driver_name!r}...")
+                robot = create_robot(driver_name, ip)
                 self._robot = robot
                 self._robot_connected = True
                 self._log_msg(f"Robot connected: {ip}")
@@ -1069,28 +1003,27 @@ class CalibTesterApp:
         T_corr = self._get_correction_T()
         T_corrected = T_corr @ self._T_cam2base
         try:
-            npz_path, json_path = save_corrected_calibration(
-                self._calib_path, T_corrected, T_corr, CALIB_DIR)
-            self._log_msg("Saved corrected calibration:")
-            self._log_msg(f"  {npz_path}")
-            self._log_msg(f"  {json_path}")
-
-            # Ask whether to overwrite the main calibration so all tools pick it up
-            overwrite = messagebox.askyesno(
-                "Overwrite main calibration?",
-                f"Overwrite the main calibration file used by the pipeline?\n\n"
-                f"  {self._calib_path}\n\n"
-                "Yes → pipeline will use the corrected calibration immediately.\n"
-                "No  → only the timestamped backup is saved.")
-            if overwrite:
-                import shutil
-                shutil.copy2(str(npz_path), self._calib_path)
-                # Also update the .json sidecar (same name, .json extension)
-                json_main = str(Path(self._calib_path).with_suffix(".json"))
-                shutil.copy2(str(json_path), json_main)
-                self._log_msg(f"Main calibration overwritten: {self._calib_path}")
-                # Reload so the tester itself uses the corrected matrix
-                self._T_cam2base = T_corrected
+            # Overwrite the loaded file in-place — preserve all existing keys.
+            data = dict(np.load(self._calib_path))
+            data["T_cam2base"]   = T_corrected
+            data["R_cam2base"]   = T_corrected[:3, :3]
+            data["t_cam2base"]   = T_corrected[:3, 3]
+            data["T_correction"] = T_corr
+            np.savez(self._calib_path, **data)
+            # Update JSON sidecar
+            json_path = str(Path(self._calib_path).with_suffix(".json"))
+            t = T_corrected[:3, 3]
+            euler = Rotation.from_matrix(T_corrected[:3, :3]).as_euler(
+                "ZYX", degrees=True).tolist() if _SCIPY_OK else []
+            with open(json_path, "w") as f:
+                json.dump({
+                    "T_cam2base":    T_corrected.tolist(),
+                    "t_cam2base_mm": t.tolist(),
+                    "euler_ZYX_deg": euler,
+                    "T_correction":  T_corr.tolist(),
+                }, f, indent=2)
+            self._T_cam2base = T_corrected
+            self._log_msg(f"Saved → {self._calib_path}")
         except Exception as ex:
             messagebox.showerror("Save error", str(ex))
 
