@@ -167,6 +167,7 @@ def _select_largest_component(mask):
 
 
 def segment_with_sam3(rgb, prompt, sock_path):
+    """Returns (mask, n_objects_detected)."""
     import socket as _s
     h, w = rgb.shape[:2]
     rgb_bytes = np.ascontiguousarray(rgb, dtype=np.uint8).tobytes()
@@ -182,10 +183,10 @@ def segment_with_sam3(rgb, prompt, sock_path):
     s.close()
     n_masks = resp.get("num_masks", 1)
     if n_masks == 0 or not mask_bytes:
-        return np.zeros((h, w), dtype=np.uint8)
+        return np.zeros((h, w), dtype=np.uint8), 0
     all_masks = np.frombuffer(mask_bytes, dtype=np.uint8).reshape(n_masks, h, w)
     best, _ = _select_largest_component((all_masks[0] > 0).astype(np.uint8))
-    return best
+    return best, n_masks
 
 
 # ===========================================================================
@@ -649,6 +650,8 @@ class GraspExecuteApp:
         # Retry on robot error — iterate through next best grasps
         self._retry_grasps_var = tk.BooleanVar(value=False)
         self._retry_stop_event = threading.Event()
+        self._pick_all_var     = tk.BooleanVar(value=False)
+        self._last_n_masks: int = 0
 
         # Sort / drop position for object placement
         self._sort_joints = None
@@ -1420,6 +1423,12 @@ class GraspExecuteApp:
             font=("Helvetica", 9, "bold"), state="disabled",
             command=self._on_stop_batch)
         self._batch_stop_btn.pack(padx=10, pady=(0,4), fill="x", ipady=5)
+
+        tk.Checkbutton(p, text="Pick all detected objects (repeat until empty)",
+                       variable=self._pick_all_var,
+                       bg=bg, fg="#aaa", activebackground=bg,
+                       selectcolor="#3a3a3a", font=("Helvetica", 9)
+                       ).pack(anchor="w", padx=10, pady=(0, 4))
         _sep()
 
         _lbl("Visualisation")
@@ -1962,7 +1971,8 @@ class GraspExecuteApp:
                     rgb_sam, _roi_poly = rgb, None
             else:
                 rgb_sam = rgb
-            mask_crop = segment_with_sam3(rgb_sam, prompt, args.sam3_socket)
+            mask_crop, n_detected = segment_with_sam3(rgb_sam, prompt, args.sam3_socket)
+            self._last_n_masks = n_detected
             if _roi_poly is not None:
                 mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
                 crop_h, crop_w = _ry2 - _ry1, _rx2 - _rx1
@@ -1975,7 +1985,7 @@ class GraspExecuteApp:
                 mask[_ry1:_ry2, _rx1:_rx2] = mask_crop
             else:
                 mask = mask_crop
-            self._log(f"[SAM3] {time.time()-t0:.2f}s — {int(mask.sum())} px")
+            self._log(f"[SAM3] {time.time()-t0:.2f}s — {n_detected} object(s) detected, {int(mask.sum())} px")
 
             if mask.shape != depth_m.shape:
                 mask = cv2.resize(mask.astype(np.float32),
@@ -3022,6 +3032,8 @@ class GraspExecuteApp:
 
         cycle = 0
         word_idx = 0
+        _pick_all_streak = 0   # consecutive runs with same n_masks (pick-all mode)
+        _pick_all_last_n = -1  # n_masks value in previous pick-all iteration
         while not self._batch_stop_event.is_set():
             word = words[word_idx]
 
@@ -3152,10 +3164,31 @@ class GraspExecuteApp:
 
             if not success and not self._batch_stop_event.is_set():
                 self._log(
-                    f"[Batch] '{word}' — all 3 attempts exhausted, "
+                    f"[Batch] '{word}' — no object found or all attempts exhausted, "
                     f"moving to next word.")
 
+            # Stay on same word if pick-all is active and we just succeeded
+            # (pipeline will re-run; "no objects found → break → not success" terminates it)
+            if success and self._pick_all_var.get():
+                n = self._last_n_masks
+                if n == _pick_all_last_n:
+                    _pick_all_streak += 1
+                else:
+                    _pick_all_streak = 1
+                    _pick_all_last_n = n
+                if _pick_all_streak >= 3:
+                    self._log(
+                        f"[Batch] Pick-all: detected {n} object(s) 3x in a row "
+                        f"— likely stuck, moving to next word.")
+                    _pick_all_streak = 0
+                    _pick_all_last_n = -1
+                else:
+                    self._log(f"[Batch] Pick-all: re-running '{word}' for remaining objects…")
+                    continue
+
             # Advance to next word; wrap around at end of list
+            _pick_all_streak = 0
+            _pick_all_last_n = -1
             word_idx += 1
             if word_idx >= len(words):
                 word_idx = 0
