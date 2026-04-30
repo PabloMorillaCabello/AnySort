@@ -136,7 +136,7 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
    Or from WSL2 terminal:
    ```bash
    docker compose -f docker/docker-compose.yml exec graspgen bash -c \
-     "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python grasp_execute_pipeline.py"
+     "source /opt/GraspGen/.venv/bin/activate && cd /ros2_ws/app && python anysort.py"
    ```
 
 **docker-compose.yml notes (Windows+WSL2 — already configured):**
@@ -449,7 +449,7 @@ GraspGen_Thesis_Repo/
 ├── USB_WSL_Docker_Guide.md       # WSL2 USB passthrough setup
 │
 ├── app/                          # PRIMARY: AnySort application
-│   ├── grasp_execute_pipeline.py # Main Tkinter app with robot control
+│   ├── anysort.py # Main Tkinter app with robot control
 │   ├── hand_eye_calibration.py   # ChArUco calibration UI (named pose sets & calib saves)
 │   ├── calibration_tester.py     # Calibration validation + correction (calib file selector)
 │   ├── camera_calibration.py     # Camera intrinsics (OpenCV)

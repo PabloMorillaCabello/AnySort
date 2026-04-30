@@ -1,0 +1,135 @@
+# UR10 Register-Based Command Server
+# ==================================
+# RTDE Input Registers (Python -> UR):
+#   input_int_register_18    = command (0=idle,1=moveL,2=moveJ,3=grip,4=release,5=stop,6=freedrive_on,7=freedrive_off)
+#   input_int_register_19    = cmd_id
+#   input_double_register_18 = target_0 (x_m or j1_rad)
+#   input_double_register_19 = target_1 (y_m or j2_rad)
+#   input_double_register_20 = target_2 (z_m or j3_rad)
+#   input_double_register_21 = target_3 (rx_rad or j4_rad)
+#   input_double_register_22 = target_4 (ry_rad or j5_rad)
+#   input_double_register_23 = target_5 (rz_rad or j6_rad)
+#   input_double_register_24 = velocity     (m/s or rad/s)
+#   input_double_register_25 = acceleration (m/s^2 or rad/s^2)
+#
+# RTDE Output Registers (UR -> Python):
+#   output_int_register_12   = status  (0=idle,1=busy,2=done,3=error)
+#   output_int_register_13   = ack_cmd_id
+
+def ur10_cmd_server():
+  STATUS_IDLE  = 0
+  STATUS_BUSY  = 1
+  STATUS_DONE  = 2
+  STATUS_ERROR = 3
+
+  CMD_IDLE            = 0
+  CMD_MOVEL           = 1
+  CMD_MOVEJ           = 2
+  CMD_GRIP            = 3
+  CMD_RELEASE         = 4
+  CMD_STOP            = 5
+  CMD_FREEDRIVE_START = 6
+  CMD_FREEDRIVE_STOP  = 7
+
+  textmsg("UR10 cmd_server: starting")
+  write_output_integer_register(12, STATUS_IDLE)
+  write_output_integer_register(13, 0)
+  textmsg("UR10 cmd_server: ready")
+
+  last_cmd_id = -1
+
+  while True:
+    cmd    = read_input_integer_register(18)
+    cmd_id = read_input_integer_register(19)
+
+    if (cmd != CMD_IDLE) and (cmd_id != last_cmd_id):
+      last_cmd_id = cmd_id
+      write_output_integer_register(12, STATUS_BUSY)
+      write_output_integer_register(13, cmd_id)
+      textmsg("UR10 cmd_server: executing cmd=", cmd)
+
+      if cmd == CMD_MOVEL:
+        target = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        target[0] = read_input_float_register(18)
+        target[1] = read_input_float_register(19)
+        target[2] = read_input_float_register(20)
+        target[3] = read_input_float_register(21)
+        target[4] = read_input_float_register(22)
+        target[5] = read_input_float_register(23)
+        vel = read_input_float_register(24)
+        acc = read_input_float_register(25)
+        if is_within_safety_limits(target):
+          movel(target, a=acc, v=vel)
+          write_output_integer_register(12, STATUS_DONE)
+        else:
+          textmsg("UR10 cmd_server: movel target outside safety limits")
+          write_output_integer_register(12, STATUS_ERROR)
+        end
+
+      elif cmd == CMD_MOVEJ:
+        q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        q[0] = read_input_float_register(18)
+        q[1] = read_input_float_register(19)
+        q[2] = read_input_float_register(20)
+        q[3] = read_input_float_register(21)
+        q[4] = read_input_float_register(22)
+        q[5] = read_input_float_register(23)
+        vel = read_input_float_register(24)
+        acc = read_input_float_register(25)
+        if is_within_safety_limits(q):
+          movej(q, a=acc, v=vel)
+          write_output_integer_register(12, STATUS_DONE)
+        else:
+          textmsg("UR10 cmd_server: movej target outside safety limits")
+          write_output_integer_register(12, STATUS_ERROR)
+        end
+
+      elif cmd == CMD_GRIP:
+        textmsg("UR10 cmd_server: grip")
+        rg_grip(0, 40, 0.0, False, False, 1)
+        sleep(0.5)
+        write_output_integer_register(12, STATUS_DONE)
+
+      elif cmd == CMD_RELEASE:
+        textmsg("UR10 cmd_server: release")
+        rg_grip(110, 40, 0.0, False, False, 1)
+        sleep(0.5)
+        write_output_integer_register(12, STATUS_DONE)
+
+      elif cmd == CMD_STOP:
+        textmsg("UR10 cmd_server: stop")
+        stopj(2.0)
+        write_output_integer_register(12, STATUS_DONE)
+
+      elif cmd == CMD_FREEDRIVE_START:
+        textmsg("UR10 cmd_server: freedrive ON")
+        write_output_integer_register(12, STATUS_DONE)
+        freedrive_mode()
+        while True:
+          fc = read_input_integer_register(18)
+          fi = read_input_integer_register(19)
+          if (fc == CMD_FREEDRIVE_STOP) and (fi != last_cmd_id):
+            last_cmd_id = fi
+            write_output_integer_register(13, fi)
+            break
+          end
+          sleep(0.01)
+        end
+        end_freedrive_mode()
+        textmsg("UR10 cmd_server: freedrive OFF")
+        write_output_integer_register(12, STATUS_DONE)
+
+      elif cmd == CMD_FREEDRIVE_STOP:
+        write_output_integer_register(12, STATUS_DONE)
+
+      else:
+        textmsg("UR10 cmd_server: unknown cmd=", cmd)
+        write_output_integer_register(12, STATUS_ERROR)
+      end
+    end
+
+    sleep(0.004)
+  end
+end
+
+ur10_cmd_server()

@@ -49,6 +49,7 @@ DASHBOARD_PORT  = 29999
 SCRIPT_PORT     = 30002       # fallback only
 POLL_INTERVAL   = 0.15        # s between programState polls
 PLAY_TIMEOUT    = 15.0        # s max wait for program to finish
+ACTION_WAIT_S   = 5.0         # seconds to wait after each gripper action
 
 
 class OnRobotRGURScript(ToolBase):
@@ -78,8 +79,6 @@ class OnRobotRGURScript(ToolBase):
         robot_ip: str | None = None,
         open_program: str  = "gripper_open",
         close_program: str = "gripper_close",
-        grasp_wait_s: float = 2.0,
-        release_wait_s: float = 1.5,
     ):
         if robot is not None and hasattr(robot, "_ip"):
             self._ip = robot._ip
@@ -90,8 +89,6 @@ class OnRobotRGURScript(ToolBase):
 
         self._open_program  = open_program
         self._close_program = close_program
-        self._grasp_wait    = grasp_wait_s
-        self._release_wait  = release_wait_s
 
         # Open a dedicated dashboard socket for gripper commands so we don't
         # interfere with the UR10 robot driver's own dashboard socket.
@@ -122,7 +119,7 @@ class OnRobotRGURScript(ToolBase):
             resp = ""
         return resp
 
-    def _run_program(self, name: str, settle_s: float = 0.0):
+    def _run_program(self, name: str):
         """Load, play, and wait for a saved .urp program to finish.
 
         After the UR program reports as stopped, waits an additional *settle_s*
@@ -147,19 +144,18 @@ class OnRobotRGURScript(ToolBase):
                 break
             time.sleep(POLL_INTERVAL)
 
-        # Extra settle time — gripper may still be physically moving
-        if settle_s > 0:
-            print(f"[OnRobotRGURScript] waiting {settle_s:.1f}s for gripper to settle", flush=True)
-            time.sleep(settle_s)
+        # Wait fixed time for controller to settle before next action
+        print(f"[OnRobotRGURScript] waiting {ACTION_WAIT_S:.1f}s before next action", flush=True)
+        time.sleep(ACTION_WAIT_S)
 
     # ── ToolBase interface ────────────────────────────────────────────────────
     def grasp(self):
         print(f"[OnRobotRGURScript] grasp  → running '{self._close_program}'", flush=True)
-        self._run_program(self._close_program, settle_s=self._grasp_wait)
+        self._run_program(self._close_program)
 
     def release(self):
         print(f"[OnRobotRGURScript] release → running '{self._open_program}'", flush=True)
-        self._run_program(self._open_program, settle_s=self._release_wait)
+        self._run_program(self._open_program)
 
     def close(self):
         try:

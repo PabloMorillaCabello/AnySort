@@ -39,7 +39,12 @@
       "WebFetch(domain:www.universal-robots.com)",
       "WebFetch(domain:aydos.de)",
       "Read(//c//**)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\.obsidian\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Pipeline\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Components\\\\Robots\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Components\\\\Tools\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Infrastructure\")"
     ]
   }
 }

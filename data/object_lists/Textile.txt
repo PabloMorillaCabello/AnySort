@@ -1,0 +1,9 @@
+  clothing item
+  small clothing item or fabric scrap
+  shoe or footwear
+  belt or strap
+  bag or purse
+  damaged or torn clothing
+  pile of layered clothing
+  pillow or duvet or cushion
+  non-textile object

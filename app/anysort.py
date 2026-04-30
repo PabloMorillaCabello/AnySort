@@ -5,7 +5,7 @@ AnySort — Grasp Execute Pipeline
 Full pipeline: Camera → SAM3 → GraspGen → hand-eye transform → Dobot execution.
 
 Single-command launch (SAM3 + Meshcat auto-start):
-  cd /ros2_ws/app && python grasp_execute_pipeline.py
+  cd /ros2_ws/app && python anysort.py
 
 Or from Windows: double-click AnySort.vbs at repo root.
 """
@@ -69,7 +69,7 @@ POSITIONS_SAVE_PATH  = Path(__file__).parent / "pipeline_positions.json"
 OBJECT_LISTS_DIR     = Path(__file__).parent.parent.parent / "data" / "object_lists"
 
 ROBOT_IP_DEFAULT = "192.168.5.1"
-APPROACH_OFFSET  = 80       # mm above grasp position for pre-grasp approach
+APPROACH_OFFSET  = 40       # mm above grasp position for pre-grasp approach
 HOME_POSE        = [300, 0, 450, 0, 0, 0]  # [X, Y, Z, Rx, Ry, Rz] safe home
 
 _PREVIEW_W  = 640
