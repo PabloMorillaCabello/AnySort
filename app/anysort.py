@@ -618,6 +618,8 @@ class GraspExecuteApp:
         self._collision_var  = tk.BooleanVar(value=False)  # enable GraspGen collision check
         self._reach_var      = tk.BooleanVar(value=False)  # filter unreachable grasps
         self._debug_var      = tk.BooleanVar(value=False)  # step-by-step debug mode
+        self._approach_filter_var = tk.StringVar(value="Top-down")  # approach direction filter
+        self._approach_tol_var    = tk.StringVar(value="45")        # tolerance in degrees
         self._debug_event    = threading.Event()
         self._debug_event.set()  # start in "go" state
 
@@ -1108,6 +1110,21 @@ class GraspExecuteApp:
                            bg=bg, fg="#aaa", activebackground=bg,
                            selectcolor="#3a3a3a", font=("Helvetica", 9)
                            ).pack(anchor="w", padx=10, pady=1)
+
+        r_af = tk.Frame(p, bg=bg); r_af.pack(fill="x", padx=10, pady=(4, 1))
+        tk.Label(r_af, text="Approach:", bg=bg, fg="#aaa",
+                 font=("Helvetica", 9), anchor="w").pack(side="left")
+        ttk.Combobox(r_af, textvariable=self._approach_filter_var,
+                     values=["Any", "Top-down", "Side"],
+                     state="readonly", font=("Helvetica", 9), width=10
+                     ).pack(side="left", padx=(4, 4))
+        tk.Label(r_af, text="±", bg=bg, fg="#aaa",
+                 font=("Helvetica", 9)).pack(side="left")
+        tk.Entry(r_af, textvariable=self._approach_tol_var, width=4,
+                 bg="#3a3a3a", fg="white", insertbackground="white",
+                 relief="flat", font=("Helvetica", 9)).pack(side="left", padx=(2, 2))
+        tk.Label(r_af, text="deg", bg=bg, fg="#aaa",
+                 font=("Helvetica", 9)).pack(side="left")
         _sep()
 
         _lbl("Inference Parameters:")
@@ -2190,28 +2207,40 @@ class GraspExecuteApp:
                 f"Step 5/7 — All GraspGen poses  ({len(grasps_obj_np)} raw grasps)")
             # ────────────────────────────────────────────────────────────────
 
-            # Filter: keep only grasps approaching from above.
-            # When the orientation flip is enabled (GraspGen outputs reversed
-            # orientations for this tool), the grasps that are visually correct
-            # top-down have approach_z > 0 in GraspGen's frame — after the 180°
-            # flip applied later they become approach_z < 0 (downward) for
-            # execution.  Without the flip, the standard convention applies.
-            approach_z = grasps_obj_np[:, 2, 2]
-            if self._flip_orient:
-                top_down = approach_z > 0   # inverted: GraspGen orientation is reversed
-                filter_label = "top-down (inverted — flip enabled)"
+            # ── Approach angle filter ────────────────────────────────────────
+            _af_mode = self._approach_filter_var.get()  # "Any", "Top-down", "Side"
+            try:
+                _af_tol = float(self._approach_tol_var.get())
+            except ValueError:
+                _af_tol = 45.0
+
+            if _af_mode == "Any":
+                self._log("[GraspGen] Approach filter: Any (no filtering)")
             else:
-                top_down = approach_z < 0   # standard: approach Z points down
-                filter_label = "top-down"
-            if top_down.sum() == 0:
-                self._log(f"[GraspGen] WARNING: no {filter_label} grasps — keeping all")
-            else:
-                n_before = len(grasps_obj_np)
-                grasps_obj_np = grasps_obj_np[top_down]
-                grasp_conf_np = grasp_conf_np[top_down]
-                n_topdown_removed = n_before - len(grasps_obj_np)
-                self._log(f"[GraspGen] {filter_label.capitalize()} filter: {n_before} → "
-                          f"{len(grasps_obj_np)} grasps")
+                # Compute angle of each grasp's approach from the downward vertical (0° = top-down).
+                # grasps_obj_np[:, 2, 2] is the world-Z component of the tool's Z-axis.
+                # With flip: GraspGen's +Z is visually top-down; without flip: -Z is top-down.
+                approach_z_comp = grasps_obj_np[:, 2, 2]
+                if self._flip_orient:
+                    theta = np.degrees(np.arccos(np.clip(approach_z_comp, -1.0, 1.0)))
+                else:
+                    theta = np.degrees(np.arccos(np.clip(-approach_z_comp, -1.0, 1.0)))
+
+                if _af_mode == "Top-down":
+                    angle_mask = theta <= _af_tol
+                    filter_label = f"top-down (≤{_af_tol:.0f}°)"
+                else:  # Side
+                    angle_mask = np.abs(theta - 90.0) <= _af_tol
+                    filter_label = f"side (90°±{_af_tol:.0f}°)"
+
+                if angle_mask.sum() == 0:
+                    self._log(f"[GraspGen] WARNING: no {filter_label} grasps — keeping all")
+                else:
+                    n_before = len(grasps_obj_np)
+                    grasps_obj_np = grasps_obj_np[angle_mask]
+                    grasp_conf_np = grasp_conf_np[angle_mask]
+                    self._log(f"[GraspGen] Approach filter ({filter_label}): "
+                              f"{n_before} → {len(grasps_obj_np)} grasps")
 
             # ── Debug step 6: top-down filtered grasps ───────────────────────
             if self._debug_var.get() and self._vis:
@@ -3066,8 +3095,8 @@ class GraspExecuteApp:
 
                 if self._all_grasps_base is None or \
                         len(self._all_grasps_base) == 0:
-                    self._log(f"[Batch]   No grasps found — retrying")
-                    continue
+                    self._log(f"[Batch]   No grasps found — skipping to next word")
+                    break
 
                 # Execute the best grasp
                 self._log(f"[Batch]   {len(self._all_grasps_base)} grasp(s) "
