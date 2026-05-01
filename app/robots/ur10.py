@@ -172,7 +172,21 @@ class UR10(RobotBase):
         return self._dash_cmd("brake release")
 
     def enable(self):
-        return self._dash_cmd("brake release")
+        resp = self._dash_cmd("brake release")
+        time.sleep(2.5)  # wait for robot to reach running mode before reuploading
+        try:
+            self._rtde_c.reuploadScript()
+            print("[UR10] Control script re-uploaded after enable.", flush=True)
+        except Exception as e:
+            print(f"[UR10] reuploadScript failed ({e}) — full rtde_control reconnect…",
+                  flush=True)
+            try:
+                self._rtde_c.disconnect()
+            except Exception:
+                pass
+            time.sleep(0.5)
+            self._rtde_c = rtde_control.RTDEControlInterface(self._ip)
+        return resp
 
     def clear_error(self):
         resp = self._dash_cmd("close safety popup")
@@ -384,14 +398,20 @@ class UR10(RobotBase):
 
     # ── Reachability ─────────────────────────────────────────────────────
     def check_reachability(self, x, y, z, rx, ry, rz):
-        """Use ur_rtde inverse kinematics."""
+        """IK + safety-limit check via ur_rtde."""
         ax, ay, az = self._euler_to_axis_angle(rx, ry, rz)
         pose = [x/1000.0, y/1000.0, z/1000.0, ax, ay, az]
         try:
+            # Safety planes / speed limits configured on the pendant
+            if not self._rtde_r.isPoseWithinSafetyLimits(pose):
+                return False, None, "Outside pendant safety limits"
+            # Kinematic reachability — returns [] on failure
             result = self._rtde_c.getInverseKinematics(pose)
-            if result and len(result) == 6:
-                joints_deg = tuple(math.degrees(a) for a in result)
-                return True, joints_deg, "OK"
-            return False, None, "IK returned no solution"
+            if not result or len(result) != 6:
+                return False, None, "IK returned no solution"
+            if any(not math.isfinite(j) for j in result):
+                return False, None, "IK returned non-finite joints"
+            joints_deg = tuple(math.degrees(a) for a in result)
+            return True, joints_deg, "OK"
         except Exception as e:
             return False, None, f"IK error: {e}"
