@@ -199,23 +199,13 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
    AnySort/data/OrbbecSDK_v2.7.6_amd64.deb
    ```
 
-4. **Modify docker-compose.yml for Linux**
-   Edit `docker/docker-compose.yml` (comments already guide you):
-   ```yaml
-   environment:
-     # Comment out this line:
-     # - DISPLAY=host.docker.internal:0.0
-     # Uncomment this line:
-     - DISPLAY=${DISPLAY}
-
-   volumes:
-     # Uncomment this line:
-     - /tmp/.X11-unix:/tmp/.X11-unix
-
-   # Comment out the entire extra_hosts block:
-   # extra_hosts:
-   #   - "host.docker.internal:host-gateway"
+4. **Allow X11 connections from Docker** (run once per session, or add to `~/.bashrc`):
+   ```bash
+   xhost +local:docker
+   # To make permanent:
+   echo 'xhost +local:docker > /dev/null 2>&1' >> ~/.bashrc
    ```
+   > `docker-compose.yml` is already pre-configured for native Linux (`DISPLAY=${DISPLAY}`, `/tmp/.X11-unix` volume). No manual edits needed.
 
 5. **Verify GPU access**
    ```bash
@@ -352,9 +342,13 @@ A **5-column layout** with status log bar:
 ### Column: Robot
 - **Robot type dropdown** — Select robot model (DobotCR, UR10, or custom)
 - **IP entry & Connect** — Robot TCP/IP address (Dobot default: `192.168.5.1`, UR10: check pendant)
-- **Motion parameters** — Speed %, Approach offset (mm), TCP Z offset (mm)
+- **Motion parameters:**
+  - **Speed %** — Slider (1–100), live-adjustable
+  - **Approach mm** — Pre-grasp standoff distance above the object
+  - **Lift mm** — How high the robot lifts after picking before moving to sort/home (default 150 mm). Increase if objects tangle
+  - **TCP Z mm** — Fine offset along the tool Z axis
 - **Recover Robot** — Reset alarm, re-enable, go home
-- **Save/Go Home** — Define and return to home position
+- **Save/Go Home** — Define and return to home position (saves joint angles *and* TCP pose — required for correct post-pick lift orientation)
 - **Save/Go Sort** — Define drop-off location
 - **Actions** — Emergency stop, motion test buttons
 
@@ -430,12 +424,39 @@ Full end-to-end automatic picking:
 2. **Teach Home** — Robot position between picks (click "Save Home")
 3. **Teach Sort** — Drop-off location (click "Save Sort")
 4. **Click "Run Batch"** — Continuous loop:
-   - Capture frame → SAM3 segment → GraspGen → pick → deliver to Sort → return Home
+   - Capture frame → SAM3 segment → GraspGen → pick → **lift + align to home orientation** → deliver to Sort → return Home
+   - Post-pick lift: robot rises to `max(approach_z + Lift mm, home_z)` at home orientation before moving away — prevents tangling or sweeping other objects off the table
    - 3 retries per word; on failure → advance to next word
    - Robot error → auto-recover
    - Wraps back to top when list exhausted
 
 Expected cycle time: ~10–15 seconds per grasp (camera + SAM3 + GraspGen + motion).
+
+### Experiment Log
+
+Enable via the **Experiment Log** checkbox in the batch panel. After each attempt a rating dialog appears with:
+
+- Auto-filled: word, cycle, attempt, result, grasp count (raw + filtered), best confidence, timing
+- **All OK** button — one click sets all ratings to Yes and saves immediately
+- **Save** — save with custom ratings and notes
+- **Skip** — skip logging this attempt
+
+CSV saved to `results/experiment_log.csv` with columns:
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | Date/time of attempt |
+| `word` | Object label |
+| `cycle`, `attempt` | Loop counters |
+| `result` | Success / Failure |
+| `n_grasps` | Grasps after filtering |
+| `n_grasps_raw` | Raw GraspGen output |
+| `best_conf` | Confidence of top grasp |
+| `t_sam3_s` | SAM3 inference time (s) |
+| `t_graspgen_s` | GraspGen inference time (s) |
+| `t_total_s` | Total attempt time (s) |
+| `segmentation_ok` … `sorted_ok` | Manual quality ratings |
+| `notes` | Free-text notes |
 
 ---
 
@@ -833,7 +854,9 @@ Docker build context is the **repository root**, not `docker/`. All `COPY` paths
 | `Camera not found (USB)` | Run `usbipd attach` again in PowerShell (WSL2) |
 | `Meshcat not opening` | Ensure port 7000 is exposed; check firewall; try `http://127.0.0.1:7000` |
 | `Dobot connection refused` | Verify IP (default `192.168.5.1`), ensure same network subnet |
-| `UR10 connection refused` | Verify IP, ensure robot is in Manual mode (pendant), check firewall on robot controller |
+| `UR10 connection refused` | Verify IP, ensure robot is in **Remote Control** mode (pendant), check firewall on robot controller |
+| `All grasps show as unreachable (UR10)` | Safety planes on the pendant may be too restrictive — reachability uses IK only, not `isPoseWithinSafetyLimits` |
+| `_tkinter.TclError: couldn't connect to display` | Run `xhost +local:docker` on the host before launching; verify `echo $DISPLAY` matches `DISPLAY` inside container |
 | `OnRobot gripper not responding` | Verify programs `gripper_open.urp` and `gripper_close.urp` exist on pendant; check Dashboard server enabled (robot settings); test gripper manually on pendant first |
 | `Gripper timing too slow / collisions during grasp` | Add Wait nodes to `.urp` programs on pendant; adjust `grasp_wait_s` and `release_wait_s` in `tools/onrobot_urscript.py` |
 | `Calibration file dropdown empty` | Ensure at least one `.npz` file exists in `data/calibration/`; run `hand_eye_calibration.py` to create one |
