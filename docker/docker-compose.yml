@@ -44,9 +44,10 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
-      - DISPLAY=host.docker.internal:0.0  # Windows+WSL2: X server on Windows side
+      #- DISPLAY=host.docker.internal:0.0  # Windows+WSL2: X server on Windows side
       # [LINUX] Comment line above, uncomment line below:
-      # - DISPLAY=${DISPLAY}
+      - DISPLAY=${DISPLAY}
+      - XAUTHORITY=${XAUTHORITY:-/root/.Xauthority}
       - QT_X11_NO_MITSHM=1
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -66,17 +67,18 @@ services:
       # Camera device access (Orbbec USB)
       - /dev:/dev
       - /dev/bus/usb:/dev/bus/usb
-      # [LINUX] Uncomment line below for X11 display passthrough (not needed on Windows+WSL2):
-      # - /tmp/.X11-unix:/tmp/.X11-unix
+      # [LINUX] X11 display passthrough (not needed on Windows+WSL2):
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ${XAUTHORITY:-${HOME}/.Xauthority}:/root/.Xauthority:ro
     # USB + video device access (more secure than privileged: true)
     device_cgroup_rules:
       - 'c 189:* rwm'   # USB devices (/dev/bus/usb)
       - 'c 180:* rwm'   # USB serial
       - 'c 81:* rwm'    # Video devices (/dev/video*)
-    #network_mode: host  # Uncomment for multi-machine DDS discovery (also fixes robot TCP routing on Linux)
+    network_mode: host  # Uncomment for multi-machine DDS discovery (also fixes robot TCP routing on Linux)
     # [WINDOWS+WSL2] Needed so container resolves Windows host for X display:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    #extra_hosts:
+    #  - "host.docker.internal:host-gateway"
     # [LINUX] Comment out the extra_hosts block above — not needed on native Linux
     stdin_open: true
     tty: true

@@ -10,6 +10,7 @@ Single-command launch (SAM3 + Meshcat auto-start):
 Or from Windows: double-click AnySort.vbs at repo root.
 """
 
+import csv
 import gc
 import json
 import os
@@ -63,7 +64,15 @@ from grasp_gen.utils.point_cloud_utils import (
 CHECKPOINTS_DIR  = "/opt/GraspGen/GraspGenModels/checkpoints"
 SAM3_SERVER_SCRIPT = "/ros2_ws/app/sam3_server.py"
 CALIB_FILE       = "/ros2_ws/data/calibration/hand_eye_calib.npz"
-RESULTS_DIR      = Path("/ros2_ws/results")
+RESULTS_DIR          = Path("/ros2_ws/results")
+EXPERIMENT_LOG_PATH  = RESULTS_DIR / "experiment_log.csv"
+CSV_COLUMNS = [
+    "timestamp", "word", "cycle", "attempt", "result",
+    "n_grasps", "n_grasps_raw", "best_conf",
+    "t_sam3_s", "t_graspgen_s", "t_total_s",
+    "segmentation_ok", "grasp_pose_ok", "position_ok",
+    "grasped_ok", "sorted_ok", "notes",
+]
 ROI_SAVE_PATH    = Path(__file__).parent / "pipeline_roi.json"
 POSITIONS_SAVE_PATH  = Path(__file__).parent / "pipeline_positions.json"
 OBJECT_LISTS_DIR     = Path(__file__).parent.parent.parent / "data" / "object_lists"
@@ -71,6 +80,7 @@ OBJECT_LISTS_DIR     = Path(__file__).parent.parent.parent / "data" / "object_li
 ROBOT_IP_DEFAULT = "192.168.5.1"
 APPROACH_OFFSET  = 40       # mm above grasp position for pre-grasp approach
 HOME_POSE        = [300, 0, 450, 0, 0, 0]  # [X, Y, Z, Rx, Ry, Rz] safe home
+POST_PICK_LIFT_MM = 150     # extra Z lift after retreat to untangle/clear table
 
 _PREVIEW_W  = 640
 _PREVIEW_H  = 480
@@ -601,6 +611,9 @@ class GraspExecuteApp:
         self._last_mask  = None
         self._best_grasp_base: np.ndarray = None  # 4×4, robot base frame, meters
         self._best_grasp_info: dict = {}
+        self._t_sam3      = 0.0   # SAM3 inference seconds (last attempt)
+        self._t_graspgen  = 0.0   # GraspGen inference seconds (last attempt)
+        self._n_grasps_raw = 0    # raw GraspGen output count before filters
         self._all_grasps_base: np.ndarray = None  # (N,4,4) sorted conf desc, base frame
         self._all_grasps_work: np.ndarray = None  # (N,4,4) Z-up work frame for vis
         self._all_grasps_centered: np.ndarray = None  # same, centered for meshcat
@@ -656,11 +669,15 @@ class GraspExecuteApp:
         # Sort / drop position for object placement
         self._sort_joints = None
         self._home_joints = None
+        self._home_pose   = None   # (x,y,z,rx,ry,rz) saved alongside home joints
 
         # Batch word-list mode
         self._batch_running    = False
         self._batch_stop_event = threading.Event()
         self._last_list_path   = None
+
+        # Experiment logging
+        self._exp_log_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._load_calibration()
@@ -718,6 +735,8 @@ class GraspExecuteApp:
             data = {}
             if self._home_joints:
                 data["home_joints"] = self._home_joints
+            if self._home_pose:
+                data["home_pose"] = self._home_pose
             if self._sort_joints:
                 data["sort_joints"] = self._sort_joints
             if self._last_list_path:
@@ -741,6 +760,8 @@ class GraspExecuteApp:
             data = json.loads(POSITIONS_SAVE_PATH.read_text())
             if "home_joints" in data:
                 self._home_joints = data["home_joints"]
+            if "home_pose" in data:
+                self._home_pose = data["home_pose"]
                 self._log(f"[Positions] Restored home: "
                           f"[{', '.join(f'{v:.1f}' for v in self._home_joints)}]")
             if "sort_joints" in data:
@@ -1230,9 +1251,24 @@ class GraspExecuteApp:
         _sep()
 
         _lbl("Motion")
+        # Speed slider
+        r_spd = tk.Frame(p, bg=bg); r_spd.pack(fill="x", padx=10, pady=2)
+        tk.Label(r_spd, text="Speed %:", bg=bg, fg="#ccc",
+                 font=("Helvetica", 9), anchor="w", width=13).pack(side="left")
+        self._speed_lbl = tk.Label(r_spd, text="15", bg=bg, fg="#e5c07b",
+                                   font=("Helvetica", 9), width=3, anchor="e")
+        self._speed_lbl.pack(side="right")
+        self._speed_var = tk.IntVar(value=15)
+        self._speed_var.trace_add("write",
+            lambda *_: self._speed_lbl.config(text=str(self._speed_var.get())))
+        tk.Scale(r_spd, variable=self._speed_var, from_=1, to=100,
+                 orient="horizontal", bg=bg, fg="#ccc", troughcolor="#3a3a3a",
+                 highlightthickness=0, showvalue=False,
+                 activebackground="#e5c07b").pack(side="left", fill="x", expand=True)
+        # Numeric motion params
         for label, attr, default in [
-                ("Speed %",     "_speed_var",    "15"),
                 ("Approach mm", "_approach_var", str(APPROACH_OFFSET)),
+                ("Lift mm",     "_lift_var",     str(POST_PICK_LIFT_MM)),
                 ("TCP Z mm",    "_tcp_z_var",    "0")]:
             r2 = tk.Frame(p, bg=bg); r2.pack(fill="x", padx=10, pady=2)
             tk.Label(r2, text=label+":", bg=bg, fg="#ccc",
@@ -1426,6 +1462,11 @@ class GraspExecuteApp:
 
         tk.Checkbutton(p, text="Pick all detected objects (repeat until empty)",
                        variable=self._pick_all_var,
+                       bg=bg, fg="#aaa", activebackground=bg,
+                       selectcolor="#3a3a3a", font=("Helvetica", 9)
+                       ).pack(anchor="w", padx=10, pady=(0, 1))
+        tk.Checkbutton(p, text="Experiment log (rate after each word)",
+                       variable=self._exp_log_var,
                        bg=bg, fg="#aaa", activebackground=bg,
                        selectcolor="#3a3a3a", font=("Helvetica", 9)
                        ).pack(anchor="w", padx=10, pady=(0, 4))
@@ -1985,7 +2026,8 @@ class GraspExecuteApp:
                 mask[_ry1:_ry2, _rx1:_rx2] = mask_crop
             else:
                 mask = mask_crop
-            self._log(f"[SAM3] {time.time()-t0:.2f}s — {n_detected} object(s) detected, {int(mask.sum())} px")
+            self._t_sam3 = time.time() - t0
+            self._log(f"[SAM3] {self._t_sam3:.2f}s — {n_detected} object(s) detected, {int(mask.sum())} px")
 
             if mask.shape != depth_m.shape:
                 mask = cv2.resize(mask.astype(np.float32),
@@ -2194,7 +2236,9 @@ class GraspExecuteApp:
                 num_grasps=_ng,
                 topk_num_grasps=_topk,
                 min_grasps=_topk)
-            self._log(f"[GraspGen] {time.time()-t1:.2f}s — {len(grasps)} grasps")
+            self._t_graspgen  = time.time() - t1
+            self._n_grasps_raw = len(grasps)
+            self._log(f"[GraspGen] {self._t_graspgen:.2f}s — {self._n_grasps_raw} grasps")
 
             if len(grasps) == 0:
                 raise RuntimeError("No grasps found")
@@ -2423,6 +2467,7 @@ class GraspExecuteApp:
             # ────────────────────────────────────────────────────────────────
 
             best_info = _save_best_grasp(grasps_base_np, grasp_conf_np)
+            self._best_grasp_info = best_info
             self._best_grasp_base = self._all_grasps_base[0].copy()  # robot base frame, meters
 
             conf_min, conf_max = float(grasp_conf_np.min()), float(grasp_conf_np.max())
@@ -2747,6 +2792,18 @@ class GraspExecuteApp:
         cmd_id = robot.move_linear(x_pre, y_pre, z_pre, rx, ry, rz)
         robot.wait_motion(cmd_id)
 
+        # Lift straight up aligned to home orientation so tangled objects detach cleanly
+        home_rx, home_ry, home_rz = (
+            (self._home_pose[3], self._home_pose[4], self._home_pose[5])
+            if self._home_pose else
+            (HOME_POSE[3], HOME_POSE[4], HOME_POSE[5])
+        )
+        lift_z = max(z_pre + float(self._lift_var.get()), float(HOME_POSE[2]))
+        self._log(f"[Execute] Lift+align X={x_pre:.1f} Y={y_pre:.1f} Z={lift_z:.1f} mm")
+        self._set_status("Lifting and aligning…")
+        cmd_id = robot.move_linear(x_pre, y_pre, lift_z, home_rx, home_ry, home_rz)
+        robot.wait_motion(cmd_id)
+
         sort_joints = self._sort_joints
         if sort_joints:
             self._log("[Execute] Going to sort position — dropping object")
@@ -3057,6 +3114,7 @@ class GraspExecuteApp:
                 self._batch_listbox.see(i)))
 
             success = False
+            attempt = 0  # sentinel: if stop fires before loop body, attempt stays 0
             for attempt in range(1, 4):
                 if self._batch_stop_event.is_set():
                     break
@@ -3064,6 +3122,7 @@ class GraspExecuteApp:
                 self._log(f"[Batch]   Attempt {attempt}/3 — running pipeline…")
                 self._set_status(
                     f"[Batch] '{word}' attempt {attempt}/3 — pipeline…")
+                _t_attempt_start = time.time()
 
                 # Set prompt display
                 self._cb_queue.put(lambda w=word: self._prompt_var.set(w))
@@ -3167,6 +3226,19 @@ class GraspExecuteApp:
                     f"[Batch] '{word}' — no object found or all attempts exhausted, "
                     f"moving to next word.")
 
+            # ── Qualitative experiment log ────────────────────────────────────
+            if self._exp_log_var.get() and not self._batch_stop_event.is_set() \
+                    and attempt > 0:
+                _n_grasps  = len(self._all_grasps_base) \
+                    if self._all_grasps_base is not None else 0
+                _best_conf = (self._best_grasp_info.get("confidence")
+                              if self._best_grasp_info else None)
+                _t_total = round(time.time() - _t_attempt_start, 2)
+                self._ask_experiment_log_dialog(
+                    word, cycle + 1, attempt, success, _n_grasps, _best_conf,
+                    self._t_sam3, self._t_graspgen, self._n_grasps_raw, _t_total)
+            # ─────────────────────────────────────────────────────────────────
+
             # Stay on same word if pick-all is active and we just succeeded
             # (pipeline will re-run; "no objects found → break → not success" terminates it)
             if success and self._pick_all_var.get():
@@ -3202,6 +3274,204 @@ class GraspExecuteApp:
         self._cb_queue.put(lambda: self._batch_run_btn.config(
             state="normal", text="[>]  Run Batch"))
         self._cb_queue.put(lambda: self._batch_stop_btn.config(state="disabled"))
+
+    # ------------------------------------------------------------------
+    # Qualitative experiment logging
+    # ------------------------------------------------------------------
+    def _ask_experiment_log_dialog(self, word, cycle, attempt, success,
+                                   n_grasps, best_conf,
+                                   t_sam3=0.0, t_graspgen=0.0,
+                                   n_grasps_raw=0, t_total=0.0):
+        """Called from batch background thread. Posts the rating form to the
+        main thread, blocks until the user submits or skips, then writes CSV."""
+        result_event  = threading.Event()
+        result_holder = [None]
+        info = {
+            "word":         word,
+            "cycle":        cycle,
+            "attempt":      attempt,
+            "result":       "Success" if success else "Failure",
+            "n_grasps":     n_grasps,
+            "n_grasps_raw": n_grasps_raw,
+            "best_conf":    round(best_conf, 4) if best_conf is not None else "",
+            "t_sam3_s":     round(t_sam3, 2),
+            "t_graspgen_s": round(t_graspgen, 2),
+            "t_total_s":    round(t_total, 2),
+        }
+        self._cb_queue.put(
+            lambda: self._show_log_form(info, result_event, result_holder))
+        signalled = result_event.wait(timeout=300)
+        if not signalled:
+            self._log("[ExpLog] Dialog timed out — skipping entry.")
+            return
+        if result_holder[0] is not None:
+            self._write_experiment_entry(result_holder[0])
+
+    def _show_log_form(self, info, result_event, result_holder):
+        """Build and display the rating dialog on the main Tkinter thread."""
+        bg      = "#1e1e1e"
+        fg      = "#abb2bf"
+        fg_head = "#e5c07b"
+        fg_ok   = "#98c379"
+        fg_err  = "#e06c75"
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Experiment Log — {info['word']}  (cycle {info['cycle']})")
+        dlg.configure(bg=bg)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.update_idletasks()
+        dlg.grab_set()
+
+        # ── Header ──────────────────────────────────────────────────────
+        tk.Label(dlg, text="Rate this attempt", bg=bg, fg=fg_head,
+                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=14, pady=(10, 4))
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=10, pady=2)
+
+        # ── Auto-filled info block ───────────────────────────────────────
+        info_frm = tk.Frame(dlg, bg=bg)
+        info_frm.pack(fill="x", padx=14, pady=4)
+        pairs = [
+            ("Word",    info["word"]),
+            ("Cycle",   str(info["cycle"])),
+            ("Attempt", str(info["attempt"])),
+            ("Result",     info["result"]),
+            ("Grasps",     str(info["n_grasps"])),
+            ("Grasps raw", str(info["n_grasps_raw"])),
+            ("Best conf",  str(info["best_conf"]) if info["best_conf"] != "" else "—"),
+            ("t SAM3",     f"{info['t_sam3_s']}s"),
+            ("t GraspGen", f"{info['t_graspgen_s']}s"),
+            ("t total",    f"{info['t_total_s']}s"),
+        ]
+        for row_i, (label, value) in enumerate(pairs):
+            col = row_i % 2
+            grp = tk.Frame(info_frm, bg=bg)
+            grp.grid(row=row_i // 2, column=col, sticky="w", padx=(0, 18), pady=1)
+            tk.Label(grp, text=f"{label}:", bg=bg, fg="#666",
+                     font=("Helvetica", 8)).pack(side="left")
+            val_fg = (fg_ok if value == "Success" else
+                      fg_err if value == "Failure" else fg)
+            tk.Label(grp, text=value, bg=bg, fg=val_fg,
+                     font=("Helvetica", 8, "bold")).pack(side="left", padx=(4, 0))
+
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=10, pady=(6, 2))
+
+        # ── Rating rows ─────────────────────────────────────────────────
+        ratings_frm = tk.Frame(dlg, bg=bg)
+        ratings_frm.pack(fill="x", padx=14, pady=4)
+
+        rating_defs = [
+            ("SAM3 Segmentation",  ["Yes", "Partial", "No"]),
+            ("Grasp Pose Quality", ["Yes", "Partial", "No"]),
+            ("Robot Position",     ["Yes", "No", "N/A"]),
+            ("Object Grasped",     ["Yes", "No", "N/A"]),
+            ("Sorted Correctly",   ["Yes", "No", "N/A"]),
+        ]
+        combo_vars = []
+        for row_i, (label, opts) in enumerate(rating_defs):
+            tk.Label(ratings_frm, text=label, bg=bg, fg=fg,
+                     font=("Helvetica", 9), width=20, anchor="w"
+                     ).grid(row=row_i, column=0, sticky="w", pady=2)
+            var = tk.StringVar(value="---")
+            cb  = ttk.Combobox(ratings_frm, textvariable=var,
+                               values=opts, state="readonly",
+                               width=9, font=("Helvetica", 9))
+            cb.grid(row=row_i, column=1, sticky="w", padx=(8, 0), pady=2)
+            combo_vars.append(var)
+
+        seg_var, pose_var, pos_var, grasped_var, sorted_var = combo_vars
+
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=10, pady=(6, 2))
+
+        # ── Notes ───────────────────────────────────────────────────────
+        notes_frm = tk.Frame(dlg, bg=bg)
+        notes_frm.pack(fill="x", padx=14, pady=(2, 4))
+        tk.Label(notes_frm, text="Notes:", bg=bg, fg=fg,
+                 font=("Helvetica", 9)).pack(anchor="w")
+        notes_text = tk.Text(notes_frm, height=3, width=36,
+                             bg="#2a2a2a", fg=fg,
+                             insertbackground=fg, relief="flat",
+                             font=("Helvetica", 9), bd=4)
+        notes_text.pack(fill="x")
+
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=10, pady=(6, 2))
+
+        # ── Buttons ─────────────────────────────────────────────────────
+        def on_save(_evt=None):
+            result_holder[0] = {
+                "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "word":           info["word"],
+                "cycle":          info["cycle"],
+                "attempt":        info["attempt"],
+                "result":         info["result"],
+                "n_grasps":       info["n_grasps"],
+                "n_grasps_raw":   info["n_grasps_raw"],
+                "best_conf":      info["best_conf"],
+                "t_sam3_s":       info["t_sam3_s"],
+                "t_graspgen_s":   info["t_graspgen_s"],
+                "t_total_s":      info["t_total_s"],
+                "segmentation_ok": seg_var.get(),
+                "grasp_pose_ok":   pose_var.get(),
+                "position_ok":     pos_var.get(),
+                "grasped_ok":      grasped_var.get(),
+                "sorted_ok":       sorted_var.get(),
+                "notes":           notes_text.get("1.0", "end-1c").strip(),
+            }
+            dlg.destroy()
+            result_event.set()
+
+        def on_all_ok(_evt=None):
+            all_ok_values = ["Yes", "Yes", "Yes", "Yes", "Yes"]
+            for var, val in zip(combo_vars, all_ok_values):
+                var.set(val)
+            on_save()
+
+        def on_skip(_evt=None):
+            dlg.destroy()
+            result_event.set()
+
+        btn_frm = tk.Frame(dlg, bg=bg)
+        btn_frm.pack(pady=(0, 12))
+        tk.Button(btn_frm, text="  All OK  ", bg="#61afef", fg="#1e1e1e",
+                  activebackground="#4a9ad4", relief="flat", bd=0,
+                  font=("Helvetica", 9, "bold"), cursor="hand2",
+                  command=on_all_ok).pack(side="left", ipady=5, ipadx=8, padx=(0, 8))
+        tk.Button(btn_frm, text="  Save  ", bg="#98c379", fg="#1e1e1e",
+                  activebackground="#7aaa61", relief="flat", bd=0,
+                  font=("Helvetica", 9, "bold"), cursor="hand2",
+                  command=on_save).pack(side="left", ipady=5, ipadx=8, padx=(0, 8))
+        tk.Button(btn_frm, text="  Skip  ", bg="#3a3a3a", fg="#aaa",
+                  activebackground="#444", relief="flat", bd=0,
+                  font=("Helvetica", 9), cursor="hand2",
+                  command=on_skip).pack(side="left", ipady=5, ipadx=8)
+
+        dlg.bind("<Return>", on_save)
+        dlg.bind("<Escape>", on_skip)
+        dlg.protocol("WM_DELETE_WINDOW", on_skip)
+
+        # Centre over root window
+        dlg.update_idletasks()
+        rx = self.root.winfo_x() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        ry = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{rx}+{ry}")
+
+    def _write_experiment_entry(self, entry):
+        """Append one row to the experiment CSV (creates file + header if needed)."""
+        try:
+            path = EXPERIMENT_LOG_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_exists = path.exists()
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS,
+                                        extrasaction="ignore")
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(entry)
+            self._log(f"[ExpLog] Saved → {path.name}  "
+                      f"({entry['word']} cycle={entry['cycle']} "
+                      f"attempt={entry['attempt']} {entry['result']})")
+        except Exception as e:
+            self._log(f"[ExpLog] ERROR writing CSV: {e}")
 
     # ------------------------------------------------------------------
     # Manual robot recovery
@@ -3351,6 +3621,7 @@ class GraspExecuteApp:
                 self._robot.enable();      time.sleep(1.5)
             joints = self._robot.get_angle()
             self._home_joints = list(joints)
+            self._home_pose   = list(self._robot.get_pose())
             self._save_positions()
             self._log(f"[Home] Saved: "
                       f"J1={joints[0]:.2f} J2={joints[1]:.2f} J3={joints[2]:.2f} "
