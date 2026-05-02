@@ -68,8 +68,7 @@ RESULTS_DIR          = Path("/ros2_ws/results")
 EXPERIMENT_LOG_PATH  = RESULTS_DIR / "experiment_log.csv"
 CSV_COLUMNS = [
     "timestamp", "word", "cycle", "attempt", "result",
-    "n_grasps", "n_grasps_raw", "best_conf",
-    "t_sam3_s", "t_graspgen_s", "t_total_s",
+    "n_grasps", "best_conf",
     "segmentation_ok", "grasp_pose_ok", "position_ok",
     "grasped_ok", "sorted_ok", "notes",
 ]
@@ -3233,10 +3232,8 @@ class GraspExecuteApp:
                     if self._all_grasps_base is not None else 0
                 _best_conf = (self._best_grasp_info.get("confidence")
                               if self._best_grasp_info else None)
-                _t_total = round(time.time() - _t_attempt_start, 2)
                 self._ask_experiment_log_dialog(
-                    word, cycle + 1, attempt, success, _n_grasps, _best_conf,
-                    self._t_sam3, self._t_graspgen, self._n_grasps_raw, _t_total)
+                    word, cycle + 1, attempt, success, _n_grasps, _best_conf)
             # ─────────────────────────────────────────────────────────────────
 
             # Stay on same word if pick-all is active and we just succeeded
@@ -3279,24 +3276,18 @@ class GraspExecuteApp:
     # Qualitative experiment logging
     # ------------------------------------------------------------------
     def _ask_experiment_log_dialog(self, word, cycle, attempt, success,
-                                   n_grasps, best_conf,
-                                   t_sam3=0.0, t_graspgen=0.0,
-                                   n_grasps_raw=0, t_total=0.0):
+                                   n_grasps, best_conf):
         """Called from batch background thread. Posts the rating form to the
         main thread, blocks until the user submits or skips, then writes CSV."""
         result_event  = threading.Event()
         result_holder = [None]
         info = {
-            "word":         word,
-            "cycle":        cycle,
-            "attempt":      attempt,
-            "result":       "Success" if success else "Failure",
-            "n_grasps":     n_grasps,
-            "n_grasps_raw": n_grasps_raw,
-            "best_conf":    round(best_conf, 4) if best_conf is not None else "",
-            "t_sam3_s":     round(t_sam3, 2),
-            "t_graspgen_s": round(t_graspgen, 2),
-            "t_total_s":    round(t_total, 2),
+            "word":      word,
+            "cycle":     cycle,
+            "attempt":   attempt,
+            "result":    "Success" if success else "Failure",
+            "n_grasps":  n_grasps,
+            "best_conf": round(best_conf, 4) if best_conf is not None else "",
         }
         self._cb_queue.put(
             lambda: self._show_log_form(info, result_event, result_holder))
@@ -3320,7 +3311,6 @@ class GraspExecuteApp:
         dlg.configure(bg=bg)
         dlg.resizable(False, False)
         dlg.transient(self.root)
-        dlg.update_idletasks()
         dlg.grab_set()
 
         # ── Header ──────────────────────────────────────────────────────
@@ -3335,13 +3325,9 @@ class GraspExecuteApp:
             ("Word",    info["word"]),
             ("Cycle",   str(info["cycle"])),
             ("Attempt", str(info["attempt"])),
-            ("Result",     info["result"]),
-            ("Grasps",     str(info["n_grasps"])),
-            ("Grasps raw", str(info["n_grasps_raw"])),
-            ("Best conf",  str(info["best_conf"]) if info["best_conf"] != "" else "—"),
-            ("t SAM3",     f"{info['t_sam3_s']}s"),
-            ("t GraspGen", f"{info['t_graspgen_s']}s"),
-            ("t total",    f"{info['t_total_s']}s"),
+            ("Result",  info["result"]),
+            ("Grasps",  str(info["n_grasps"])),
+            ("Best conf", str(info["best_conf"]) if info["best_conf"] != "" else "—"),
         ]
         for row_i, (label, value) in enumerate(pairs):
             col = row_i % 2
@@ -3405,11 +3391,7 @@ class GraspExecuteApp:
                 "attempt":        info["attempt"],
                 "result":         info["result"],
                 "n_grasps":       info["n_grasps"],
-                "n_grasps_raw":   info["n_grasps_raw"],
                 "best_conf":      info["best_conf"],
-                "t_sam3_s":       info["t_sam3_s"],
-                "t_graspgen_s":   info["t_graspgen_s"],
-                "t_total_s":      info["t_total_s"],
                 "segmentation_ok": seg_var.get(),
                 "grasp_pose_ok":   pose_var.get(),
                 "position_ok":     pos_var.get(),
@@ -3420,22 +3402,12 @@ class GraspExecuteApp:
             dlg.destroy()
             result_event.set()
 
-        def on_all_ok(_evt=None):
-            all_ok_values = ["Yes", "Yes", "Yes", "Yes", "Yes"]
-            for var, val in zip(combo_vars, all_ok_values):
-                var.set(val)
-            on_save()
-
         def on_skip(_evt=None):
             dlg.destroy()
             result_event.set()
 
         btn_frm = tk.Frame(dlg, bg=bg)
         btn_frm.pack(pady=(0, 12))
-        tk.Button(btn_frm, text="  All OK  ", bg="#61afef", fg="#1e1e1e",
-                  activebackground="#4a9ad4", relief="flat", bd=0,
-                  font=("Helvetica", 9, "bold"), cursor="hand2",
-                  command=on_all_ok).pack(side="left", ipady=5, ipadx=8, padx=(0, 8))
         tk.Button(btn_frm, text="  Save  ", bg="#98c379", fg="#1e1e1e",
                   activebackground="#7aaa61", relief="flat", bd=0,
                   font=("Helvetica", 9, "bold"), cursor="hand2",
