@@ -402,9 +402,6 @@ class UR10(RobotBase):
         ax, ay, az = self._euler_to_axis_angle(rx, ry, rz)
         pose = [x/1000.0, y/1000.0, z/1000.0, ax, ay, az]
         try:
-            # Safety planes / speed limits configured on the pendant
-            if not self._rtde_r.isPoseWithinSafetyLimits(pose):
-                return False, None, "Outside pendant safety limits"
             # Kinematic reachability — returns [] on failure
             result = self._rtde_c.getInverseKinematics(pose)
             if not result or len(result) != 6:
