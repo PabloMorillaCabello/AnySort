@@ -120,12 +120,6 @@ import pyorbbecsdk
 
 ---
 
-## UR10: RTDE Register Conflicts
-
-**Note:** All RTDE registers used by the UR10 driver are within user-accessible ranges (int registers 18–19, double registers 18–25, output int registers 12–13). Avoid using these ranges in other programs running on the controller.
-
----
-
 ## Links
 - [[Components/Robots/Dobot CR|Dobot CR]] — robot affected by TCP/Tkinter fixes
 - [[Components/Tools/OnRobot RG|OnRobot RG]] — gripper affected by URScript issue

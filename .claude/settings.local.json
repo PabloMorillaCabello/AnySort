@@ -44,7 +44,10 @@
       "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Pipeline\")",
       "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Components\\\\Robots\")",
       "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Components\\\\Tools\")",
-      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Infrastructure\")"
+      "Bash(mkdir -p \"C:\\\\Users\\\\pablo\\\\Desktop\\\\HV\\\\_THESIS\\\\Enviorment\\\\GraspGen\\\\GraspGen_Thesis_Repo\\\\obsidian\\\\Infrastructure\")",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(git add *)"
     ]
   }
 }
