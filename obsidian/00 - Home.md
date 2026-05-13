@@ -23,6 +23,7 @@
 - [[Components/Robots/Robot Architecture|Robot Architecture]] — Abstract base class + registry
 - [[Components/Robots/Dobot CR|Dobot CR]] — TCP/IP CR-series driver
 - [[Components/Robots/UR10|UR10]] — RTDE register-based driver
+- [[Components/Robots/ABB IRB|ABB IRB]] — IRC5 + RWS driver (see also [[../docs/abb_setup|docs/abb_setup.md]])
 
 ### End-Effectors
 - [[Components/Tools/Tool Architecture|Tool Architecture]] — Abstract base class + registry
@@ -59,7 +60,7 @@
 GraspGen_Thesis_Repo/
 ├── app/                      ← FINAL PIPELINE (AnySort)
 │   ├── anysort.py                  ← main entry point
-│   ├── robots/               ← robot drivers (base + Dobot CR + UR10)
+│   ├── robots/               ← robot drivers (base + Dobot CR + UR10 + ABB IRB)
 │   ├── tools/                ← end-effector drivers (base + vacuum + OnRobot)
 │   ├── sam3_server.py        ← persistent SAM3 socket server
 │   ├── hand_eye_calibration.py

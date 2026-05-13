@@ -18,6 +18,7 @@ from robots.base import RobotBase  # noqa: F401
 ROBOT_DRIVERS: dict[str, tuple[str, str]] = {
     "Dobot CR": ("robots.dobot_cr", "DobotCR"),
     "UR10":     ("robots.ur10",     "UR10"),
+    "ABB IRB":  ("robots.abb_irb",  "ABBIRB"),
 }
 
 

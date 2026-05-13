@@ -13,6 +13,7 @@ The pipeline calls **only** `RobotBase` methods. No robot-specific code leaks in
 RobotBase (ABC)
 ├── DobotCR          ← robots/dobot_cr.py
 ├── UR10             ← robots/ur10.py
+├── ABBIRB           ← robots/abb_irb.py
 └── [YourRobot]      ← robots/my_robot.py (add new robot here)
 ```
 
@@ -24,6 +25,7 @@ RobotBase (ABC)
 ROBOT_DRIVERS = {
     "Dobot CR": ("robots.dobot_cr", "DobotCR"),
     "UR10":     ("robots.ur10",     "UR10"),
+    "ABB IRB":  ("robots.abb_irb",  "ABBIRB"),
 }
 
 # Create robot by name:
@@ -99,6 +101,7 @@ Default: always `True`. Override with IK solver.
 ## Links
 - [[Dobot CR]] — TCP/IP CR-series implementation
 - [[UR10]] — RTDE register-based implementation
+- [[ABB IRB]] — IRC5 RWS implementation
 - [[../../Pipeline/AnySort Pipeline|AnySort Pipeline]] — how robot is used
 - [[../../Pipeline/Pipeline Flow|Pipeline Flow]] — execution sequence
 - [[../Tools/Tool Architecture|Tool Architecture]] — end-effector layer
