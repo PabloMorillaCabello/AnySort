@@ -368,16 +368,36 @@ class ABBIRB(RobotBase):
         return True
 
     # ── End-effector (DO-controlled vacuum) ──────────────────────────────
+    def _set_io(self, signal: str, value: int):
+        """Write a digital output, acquiring iosystem mastership if available."""
+        _mastered = False
+        try:
+            self._rws.request_mastership("iosystem")
+            _mastered = True
+        except AttributeError:
+            pass  # older abb_robot_client without explicit mastership API
+        except Exception as e:
+            print(f"[ABBIRB] request_mastership(iosystem) failed (ignored): {e}",
+                  flush=True)
+        try:
+            return self._rws.set_digital_io(signal, value)
+        finally:
+            if _mastered:
+                try:
+                    self._rws.release_mastership("iosystem")
+                except Exception:
+                    pass
+
     def vacuum_on(self, port: int = 0):
         if self._tool is not None:
             return self._tool.grasp()
-        resp = self._rws.set_digital_io(self._do_vacuum, 1)
+        resp = self._set_io(self._do_vacuum, 1)
         print(f"[ABBIRB] vacuum_on  set_digital_io({self._do_vacuum},1)", flush=True)
         return resp
 
     def vacuum_off(self, port: int = 0):
         if self._tool is not None:
             return self._tool.release()
-        resp = self._rws.set_digital_io(self._do_vacuum, 0)
+        resp = self._set_io(self._do_vacuum, 0)
         print(f"[ABBIRB] vacuum_off set_digital_io({self._do_vacuum},0)", flush=True)
         return resp
