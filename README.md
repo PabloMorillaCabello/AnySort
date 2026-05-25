@@ -32,6 +32,7 @@ Everything runs inside Docker with CUDA 12.6, ROS2 Humble, and WSL2 on Windows. 
 - [Exposed Ports](#exposed-ports)
 - [Key Technical Notes](#key-technical-notes)
 - [Troubleshooting](#troubleshooting)
+- [X11 Display Troubleshooting (Linux)](#x11-display-troubleshooting-linux)
 - [Upstream Repositories](#upstream-repositories)
 
 ---
@@ -201,11 +202,11 @@ The project runs in Docker with support for **Windows + WSL2** (current default)
 
 4. **Allow X11 connections from Docker** (run once per session, or add to `~/.bashrc`):
    ```bash
-   xhost +local:docker
+   xhost +local:root
    # To make permanent:
-   echo 'xhost +local:docker > /dev/null 2>&1' >> ~/.bashrc
+   echo 'xhost +local:root > /dev/null 2>&1' >> ~/.bashrc
    ```
-   > `docker-compose.yml` is already pre-configured for native Linux (`DISPLAY=${DISPLAY}`, `/tmp/.X11-unix` volume). No manual edits needed.
+   > The container runs as `root`, so `xhost +local:docker` is not sufficient — use `xhost +local:root`. `docker-compose.yml` is already pre-configured for native Linux (`DISPLAY=${DISPLAY}`, `/tmp/.X11-unix` volume, xauth cookie mount). No manual edits needed.
 
 5. **Verify GPU access**
    ```bash
@@ -856,13 +857,56 @@ Docker build context is the **repository root**, not `docker/`. All `COPY` paths
 | `Dobot connection refused` | Verify IP (default `192.168.5.1`), ensure same network subnet |
 | `UR10 connection refused` | Verify IP, ensure robot is in **Remote Control** mode (pendant), check firewall on robot controller |
 | `All grasps show as unreachable (UR10)` | Safety planes on the pendant may be too restrictive — reachability uses IK only, not `isPoseWithinSafetyLimits` |
-| `_tkinter.TclError: couldn't connect to display` | Run `xhost +local:docker` on the host before launching; verify `echo $DISPLAY` matches `DISPLAY` inside container |
+| `_tkinter.TclError: couldn't connect to display` or `Authorization required, but no authorization protocol specified` | Container runs as root — `xhost +local:docker` is not enough. Run `xhost +local:root` on the host first. Also verify `echo $DISPLAY` inside the container matches the host value. If `xauth list` inside the container is empty, the cookie mount failed — see [X11 Display Troubleshooting](#x11-display-troubleshooting-linux) below. |
 | `OnRobot gripper not responding` | Verify programs `gripper_open.urp` and `gripper_close.urp` exist on pendant; check Dashboard server enabled (robot settings); test gripper manually on pendant first |
 | `Gripper timing too slow / collisions during grasp` | Add Wait nodes to `.urp` programs on pendant; adjust `grasp_wait_s` and `release_wait_s` in `tools/onrobot_urscript.py` |
 | `Calibration file dropdown empty` | Ensure at least one `.npz` file exists in `data/calibration/`; run `hand_eye_calibration.py` to create one |
 | `Cannot switch calibration in main app` | Restart AnySort; verify calibration file readable; check file is valid `.npz` (not corrupted) |
 | `Robot not recognized in dropdown` | Verify robot driver imported in `app/robots/__init__.py`; check for syntax errors in driver file |
 | `Docker model cache empty` | Models auto-download on first use via HuggingFace API; ensure `HF_TOKEN` set in `docker/.env` |
+
+---
+
+## X11 Display Troubleshooting (Linux)
+
+If `python anysort.py` fails with either of these errors:
+
+```
+Authorization required, but no authorization protocol specified
+_tkinter.TclError: couldn't connect to display ":1"
+```
+
+The container runs as `root`, but your X server only allows your user. Fix:
+
+**Step 1 — grant root access to X server (run on host, not inside container):**
+```bash
+xhost +local:root
+```
+
+**Step 2 — verify DISPLAY and xauth cookie are visible inside the container:**
+```bash
+# Inside container:
+echo $DISPLAY          # must match host (e.g. :1)
+echo $XAUTHORITY       # should be /root/.Xauthority
+xauth list             # must show an entry for the display
+```
+
+If `xauth list` is empty, the cookie mount failed. Fix manually:
+```bash
+# On host:
+xauth extract /tmp/xauth_cookie $DISPLAY
+docker cp /tmp/xauth_cookie graspgen_dev:/tmp/xauth_cookie
+
+# Inside container:
+xauth merge /tmp/xauth_cookie
+```
+
+**Make the xhost grant permanent** (so it survives reboots):
+```bash
+echo 'xhost +local:root > /dev/null 2>&1' >> ~/.bashrc
+```
+
+> **Why `+local:root` and not `+local:docker`?** `xhost +local:docker` grants access to a Unix user named `docker` — not to processes connecting from a Docker container. Since the container runs as `root`, you need `xhost +local:root` (or `xhost +local:` to allow all local users, which is fine on a single-user machine).
 
 ---
 
