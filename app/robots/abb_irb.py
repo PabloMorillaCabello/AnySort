@@ -43,7 +43,7 @@ except ImportError:
 
 DEFAULT_USERNAME   = "Default User"
 DEFAULT_PASSWORD   = "robotics"
-DEFAULT_DO_VACUUM  = "DO_VACUUM"
+DEFAULT_DO_VACUUM  = "DoValve1"
 DEFAULT_TOOL       = "tool0"
 DEFAULT_WOBJ       = "wobj0"
 DEFAULT_MECHUNIT   = "ROB_1"
@@ -147,27 +147,73 @@ class ABBIRB(RobotBase):
                                             thread_name_prefix="abb-motion")
 
     # ── Lifecycle ────────────────────────────────────────────────────────
+    def get_controller_state_raw(self) -> str:
+        """Return raw controller state string (e.g. 'motoron', 'emergencystop')."""
+        try:
+            return str(self._rws.get_controller_state()).lower()
+        except Exception:
+            return "unknown"
+
+    def is_auto_mode(self) -> bool:
+        """Return True if the key-switch is in AUTO (motors-on commands allowed)."""
+        return self.get_operation_mode().upper().startswith("AUTO")
+
+    def is_emergency_stopped(self) -> bool:
+        """Return True if the controller is in an emergency-stop state."""
+        return "emergency" in self.get_controller_state_raw()
+
+    def is_guard_stopped(self) -> bool:
+        """Return True if the controller is in a guard stop (safety latch requires
+        physical Motors ON / Reset on the FlexPendant to clear)."""
+        return "guardstop" in self.get_controller_state_raw()
+
+    def _motoron_blocked(self) -> bool:
+        """Return True if set_controller_state('motoron') would be rejected by RWS."""
+        state = self.get_controller_state_raw()
+        return ("emergency" in state or "guardstop" in state
+                or "sysfail" in state or not self.is_auto_mode())
+
     def enable(self):
-        """Set controller motors on. Required before any motion."""
+        """Set controller motors on. No-op (with log) when motoron would be rejected."""
+        if self._motoron_blocked():
+            state = self.get_controller_state_raw()
+            op = self.get_operation_mode()
+            print(f"[ABBIRB] enable skipped — state={state!r} mode={op!r} "
+                  "(requires AUTO + no guard/emergency stop)", flush=True)
+            return
         return self._rws.set_controller_state("motoron")
 
     def power_on(self):
-        """IRC5 has no separate power button — motors-on + reset PP."""
-        try:
-            self._rws.set_controller_state("motoron")
-        except Exception as e:
-            print(f"[ABBIRB] power_on motoron failed: {e}", flush=True)
+        """IRC5 has no separate power button — motors-on + reset PP.
+        Motors-on is skipped when the controller would reject it."""
+        if self._motoron_blocked():
+            state = self.get_controller_state_raw()
+            op = self.get_operation_mode()
+            print(f"[ABBIRB] power_on motoron skipped — state={state!r} mode={op!r}",
+                  flush=True)
+        else:
+            try:
+                self._rws.set_controller_state("motoron")
+            except Exception as e:
+                print(f"[ABBIRB] power_on motoron failed: {e}", flush=True)
         try:
             self._rws.resetpp()
         except Exception as e:
             print(f"[ABBIRB] power_on resetpp failed (ignored): {e}", flush=True)
 
     def clear_error(self):
-        """Reset program pointer + motors on (clears guard-stop after reset)."""
+        """Reset program pointer + motors on.
+        Motors-on is skipped when the controller would reject it."""
         try:
             self._rws.resetpp()
         except Exception as e:
             print(f"[ABBIRB] clear_error resetpp failed: {e}", flush=True)
+        if self._motoron_blocked():
+            state = self.get_controller_state_raw()
+            op = self.get_operation_mode()
+            print(f"[ABBIRB] clear_error motoron skipped — state={state!r} mode={op!r}",
+                  flush=True)
+            return
         try:
             self._rws.set_controller_state("motoron")
         except Exception as e:

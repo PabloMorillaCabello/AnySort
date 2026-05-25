@@ -2613,20 +2613,54 @@ class GraspExecuteApp:
             self._log(f"[Robot] Connecting to {ip} via {driver_name!r}…")
             robot = create_robot(driver_name, ip)
             self._log(f"[Robot] Connected to {ip}")
-            # Clear any stale alarms first
-            robot.clear_error()
-            time.sleep(0.5)
-            # Power on (takes ~10 s for controller boot)
-            self._log("[Robot] PowerOn…")
-            robot.power_on()
-            time.sleep(3.0)
-            # Enable
-            self._log("[Robot] EnableRobot…")
-            robot.enable()
-            time.sleep(2.0)
+
+            # Check E-STOP / guard stop / operation mode before motor commands
+            _is_abb = hasattr(robot, "get_operation_mode")
+            _read_only = False   # True → skip power_on/enable; connect for pose reads only
+            if _is_abb:
+                ctrl_state = robot.get_controller_state_raw()
+                op_mode = robot.get_operation_mode().upper()
+
+                if robot.is_emergency_stopped():
+                    raise RuntimeError(
+                        "Emergency stop is active on the controller.\n"
+                        "  → Release the E-STOP button on the cabinet and/or "
+                        "FlexPendant, reset it, then press Connect again."
+                    )
+                elif robot.is_guard_stopped():
+                    _read_only = True
+                    self._log(
+                        f"[Robot] Guard stop active (controller state: {ctrl_state!r}) — "
+                        "the safety latch needs a physical reset on the FlexPendant: "
+                        "press [Motors ON] / [Reset] after clearing the safety condition. "
+                        "Connected in read-only mode. Use [Recover Robot] once the "
+                        "pendant is reset."
+                    )
+                elif not op_mode.startswith("AUTO"):
+                    _read_only = True
+                    self._log(
+                        f"[Robot] Controller is in {op_mode!r} mode — "
+                        "switch the key-switch to AUTO on the FlexPendant to enable "
+                        "motion. Connected in read-only mode (pose reads work, "
+                        "motion commands will be rejected by the controller)."
+                    )
+
+            if not _read_only:
+                # Clear any stale alarms first
+                robot.clear_error()
+                time.sleep(0.5)
+                # Power on (takes ~10 s for controller boot)
+                self._log("[Robot] PowerOn…")
+                robot.power_on()
+                time.sleep(3.0)
+                # Enable
+                self._log("[Robot] EnableRobot…")
+                robot.enable()
+                time.sleep(2.0)
+
             # Check mode; clear errors and retry once if needed
             mode = robot.get_mode()
-            if mode == robot.MODE_ERROR:
+            if not _read_only and mode == robot.MODE_ERROR:
                 self._log("[Robot] Error state — clearing and re-enabling…")
                 robot.clear_error(); time.sleep(1.0)
                 robot.enable();      time.sleep(2.0)
@@ -2868,6 +2902,13 @@ class GraspExecuteApp:
         recovered = False
         for attempt in range(1, 4):
             try:
+                # Guard stop requires physical pendant action — can't clear via software
+                if hasattr(robot, "is_guard_stopped") and robot.is_guard_stopped():
+                    self._log(
+                        "[Recover] Guard stop still active — press [Motors ON] / "
+                        "[Reset] on the FlexPendant first, then retry Recovery."
+                    )
+                    break
                 self._log(f"[Recover] Clear alarm + enable (attempt {attempt}/3)…")
                 robot.clear_error()
                 time.sleep(0.5)
