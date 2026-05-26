@@ -1217,6 +1217,7 @@ class GraspExecuteApp:
                                   values=driver_names, state="readonly",
                                   font=("Helvetica", 9), width=18)
         type_menu.pack(side="left", fill="x", expand=True, ipady=2)
+        type_menu.bind("<<ComboboxSelected>>", self._on_robot_type_changed)
 
         # Tool selector
         r_tool = tk.Frame(p, bg=bg); r_tool.pack(fill="x", padx=10, pady=(0,3))
@@ -1238,6 +1239,22 @@ class GraspExecuteApp:
         tk.Entry(r, textvariable=self._ip_var, bg="#3a3a3a", fg="white",
                  insertbackground="white", relief="flat",
                  font=("Helvetica", 9)).pack(side="left", fill="x", expand=True, ipady=3)
+
+        # ABB-only: DO signal name for gripper (shown/hidden by _on_robot_type_changed)
+        self._abb_signal_frame = tk.Frame(p, bg=bg)
+        tk.Label(self._abb_signal_frame, text="DO Signal:", bg=bg, fg="#ccc",
+                 font=("Helvetica", 9), width=9, anchor="w").pack(side="left")
+        self._abb_do_signal_var = tk.StringVar(value="doValve1")
+        tk.Entry(self._abb_signal_frame, textvariable=self._abb_do_signal_var,
+                 bg="#3a3a3a", fg="white", insertbackground="white",
+                 relief="flat", font=("Helvetica", 9)
+                 ).pack(side="left", fill="x", expand=True, ipady=3)
+        tk.Label(self._abb_signal_frame, text="ABB gripper DO", bg=bg, fg="#555",
+                 font=("Helvetica", 7)).pack(side="right", padx=(4, 0))
+        # Show immediately only if the default driver is ABB
+        if self._robot_type_var.get().startswith("ABB"):
+            self._abb_signal_frame.pack(fill="x", padx=10, pady=(0,3))
+
         self._connect_btn = tk.Button(p, text=">>  Connect Robot",
                                        bg="#4a5568", fg="white",
                                        activebackground="#5a6578",
@@ -2589,6 +2606,14 @@ class GraspExecuteApp:
     # ------------------------------------------------------------------
     # Robot connection
     # ------------------------------------------------------------------
+    def _on_robot_type_changed(self, _=None):
+        """Show the ABB DO signal entry only when an ABB driver is selected."""
+        if self._robot_type_var.get().startswith("ABB"):
+            self._abb_signal_frame.pack(fill="x", padx=10, pady=(0, 3),
+                                        before=self._connect_btn)
+        else:
+            self._abb_signal_frame.pack_forget()
+
     def _on_connect(self):
         if self._robot_connected:
             # Disconnect
@@ -2611,7 +2636,13 @@ class GraspExecuteApp:
         try:
             driver_name = self._robot_type_var.get()
             self._log(f"[Robot] Connecting to {ip} via {driver_name!r}…")
-            robot = create_robot(driver_name, ip)
+            extra_kwargs = {}
+            if driver_name.startswith("ABB"):
+                sig = self._abb_do_signal_var.get().strip()
+                if sig:
+                    extra_kwargs["do_vacuum_signal"] = sig
+                    self._log(f"[Robot] ABB gripper DO signal: {sig!r}")
+            robot = create_robot(driver_name, ip, **extra_kwargs)
             self._log(f"[Robot] Connected to {ip}")
 
             # Check E-STOP / guard stop / operation mode before motor commands
@@ -2646,17 +2677,24 @@ class GraspExecuteApp:
                     )
 
             if not _read_only:
-                # Clear any stale alarms first
-                robot.clear_error()
-                time.sleep(0.5)
-                # Power on (takes ~10 s for controller boot)
-                self._log("[Robot] PowerOn…")
-                robot.power_on()
-                time.sleep(3.0)
-                # Enable
-                self._log("[Robot] EnableRobot…")
-                robot.enable()
-                time.sleep(2.0)
+                # For ABB: if motors are already ON, skip the enable sequence.
+                # Calling set_controller_state("motoron") when already motoron
+                # triggers a FlexPendant panel confirmation that times out via RWS.
+                _already_motoron = _is_abb and "motoron" in ctrl_state
+                if _already_motoron:
+                    self._log("[Robot] Motors already ON — skipping power-on sequence")
+                else:
+                    # Clear any stale alarms first
+                    robot.clear_error()
+                    time.sleep(0.5)
+                    # Power on (takes ~10 s for controller boot)
+                    self._log("[Robot] PowerOn…")
+                    robot.power_on()
+                    time.sleep(3.0)
+                    # Enable
+                    self._log("[Robot] EnableRobot…")
+                    robot.enable()
+                    time.sleep(2.0)
 
             # Check mode; clear errors and retry once if needed
             mode = robot.get_mode()

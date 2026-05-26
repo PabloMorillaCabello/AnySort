@@ -181,7 +181,10 @@ class ABBIRB(RobotBase):
             print(f"[ABBIRB] enable skipped — state={state!r} mode={op!r} "
                   "(requires AUTO + no guard/emergency stop)", flush=True)
             return
-        return self._rws.set_controller_state("motoron")
+        try:
+            return self._rws.set_controller_state("motoron")
+        except Exception as e:
+            print(f"[ABBIRB] enable motoron failed: {e}", flush=True)
 
     def power_on(self):
         """IRC5 has no separate power button — motors-on + reset PP.
